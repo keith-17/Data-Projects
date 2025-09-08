@@ -17,3 +17,4 @@ CAVU/analysis/temp_csv/
 CAVU/raw_data/
 CAVU/analysis/__pycache__/general_utils.cpython-310.pyc
 CAVU/analysis/reports/
+numerai/data_folder/
