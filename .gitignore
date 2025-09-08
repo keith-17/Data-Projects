@@ -14,5 +14,6 @@ CAVU/.idea/vcs.xml
 CAVU/.idea/inspectionProfiles/profiles_settings.xml
 CAVU/temp_csv/
 CAVU/analysis/temp_csv/
-CAVU/raw_data/flights_sample.csv
+CAVU/raw_data/
 CAVU/analysis/__pycache__/general_utils.cpython-310.pyc
+CAVU/analysis/reports/
