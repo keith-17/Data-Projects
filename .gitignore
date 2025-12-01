@@ -19,3 +19,7 @@ CAVU/analysis/__pycache__/general_utils.cpython-310.pyc
 CAVU/analysis/reports/
 numerai/data_folder/
 numerai/reports/
+cursor rag/
+Inference Group/.env
+Inference Group/rag_data
+Inference Group/django-errors.log
