@@ -25,3 +25,6 @@ Inference Group/rag_data
 Inference Group/django-errors.log
 capgemini/data/
 dxc_tech/data/
+capgemini/results/
+capgemini/simple_reports/
+dxc_tech/results/
