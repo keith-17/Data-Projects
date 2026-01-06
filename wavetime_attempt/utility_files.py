@@ -2,6 +2,8 @@ import numpy as np
 from numba import njit, prange
 from types import SimpleNamespace
 from tqdm.auto import tqdm  # optional
+from scipy.special import j1
+from typing import Any, Dict, List, Optional, Tuple
 Complex = np.complex128
 
 
@@ -1000,6 +1002,7 @@ def interface_scattering_general_numba(
     return S11, S12, S21, S22
 
 
+@njit(parallel=True)
 def fill_layer_modes_kernel(
     kind_flag,          # 1 piezo, 0 elastic
     C4_eff, e_ijk, eps_tensor, rho,
@@ -1338,6 +1341,19 @@ def build_block_caches_streaming_fill_kernel(
     )
 
 
+@njit
+def _rest_indices4(idx_free):
+    """Return the 3 indices out of 0,1,2,3 that are NOT idx_free."""
+    if idx_free == 0:
+        return 1, 2, 3
+    elif idx_free == 1:
+        return 0, 2, 3
+    elif idx_free == 2:
+        return 0, 1, 3
+    else:
+        return 0, 1, 2
+
+
 @njit(parallel=True)
 def build_Btop_ftop_from_fulltop_numba(
     Uplus_top, Pplus_top, Uminus_top, Pminus_top,   # (Ns,Nphi,4,4)
@@ -1640,6 +1656,7 @@ def build_slowness_blocks_streaming_packed(
             raise ValueError(f"Need {N_layers} tanδ fns (or None), got {len(layer_fns)}")
 
     block_indices = range(len(f_ref_blocks))
+    block_indices = range(1)
     if show_progress_blocks and (tqdm is not None):
         block_indices = tqdm(block_indices, desc="Building slowness blocks")
 
@@ -2737,3 +2754,296 @@ def apply_block_extra_tandelta_to_C4_stack(C4_stack: np.ndarray, td_block_add: n
     C4c = np.asarray(C4_stack, dtype=np.complex128)
     td  = np.asarray(td_block_add, dtype=np.float64)
     return C4c * (1.0 - 1j * td[:, None, None, None, None])
+
+
+@njit
+def _rest_indices4(idx_free):
+    # idx_free must be 0..3
+    if idx_free == 0:
+        return 1, 2, 3
+    elif idx_free == 1:
+        return 0, 2, 3
+    elif idx_free == 2:
+        return 0, 1, 3
+    else:
+        return 0, 1, 2
+
+
+
+@njit
+def solve3x3_inplace_multi(A, B, n_rhs):
+    """
+    Solve A X = B for A(3x3), B(3xn_rhs). Overwrites B with X.
+    Simple Gaussian elimination with partial pivoting.
+    """
+    # Augment in-place into a local 3x(3+n_rhs)
+    Aug = np.empty((3, 3 + n_rhs), dtype=A.dtype)
+    for i in range(3):
+        for j in range(3):
+            Aug[i, j] = A[i, j]
+        for j in range(n_rhs):
+            Aug[i, 3 + j] = B[i, j]
+
+    # Forward elimination
+    for k in range(3):
+        # pivot
+        piv = k
+        maxv = abs(Aug[k, k])
+        for i in range(k + 1, 3):
+            v = abs(Aug[i, k])
+            if v > maxv:
+                maxv = v
+                piv = i
+        if piv != k:
+            for j in range(3 + n_rhs):
+                tmp = Aug[k, j]
+                Aug[k, j] = Aug[piv, j]
+                Aug[piv, j] = tmp
+
+        akk = Aug[k, k]
+        # (assume regularised so not zero)
+        for i in range(k + 1, 3):
+            f = Aug[i, k] / akk
+            Aug[i, k] = 0.0 + 0.0j
+            for j in range(k + 1, 3 + n_rhs):
+                Aug[i, j] -= f * Aug[k, j]
+
+    # Back substitution
+    for jrhs in range(n_rhs):
+        x2 = Aug[2, 3 + jrhs] / Aug[2, 2]
+        x1 = (Aug[1, 3 + jrhs] - Aug[1, 2] * x2) / Aug[1, 1]
+        x0 = (Aug[0, 3 + jrhs] - Aug[0, 1] * x1 - Aug[0, 2] * x2) / Aug[0, 0]
+        B[0, jrhs] = x0
+        B[1, jrhs] = x1
+        B[2, jrhs] = x2
+
+
+
+
+def _apply_mech_loss_to_velocity(v: complex | float, tan_delta: float) -> complex:
+    """
+    Mechanical loss tangent via complex modulus:
+        M* = M (1 + i tan_delta)  =>  v* = v * sqrt(1 + i tan_delta)
+    """
+    return v * np.sqrt(1.0 + 1j * tan_delta)
+
+
+def reflection_coeff(Zin, Z0=50.0):
+    Zin = np.asarray(Zin, dtype=np.complex128)
+    return (Zin - Z0) / (Zin + Z0)
+
+
+def window_1d(name, n):
+    name = (name or "none").lower()
+    if name in ("none", "rect", "rectangular"):
+        return np.ones(n)
+    if name in ("hann", "hanning"):
+        return np.hanning(n)
+    if name == "hamming":
+        return np.hamming(n)
+    if name == "blackman":
+        return np.blackman(n)
+    raise ValueError(f"Unknown window '{name}'")
+
+
+def rect_pulse_spectrum(
+    freqs_hz: np.ndarray,
+    *,
+    T_s: float,              # pulse duration (seconds)
+    t0_s: float = 0.0,       # time shift
+    f0_hz: float = 0.0,      # carrier (Hz). f0=0 => baseband rectangle
+    amp: float = 1.0,
+    make_real: bool = True,# match the IFFT make_real choice
+) -> np.ndarray:
+    """
+    Returns P(f) on f>=0 grid.
+
+    Baseband rectangle (f0=0):
+      P(f) = amp * T * sinc(f T) * exp(-i 2π f t0)
+
+    RF burst (f0>0):
+      - if make_real=True (real time waveform), include both sidebands:
+          P(f) = amp * (T/2) * [sinc((f-f0)T) + sinc((f+f0)T)] * exp(-i 2π f t0)
+      - if make_real=False (analytic complex waveform), keep only +f0 lobe:
+          P(f) = amp * T * sinc((f-f0)T) * exp(-i 2π f t0)
+
+    numpy.sinc(x) = sin(pi x)/(pi x).
+    """
+    f = np.asarray(freqs_hz, dtype=float)
+    phase = np.exp(-1j * 2.0 * np.pi * f * t0_s)
+    phase2=np.exp(1j*f0_hz*2*np.pi*t0_s)
+    if make_real:
+        return amp * (T_s /(2.0)) * (np.sinc((f0_hz-f) * T_s)*phase2- np.sinc((f + f0_hz) * T_s)*np.conj(phase2)) * phase*(-1j)
+    else:
+        return amp * T_s * np.sinc((f - f0_hz) * T_s) * phase*(-1j)
+def pad_to_dc_grid(freqs_hz, H_pos, fill_value=1.0+0.0j, df=None, rtol_align=1e-8):
+    """
+    Embed one-sided spectrum H_pos sampled on freqs_hz (uniform, starting at f_min>0)
+    into a uniform grid starting at 0 with the same df, filling missing bins with fill_value.
+    """
+    f = np.asarray(freqs_hz, dtype=float)
+    H = np.asarray(H_pos, dtype=np.complex128)
+
+    if df is None:
+        df = (f[-1] - f[0]) / (f.size - 1)
+
+    k0 = int(np.rint(f[0] / df))
+    kN = int(np.rint(f[-1] / df))
+
+    if not (np.isclose(k0 * df, f[0], rtol=rtol_align, atol=0.0) and
+            np.isclose(kN * df, f[-1], rtol=rtol_align, atol=0.0)):
+        raise ValueError("Frequency axis is not aligned to a constant df grid.")
+
+    n_full = kN + 1
+    f_full = df * np.arange(n_full, dtype=float)
+    H_full = np.full(n_full, fill_value, dtype=np.complex128)
+    H_full[k0:k0 + H.size] = H
+    return f_full, H_full
+
+
+import numpy as np
+
+def _cosine_taper_onesided(f, *, f_lo=None, f_hi=None, frac=0.10):
+    """
+    Smooth bandpass/taper for a one-sided f>=0 grid.
+
+    - If f_lo is not None: ramps from 0->1 over a width = frac*(f_hi-f_lo) starting at f_lo.
+    - If f_hi is not None: ramps from 1->0 over the same width ending at f_hi.
+    - Between ramps: 1.
+
+    This is a Tukey-like cosine taper (flat middle, cosine edges).
+
+    Parameters
+    ----------
+    f : (N,) array, Hz, assumed increasing
+    f_lo : float or None
+        Start frequency where passband begins (below this, weight=0 if f_lo is set).
+    f_hi : float or None
+        End frequency where passband ends (above this, weight=0 if f_hi is set).
+    frac : float
+        Fraction of the band (f_hi - f_lo) used for EACH taper edge. Typical 0.05–0.2.
+
+    Returns
+    -------
+    w : (N,) array in [0,1]
+    """
+    f = np.asarray(f, float)
+    if f_lo is None and f_hi is None:
+        return np.ones_like(f)
+
+    # Sensible defaults
+    if f_lo is None:
+        f_lo = float(f[0])
+    if f_hi is None:
+        f_hi = float(f[-1])
+
+    if not (f_hi > f_lo):
+        raise ValueError("Require f_hi > f_lo for taper.")
+
+    bw = f_hi - f_lo
+    tw = max(frac * bw, 0.0)
+
+    w = np.zeros_like(f)
+
+    # Flat region
+    flat = (f >= f_lo + tw) & (f <= f_hi - tw)
+    w[flat] = 1.0
+
+    # Low-end ramp 0 -> 1
+    lo = (f >= f_lo) & (f < f_lo + tw) if tw > 0 else (f >= f_lo)
+    if np.any(lo) and tw > 0:
+        x = (f[lo] - f_lo) / tw  # 0..1
+        w[lo] = 0.5 * (1.0 - np.cos(np.pi * x))
+    elif np.any(lo) and tw == 0:
+        w[lo] = 1.0
+
+    # High-end ramp 1 -> 0
+    hi = (f > f_hi - tw) & (f <= f_hi) if tw > 0 else (f <= f_hi)
+    if np.any(hi) and tw > 0:
+        x = (f_hi - f[hi]) / tw  # 0..1
+        w[hi] = np.minimum(w[hi], 0.5 * (1.0 - np.cos(np.pi * x))) if np.any(flat) else 0.5 * (1.0 - np.cos(np.pi * x))
+        # simpler: overwrite for hi region (safe because hi doesn't overlap flat except boundary)
+        w[hi] = 0.5 * (1.0 - np.cos(np.pi * x))
+    elif np.any(hi) and tw == 0:
+        # keep whatever was set by lo/flat
+        pass
+
+    # Ensure outside [f_lo,f_hi] is zero
+    w[(f < f_lo) | (f > f_hi)] = 0.0
+    return w
+
+
+def ifft_one_sided_to_time(
+    freqs_hz,
+    H_pos,
+    *,
+    pad_factor: int = 8,
+    make_real: bool = True,
+    scale_physical: bool = True,
+    analytic_preserve_amplitude: bool = True,
+    # --- NEW: frequency-domain windowing ---
+    window: str | None = "taper",      # None/"taper"
+    f_lo: float | None = None,         # e.g. your reliable low cutoff (Hz)
+    f_hi: float | None = None,         # e.g. your reliable high cutoff (Hz)
+    taper_frac: float = 0.10,          # 5–20% typical
+):
+    """
+    IFFT a one-sided spectrum H_pos defined on a uniform f>=0 grid.
+
+    Windowing:
+      If window="taper", applies a smooth cosine taper in frequency to suppress
+      hard band edges / DC padding discontinuities that cause ringing/bricks.
+
+      - f_lo: start of passband (below: taper to 0)
+      - f_hi: end of passband (above: taper to 0)
+      - taper_frac: fraction of (f_hi-f_lo) used for each edge taper
+    """
+    f = np.asarray(freqs_hz, dtype=float)
+    H = np.asarray(H_pos, dtype=np.complex128)
+
+    if f.ndim != 1 or H.ndim != 1 or f.size != H.size:
+        raise ValueError("freqs_hz and H_pos must be 1D arrays of equal length.")
+
+    df = np.median(np.diff(f))
+    if not np.allclose(np.diff(f), df, rtol=1e-6, atol=0.0):
+        raise ValueError("freqs_hz must be uniformly spaced for IFFT.")
+
+    # ---- Apply frequency window BEFORE padding ----
+    if window is None:
+        Hw = H
+    elif window == "taper":
+        # Default f_lo/f_hi to the provided grid limits if not specified
+        f_lo_eff = f_lo if f_lo is not None else float(f[0])
+        f_hi_eff = f_hi if f_hi is not None else float(f[-1])
+        w = _cosine_taper_onesided(f, f_lo=f_lo_eff, f_hi=f_hi_eff, frac=taper_frac)
+        Hw = H * w
+    else:
+        raise ValueError(f"Unknown window={window!r}. Use None or 'taper'.")
+
+    n = Hw.size
+    n_pad = max(n, int(pad_factor * n))
+
+    Hp = np.zeros(n_pad, dtype=np.complex128)
+    Hp[:n] = Hw
+
+    # Optional amplitude preservation for analytic (one-sided) IFFT
+    if (not make_real) and analytic_preserve_amplitude:
+        # double all positive-frequency bins except DC (index 0)
+        Hp[1:n] *= 2.0
+
+    if make_real:
+        # Construct two-sided Hermitian spectrum:
+        # [0..fmax] + conjugate of [fmax-df .. df]
+        Hfull = np.concatenate([Hp, np.conjugate(Hp[-2:0:-1])])
+        Nfft = Hfull.size
+        ht = np.fft.ifft(Hfull)
+    else:
+        Nfft = n_pad
+        ht = np.fft.ifft(Hp, n=Nfft)
+
+    if scale_physical:
+        ht *= (Nfft * df)
+
+    dt = 1.0 / (Nfft * df)
+    t = np.arange(Nfft) * dt
+    return t, ht
