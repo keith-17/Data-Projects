@@ -29,3 +29,5 @@ capgemini/results/
 capgemini/simple_reports/
 dxc_tech/results/
 wavetime_attempt/.idea/
+wavetime_attempt/*.png
+wavetime_attempt/__pycache__/utility_files.cpython-310.pyc
