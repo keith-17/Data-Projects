@@ -23,3 +23,12 @@ cursor rag/
 Inference Group/.env
 Inference Group/rag_data
 Inference Group/django-errors.log
+capgemini/data/
+dxc_tech/data/
+capgemini/results/
+capgemini/simple_reports/
+dxc_tech/results/
+wavetime_attempt/.idea/
+wavetime_attempt/*.png
+wavetime_attempt/__pycache__/utility_files.cpython-310.pyc
+dxc_tech/final_answer/
