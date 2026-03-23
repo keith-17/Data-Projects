@@ -1,11 +1,4 @@
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-# Force project root onto sys.path
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from fastapi.testclient import TestClient
 
@@ -17,22 +10,26 @@ def make_mock_model_service(category="Standard", confidence=0.73):
 
 
 def test_health():
-    from app.main import app
+    mock_service = make_mock_model_service()
 
-    client = TestClient(app)
-    response = client.get("/health")
+    with patch("app.main.get_model_service", return_value=mock_service):
+        from app import app
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "ok"
-    assert "model_version" in body
+        client = TestClient(app)
+        response = client.get("/health")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["model_loaded"] is True
+        assert "model_version" in body
 
 
 def test_predict():
     mock_service = make_mock_model_service(category="Premium", confidence=0.91)
 
     with patch("app.main.get_model_service", return_value=mock_service):
-        from app.main import app
+        from app import app
 
         client = TestClient(app)
         payload = {
@@ -56,7 +53,7 @@ def test_predict_invalid_input():
     mock_service = make_mock_model_service()
 
     with patch("app.main.get_model_service", return_value=mock_service):
-        from app.main import app
+        from app import app
 
         client = TestClient(app)
         payload = {

@@ -13,3 +13,11 @@ class PredictResponse(BaseModel):
     predictedCategory: str
     confidence: float
     model_version: str
+
+
+class BatchPredictRequest(BaseModel):
+    centers: list[CenterFeatures] = Field(..., min_length=1)
+
+
+class BatchPredictResponse(BaseModel):
+    predictions: list[PredictResponse]
