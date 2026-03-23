@@ -35,3 +35,5 @@ dxc_tech/final_answer/
 research_center_assignment/data/
 research_center_assignment/models/
 research_center_assignment/__pycache__/
+research_center_assignment/app/__pycache__/
+research_center_assignment/tests/__pycache__/
