@@ -35,3 +35,4 @@ dxc_tech/final_answer/
 research_center_assignment/research_centers.csv
 research_center_assignment/models/
 
+research_center_assignment/__pycache__/
