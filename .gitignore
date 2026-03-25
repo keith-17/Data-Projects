@@ -38,3 +38,5 @@ research_center_assignment/__pycache__/
 research_center_assignment/app/__pycache__/
 research_center_assignment/tests/__pycache__/
 cmi_kaggle/data/
+cmi_kaggle/temp_calculations/
+cmi_kaggle/__pycache__/
