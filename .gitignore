@@ -42,3 +42,4 @@ cmi_kaggle/temp_calculations/
 cmi_kaggle/__pycache__/
 cmi_kaggle/.idea/
 cmi_kaggle/model_runs/
+cmi_kaggle/trained_models/
