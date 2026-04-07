@@ -1,10 +1,15 @@
 import numpy as np
 import pandas as pd
-from scipy.fft import fft, fftfreq
+
 from sklearn.base import BaseEstimator, ClassifierMixin, clone, TransformerMixin
 from joblib import parallel
 from contextlib import contextmanager
 from tqdm.auto import tqdm
+from scipy.ndimage import label, center_of_mass
+from sklearn.preprocessing import LabelEncoder
+from sklearn.decomposition import PCA
+from scipy.fft import fft, fftfreq, ifft
+from pathlib import Path
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
@@ -77,9 +82,12 @@ def extract_features(
 
 class ImuExtractor(BaseEstimator, TransformerMixin):
     def __init__(self,
-                 imu_sensor_list: list = None, # Default values
-                 sampling_rate: int =100,
-                 domain: str = 'acceleration',
+                 imu_sensor_list: list = None,
+                 rotation_sensor_list: list = None,
+                 thermopile_sensor_list: list = None,
+                 sampling_rate: int = 100,
+                 imu_domain: str = 'acceleration',
+                 rotation_domain: str = 'acceleration',
                  dc_offset: float = 2.0,
                  band_edges: list = None,
                  subject_df: pd.DataFrame = None,
@@ -88,11 +96,15 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                  segmentation: str = None,
                  window: float = 2.0,
                  step_sec: float = 1.0,
-                 combine_axes: bool = False
+                 combine_imu_axes: bool = False,
+                 combine_rot_axes: bool = False,
+                 tof_sensor_list: list = None,
+                 tof_mode: str = None
                  ):
         self.imu_sensor_list = imu_sensor_list
+        self.rotation_sensor_list = rotation_sensor_list
         self.sampling_rate = sampling_rate
-        self.domain = domain
+        self.imu_domain = imu_domain
         self.dc_offset = dc_offset
         self.band_edges = band_edges
         self.subject_df = subject_df
@@ -101,10 +113,16 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         self.segmentation = segmentation
         self.window = window
         self.step_sec = step_sec
-        self.combine_axes = combine_axes
+        self.combine_imu_axes = combine_imu_axes
+        self.rotation_domain = rotation_domain
+        self.combine_rot_axes = combine_rot_axes
+        self.thermopile_sensor_list = thermopile_sensor_list
+        self.tof_sensor_list = tof_sensor_list
+        self.tof_mode = tof_mode
 
     def fit(self, X, y=None):
-        if self.domain == 'time' and self.band_edges is not None:
+        # print(X.shape, y.shape)
+        if self.imu_domain == 'time' and self.band_edges is not None:
             self.band_edges = None
         return self
 
@@ -124,18 +142,37 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                                                             self.sampling_rate)
             else:
                 sequence_groups_list = self.split_segments(single_sequence_df, self.segmentation)
+
             for segmented_sequence_df in sequence_groups_list:
                 singular_record_list = []
                 if self.imu_sensor_list:
                     imu_df = self.process_for_imu_values(segmented_sequence_df)
-                    if self.domain == 'time':
+                    if self.imu_domain == 'time':
                         imu_features_df = self.extract_time_features(imu_df)
                     else:
-                        imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges, self.combine_axes)
+                        imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges, self.combine_imu_axes)
 
                     imu_features_df = imu_features_df.reset_index(drop=True)
                     imu_features_df['sequence_id'] = a_sequence
                     singular_record_list.append(imu_features_df)
+
+                if self.rotation_sensor_list:
+                    rot_df = segmented_sequence_df[self.rotation_sensor_list]
+                    if self.rotation_domain != 'time':
+                        rot_df = rot_df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
+                        rot_df = self.filter_signal(rot_df)
+                        rot_features_df = self.extract_rotation_features(rot_df, self.combine_rot_axes)
+                        singular_record_list.append(rot_features_df)
+
+                # After rotation features, add thermopile
+                if self.thermopile_sensor_list:
+                    thm_df = segmented_sequence_df[self.thermopile_sensor_list]
+                    thm_df = self.extract_thermopile_features(thm_df)
+                    singular_record_list.append(thm_df)
+
+                if self.tof_sensor_list:
+                    tof_df = self.extract_tof_features(segmented_sequence_df)
+                    singular_record_list.append(tof_df)
 
                 category_df = self.return_single_category_desc_record(segmented_sequence_df, self.category_data)
                 singular_record_list.append(category_df)
@@ -151,6 +188,21 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
         final_df = final_df.set_index('sequence_id').fillna(0)
         return final_df
+
+    @staticmethod
+    def extract_thermopile_features(thm_df: pd.DataFrame) -> pd.DataFrame:
+        """Extract simple stats from thermopile sensors"""
+        if thm_df.empty:
+            return pd.DataFrame()
+
+        features = {}
+        for col in thm_df.columns:
+            features[f'{col}_mean'] = thm_df[col].mean()
+            features[f'{col}_std'] = thm_df[col].std()
+            features[f'{col}_min'] = thm_df[col].min()
+            features[f'{col}_max'] = thm_df[col].max()
+
+        return pd.DataFrame([features])
 
     def window_segments(self, df: pd.DataFrame, window_sec: float, step_sec: float, sampling_rate: int) -> list:
         """Split dataframe into windows based on sequence_counter"""
@@ -180,11 +232,17 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
     def process_for_imu_values(self, df: pd.DataFrame) -> pd.DataFrame:
         df = self.get_accelerometer_values(df)
-        if self.domain != 'time':
-            df = df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
-            df = self.apply_domain_scaling(df, df.index, self.domain)
-            df = self.filter_signal(df)
-        return df
+        if self.imu_domain == 'time':
+            return df
+        elif self.imu_domain == 'acceleration':
+            df = df.apply(self.preprocess_time_signal, axis=0)
+            return df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
+        elif self.imu_domain in ['velocity', 'displacement']:
+            complex_fft = df.apply(self._fft_complex, axis=0)
+            scaled_fft = self._scale_frequency_domain(complex_fft, self.imu_domain)
+            return self._ifft_to_time(scaled_fft, len(df))
+        else:
+            raise ValueError(f"Unknown imu_domain: {self.imu_domain}")
 
     def get_accelerometer_values(self, sensor_values: pd.DataFrame) -> pd.DataFrame:
         return sensor_values[self.imu_sensor_list]
@@ -203,6 +261,14 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
             return fft_df
         return fft_df.mul(scale_factor, axis=0)
 
+    def preprocess_time_signal(self, signal: pd.Series) -> pd.Series:
+        signal = signal.astype(float).copy()
+        signal = signal - signal.mean()
+        signal = signal.rolling(window=3, center=True, min_periods=1).mean()
+        window = np.hanning(len(signal))
+        signal = signal * window
+        return pd.Series(signal, index=signal.index, name=signal.name)
+
     @staticmethod
     def convert_frame_to_fft(df: pd.DataFrame, sampling_rate: int, sample_points_N: int = None, **kwargs) -> pd.Series:
         sample_interval_T = 1 / sampling_rate
@@ -213,6 +279,39 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         single_axis_fft_values = abs(fft(array_values))[0:sample_points_N // 2]
         single_axis_fft_columns = fftfreq(sample_points_N, sample_interval_T)[0:sample_points_N // 2]
         return pd.Series(single_axis_fft_values, index=single_axis_fft_columns, name='Frequency')
+
+    def _fft_complex(self, series: pd.Series) -> np.ndarray:
+        """Return complex FFT (preserves phase information)."""
+        return fft(series.values)
+
+    def _scale_frequency_domain(self, fft_complex: pd.DataFrame, domain: str) -> pd.DataFrame:
+        """Scale complex FFT for integration/differentiation."""
+        n = len(fft_complex.index)
+        freqs = fftfreq(n, 1 / self.sampling_rate)
+        freqs = np.where(freqs == 0, 1e-6, freqs)  # Avoid division by zero
+
+        if domain == 'velocity':
+            # V = A / (j * 2πf)
+            scale = 1 / (2j * np.pi * freqs)
+        elif domain == 'displacement':
+            # D = A / (-(2πf)²)
+            scale = 1 / (-(2 * np.pi * freqs) ** 2)
+        else:
+            scale = 1
+
+        # Apply scaling to each column
+        scaled = fft_complex.copy()
+        for col in fft_complex.columns:
+            scaled[col] = fft_complex[col].values * scale
+        return scaled
+
+    def _ifft_to_time(self, scaled_fft: pd.DataFrame, original_length: int) -> pd.DataFrame:
+        """Convert scaled FFT back to time domain."""
+        result = {}
+        for col in scaled_fft.columns:
+            time_signal = np.real(ifft(scaled_fft[col].values))[:original_length]
+            result[col] = time_signal
+        return pd.DataFrame(result, index=range(original_length))
 
     @staticmethod
     def extract_features_from_imu(fft_df: pd.DataFrame, band_edges: list = None,
@@ -310,35 +409,233 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
             segments.append(group.assign(segment_id=i))
         return segments
 
+    def process_rotation_values(self, df: pd.DataFrame, domain: str) -> pd.DataFrame:
+        if domain != 'time':
+            rot_df = df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
+            rot_df = self.apply_domain_scaling(rot_df, rot_df.index, domain)
+            rot_df = self.filter_signal(rot_df)
+        else:
+            return df
+        return rot_df
+
+    @staticmethod
+    def extract_rotation_features(rot_df: pd.DataFrame, combine_axes: bool = False) -> pd.DataFrame:
+        """Extract simple stats from rotation quaternions"""
+        if rot_df.empty:
+            return pd.DataFrame()
+
+        features = {}
+
+        # Single axis features
+        for col in rot_df.columns:
+            features[f'{col}_mean'] = rot_df[col].mean()
+            features[f'{col}_std'] = rot_df[col].std()
+            features[f'{col}_min'] = rot_df[col].min()
+            features[f'{col}_max'] = rot_df[col].max()
+
+        # Combined magnitude (sqrt(w² + x² + y² + z²) = 1 for unit quaternions, but may vary)
+        if combine_axes and len(rot_df.columns) >= 2:
+            # Combined magnitude
+            combined = np.sqrt(np.sum([rot_df[col].values ** 2 for col in rot_df.columns], axis=0))
+            features['rot_magnitude_mean'] = np.mean(combined)
+            features['rot_magnitude_std'] = np.std(combined)
+            features['rot_magnitude_min'] = np.min(combined)
+            features['rot_magnitude_max'] = np.max(combined)
+
+            # Pairwise combinations
+            from itertools import combinations
+            for ax1, ax2 in combinations(rot_df.columns, 2):
+                pair = np.sqrt(rot_df[ax1].values ** 2 + rot_df[ax2].values ** 2)
+                features[f'{ax1}_{ax2}_mean'] = np.mean(pair)
+                features[f'{ax1}_{ax2}_std'] = np.std(pair)
+
+        return pd.DataFrame([features])
+
+    @staticmethod
+    def process_thermopile_values(df: pd.DataFrame) -> pd.DataFrame:
+        """Extract stats from thermopile sensors (no FFT)"""
+        thm_cols = ['thm_1', 'thm_2', 'thm_3', 'thm_4', 'thm_5']
+        thm_cols = [col for col in thm_cols if col in df.columns]
+
+        if not thm_cols:
+            return pd.DataFrame()
+
+        features = {}
+        for col in thm_cols:
+            features[f'{col}_mean'] = df[col].mean()
+            features[f'{col}_std'] = df[col].std()
+            features[f'{col}_min'] = df[col].min()
+            features[f'{col}_max'] = df[col].max()
+
+        return pd.DataFrame([features])
+
+    def extract_tof_features(self, segmented_sequence_df: pd.DataFrame) -> pd.DataFrame:
+        if segmented_sequence_df.empty:
+            return pd.DataFrame()
+
+        all_cols = segmented_sequence_df.columns
+        sensor_prefixes = sorted(list(set(['_'.join(c.split('_')[:-1])
+                                           for c in all_cols if '_v' in c])))
+
+        all_sensor_features = {}
+
+        for sensor_id in sensor_prefixes:
+            s_cols = [c for c in all_cols if c.startswith(f"{sensor_id}_v")]
+            s_cols = sorted(s_cols, key=lambda x: int(x.split('_v')[-1]))
+
+            if len(s_cols) != 64:
+                continue
+
+            raw_values = segmented_sequence_df[s_cols].values
+            raw_values = np.where((raw_values <= 0) | (raw_values >= 4000), np.nan, raw_values)
+            frames = raw_values.reshape(-1, 8, 8)
+
+            if self.tof_mode == 'research':
+                all_sensor_features.update(self.tof_research_logic(frames, sensor_id))
+            else:
+                all_sensor_features.update(self.tof_simple_logic(frames, sensor_id))
+        return pd.DataFrame([all_sensor_features])
+
+    @staticmethod
+    def tof_simple_logic(frames: np.ndarray, sensor_id: str) -> dict:
+        """Simple Version: Zone-based averages"""
+        mean_frame = np.nanmean(frames, axis=0)
+        if np.all(np.isnan(mean_frame)):
+            return {
+                f"{sensor_id}_simple_min": 4000.0,
+                f"{sensor_id}_simple_avg": 4000.0,
+                f"{sensor_id}_center_avg": 4000.0,
+                f"{sensor_id}_top_avg": 4000.0,
+                f"{sensor_id}_bottom_avg": 4000.0,
+            }
+        mean_frame = np.nan_to_num(mean_frame, nan=4000.0)
+        return {
+            f"{sensor_id}_simple_min": np.min(mean_frame),
+            f"{sensor_id}_simple_avg": np.mean(mean_frame),
+            f"{sensor_id}_center_avg": np.mean(mean_frame[2:6, 2:6]),
+            f"{sensor_id}_top_avg": np.mean(mean_frame[:4, :]),
+            f"{sensor_id}_bottom_avg": np.mean(mean_frame[4:, :]),
+        }
+
+
+    @staticmethod
+    def tof_research_logic(frames: np.ndarray, sensor_id: str) -> dict:
+        mean_frame = np.nanmean(frames, axis=0)
+
+        feat = {
+            f"{sensor_id}_blob_area": 0,
+            f"{sensor_id}_mass_r": 4,
+            f"{sensor_id}_mass_c": 4,
+            f"{sensor_id}_motion_intensity": 0,
+        }
+
+        if np.all(np.isnan(mean_frame)):
+            return feat
+
+        mean_frame = np.nan_to_num(mean_frame, nan=4000.0)
+
+        mask = mean_frame < 1500
+        labeled, num_blobs = label(mask)
+
+        if num_blobs > 0:
+            counts = np.bincount(labeled.ravel())
+            counts[0] = 0
+            largest = counts.argmax()
+
+            weights = np.maximum(0, 1500 - mean_frame)
+            weights[labeled != largest] = 0
+            if weights.sum() > 0:
+                r, c = center_of_mass(weights)
+                feat[f"{sensor_id}_blob_area"] = np.sum(labeled == largest)
+                feat[f"{sensor_id}_mass_r"] = r
+                feat[f"{sensor_id}_mass_c"] = c
+
+        if frames.shape[0] > 1:
+            diffs = np.abs(np.diff(frames, axis=0))
+            motion = np.nanmean(diffs)
+            feat[f"{sensor_id}_motion_intensity"] = 0 if np.isnan(motion) else motion
+
+        return feat
+
 
 class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, estimator):
+    def __init__(self, estimator, extractor, mode=None, target: str = 'gesture', **kwargs):
         self.estimator = estimator
+        self.extractor = extractor
+        self.mode = mode
+        self.target = target
 
-    def _get_tags(self):
-        return {'multioutput': True}
+    def _collapse_y_to_sequence(self, X, y):
+        # build one label per sequence_id
+        gesture_map = (
+            y.drop_duplicates(subset='sequence_id')
+             .set_index('sequence_id')[self.target]
+        )
+
+        y_seq = pd.Series(X.index.map(gesture_map), index=X.index, name=self.target)
+
+        if y_seq.isna().any():
+            missing_ids = y_seq[y_seq.isna()].index.unique().tolist()
+            raise ValueError(
+                f"Missing gesture labels after aligning to X.index. "
+                f"Example missing sequence_id values: {missing_ids[:10]}"
+            )
+
+        if len(y_seq) == 0:
+            raise ValueError("y_seq is empty after collapsing to sequence level.")
+
+        return y_seq
 
     def fit(self, X, y):
-        # Slices y to get one label per sequence
-        y_seq = y.groupby('sequence_id', sort=False)['gesture'].first()
-        self.estimator_ = clone(self.estimator)
-        self.estimator_.fit(X, y_seq)
+        gesture_map = (
+            y.drop_duplicates(subset='sequence_id')
+                .set_index('sequence_id')[self.target]
+        )
+
+        y_seq = X.index.to_series().map(gesture_map)
+
+        # 🚨 DROP BAD ALIGNMENTS
+        valid_mask = y_seq.notna()
+        X = X.loc[valid_mask]
+        y_seq = y_seq.loc[valid_mask]
+
+        if len(y_seq) == 0:
+            raise ValueError("No valid labels after alignment — check sequence_id mismatch.")
+
+        if self.mode == 'xgboost':
+            self.label_encoder_ = LabelEncoder()
+            y_enc = self.label_encoder_.fit_transform(y_seq)
+
+            if len(np.unique(y_enc)) == 0:
+                raise ValueError("No classes in this fold")
+
+            self.estimator_ = clone(self.estimator)
+            self.estimator_.fit(X, y_enc)
+
+        else:
+            self.estimator_ = clone(self.estimator)
+            self.estimator_.fit(X, y_seq)
+
         return self
 
     def predict(self, X):
-        return self.estimator_.predict(X)
+        preds = self.estimator_.predict(X)
+        if self.mode == 'xgboost':
+            preds = self.label_encoder_.inverse_transform(preds.astype(int))
+        return preds
+
+    def predict_proba(self, X):
+        return self.estimator_.predict_proba(X)
 
     def score(self, X, y, sample_weight=None):
-        y_true_seq = y.groupby('sequence_id', sort=False)['gesture'].first()
+        y_true = self._collapse_y_to_sequence(X, y).to_numpy()
         y_pred = self.predict(X)
 
-        # Manual accuracy calculation
         if sample_weight is not None:
-            # Handle weighted accuracy if needed
-            correct = (y_true_seq == y_pred).astype(int)
+            correct = (y_true == y_pred).astype(int)
             return np.average(correct, weights=sample_weight)
-        else:
-            return np.mean(y_true_seq == y_pred)
+
+        return np.mean(y_true == y_pred)
 
 @contextmanager
 def tqdm_joblib(tqdm_object):
@@ -356,7 +653,118 @@ def tqdm_joblib(tqdm_object):
         tqdm_object.close()
 
 
-def existing_cols(cols):
-    def selector(X):
-        return [c for c in cols if c in X.columns]
-    return selector
+class existing_cols:
+    def __init__(self, cols):
+        self.cols = cols
+
+    def __call__(self, X):
+        return [c for c in self.cols if c in X.columns]
+
+
+def attach_metadata(grid_search):
+    model = grid_search.best_estimator_
+
+    wrapped_clf = model.named_steps["classifier"]
+    rf = wrapped_clf.estimator_
+
+    feature_names = model.named_steps["preprocessor"].get_feature_names_out()
+
+    model.metadata_ = {
+        "best_score": float(grid_search.best_score_),
+        "best_params": grid_search.best_params_,
+    }
+
+    model.feature_importances_ = {
+        "feature_names": feature_names.tolist(),
+        "importances": rf.feature_importances_.tolist()
+    }
+
+    return model
+
+
+def sample_balanced_split(df, train_pct=0.20, test_pct=0.05, random_state=42):
+    total_sequences = df['sequence_id'].nunique()
+    n_gestures = df['gesture'].nunique()
+    n_subjects = df['subject'].nunique()
+
+    train_target = int(total_sequences * train_pct)
+    test_target  = int(total_sequences * test_pct)
+
+    train_seqs_per_cell = train_target // (n_subjects * n_gestures)
+    test_seqs_per_cell  = test_target  // (n_subjects * n_gestures)
+
+    min_pct = n_subjects * n_gestures / total_sequences
+
+    if train_seqs_per_cell == 0 or test_seqs_per_cell == 0:
+        raise ValueError(
+            f"Percentage too small. "
+            f"Min viable pct for this data: {min_pct:.1%}"
+        )
+
+    train_ids, test_ids = [], []
+
+    for _, group in df.groupby(['subject', 'gesture']):
+        unique_seqs = group['sequence_id'].drop_duplicates().sample(frac=1, random_state=random_state)
+
+        n_train = min(train_seqs_per_cell, len(unique_seqs))
+        n_test  = min(test_seqs_per_cell,  len(unique_seqs) - n_train)
+
+        train_ids.extend(unique_seqs.iloc[:n_train].tolist())
+        test_ids.extend( unique_seqs.iloc[n_train:n_train + n_test].tolist())
+
+    train_df = df[df['sequence_id'].isin(train_ids)]
+    test_df = df[df['sequence_id'].isin(test_ids)]
+
+    assert len(set(train_ids) & set(test_ids)) == 0, "Overlap detected!"
+
+    print(f"Train: {train_df['sequence_id'].nunique()} seqs | {100*train_df['sequence_id'].nunique()/total_sequences:.1f}%")
+    print(f"Test:  {test_df['sequence_id'].nunique()} seqs  | {100*test_df['sequence_id'].nunique()/total_sequences:.1f}%")
+
+    return train_df, test_df
+
+
+class IndexPreservingPCA(BaseEstimator, TransformerMixin):
+    def __init__(self, n_components=None):
+        self.n_components = n_components
+        self.pca = PCA(n_components=n_components)
+
+    def fit(self, X, y=None):
+        self.pca.fit(X)
+        return self
+
+    def transform(self, X):
+        # Transform to numpy array
+        X_transformed = self.pca.transform(X)
+        # Return as DataFrame with same index
+        return pd.DataFrame(X_transformed, index=X.index)
+
+    def fit_transform(self, X, y=None):
+        self.fit(X)
+        return self.transform(X)
+
+
+def find_data_root(local_dir='data', kaggle_root='/kaggle/input'):
+    local_path = Path(local_dir)
+    required = [
+        'train.csv',
+        'test.csv',
+        'train_demographics.csv',
+        'test_demographics.csv'
+    ]
+
+    if local_path.exists() and all((local_path / f).exists() for f in required):
+        print(f'Using local data folder: {local_path.resolve()}')
+        return local_path
+
+    kaggle_root = Path(kaggle_root)
+    if kaggle_root.exists():
+        for csv_path in kaggle_root.rglob('train.csv'):
+            candidate = csv_path.parent
+            if all((candidate / f).exists() for f in required):
+                print(f'Using Kaggle data folder: {candidate}')
+                return candidate
+
+    raise FileNotFoundError(
+        'Could not find the dataset locally or in /kaggle/input. '
+        'Place the CSV files in ./data/ or attach the Kaggle dataset.'
+    )
