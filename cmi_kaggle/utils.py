@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-
 from sklearn.base import BaseEstimator, ClassifierMixin, clone, TransformerMixin
 from joblib import parallel
 from contextlib import contextmanager
@@ -10,6 +9,15 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.decomposition import PCA
 from scipy.fft import fft, fftfreq, ifft
 from pathlib import Path
+from scipy import ndimage
+import pywt
+import warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+from tensorflow import keras
+from tensorflow.keras import layers
+from sklearn.utils.validation import check_is_fitted
+from sklearn.utils.class_weight import compute_class_weight
+import tensorflow as tf
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
@@ -87,7 +95,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                  thermopile_sensor_list: list = None,
                  sampling_rate: int = 100,
                  imu_domain: str = 'acceleration',
-                 rotation_domain: str = 'acceleration',
+                 rotation_domain: str = 'motion',
                  dc_offset: float = 2.0,
                  band_edges: list = None,
                  subject_df: pd.DataFrame = None,
@@ -99,7 +107,8 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                  combine_imu_axes: bool = False,
                  combine_rot_axes: bool = False,
                  tof_sensor_list: list = None,
-                 tof_mode: str = None
+                 tof_mode: str = 'baseline',
+                 thermopile_mode: str = 'baseline'
                  ):
         self.imu_sensor_list = imu_sensor_list
         self.rotation_sensor_list = rotation_sensor_list
@@ -119,6 +128,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         self.thermopile_sensor_list = thermopile_sensor_list
         self.tof_sensor_list = tof_sensor_list
         self.tof_mode = tof_mode
+        self.thermopile_mode = thermopile_mode
 
     def fit(self, X, y=None):
         # print(X.shape, y.shape)
@@ -158,11 +168,9 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
                 if self.rotation_sensor_list:
                     rot_df = segmented_sequence_df[self.rotation_sensor_list]
-                    if self.rotation_domain != 'time':
-                        rot_df = rot_df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
-                        rot_df = self.filter_signal(rot_df)
-                        rot_features_df = self.extract_rotation_features(rot_df, self.combine_rot_axes)
-                        singular_record_list.append(rot_features_df)
+                    rot_df = self.process_rotation_values(rot_df, self.rotation_domain)
+                    rot_features_df = self.extract_rotation_features(rot_df, self.combine_rot_axes)
+                    singular_record_list.append(rot_features_df)
 
                 # After rotation features, add thermopile
                 if self.thermopile_sensor_list:
@@ -189,18 +197,250 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         final_df = final_df.set_index('sequence_id').fillna(0)
         return final_df
 
+    def process_rotation_values(self, df: pd.DataFrame, domain: str) -> pd.DataFrame:
+        euler_df = self.quaternion_to_euler(df)
+        euler_df = self.unwrap_angles(euler_df)
+
+        if domain == 'orientation':
+            return euler_df
+
+        elif domain == 'motion':
+            motion_df = euler_df.diff().fillna(0)
+            return motion_df
+
+        elif domain == 'frequency':
+            motion_df = euler_df.diff().fillna(0)
+            fft_df = motion_df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
+            fft_df = self.filter_signal(fft_df)
+            return fft_df
+
+        else:
+            raise ValueError(f"Unknown rotation_domain: {domain}")
+
     @staticmethod
-    def extract_thermopile_features(thm_df: pd.DataFrame) -> pd.DataFrame:
-        """Extract simple stats from thermopile sensors"""
+    def quaternion_to_euler(df: pd.DataFrame) -> pd.DataFrame:
+        q = df.astype(float).copy()
+
+        w = q.iloc[:, 0].values
+        x = q.iloc[:, 1].values
+        y = q.iloc[:, 2].values
+        z = q.iloc[:, 3].values
+
+        t0 = 2.0 * (w * x + y * z)
+        t1 = 1.0 - 2.0 * (x * x + y * y)
+        roll = np.arctan2(t0, t1)
+
+        t2 = 2.0 * (w * y - z * x)
+        t2 = np.clip(t2, -1.0, 1.0)
+        pitch = np.arcsin(t2)
+
+        t3 = 2.0 * (w * z + x * y)
+        t4 = 1.0 - 2.0 * (y * y + z * z)
+        yaw = np.arctan2(t3, t4)
+
+        return pd.DataFrame({
+            'rot_roll': roll,
+            'rot_pitch': pitch,
+            'rot_yaw': yaw,
+        }, index=df.index)
+
+    def extract_rotation_features(self, rot_df: pd.DataFrame, combine_axes: bool = False) -> pd.DataFrame:
+        if rot_df.empty:
+            return pd.DataFrame()
+
+        if self.rotation_domain in ['orientation', 'motion']:
+            return self.extract_rotation_time_features(rot_df, combine_axes)
+        elif self.rotation_domain == 'frequency':
+            return self.extract_rotation_frequency_features(rot_df, combine_axes)
+        else:
+            raise ValueError(f"Unknown rotation_domain: {self.rotation_domain}")
+
+    @staticmethod
+    def extract_rotation_time_features(rot_df: pd.DataFrame, combine_axes: bool = False) -> pd.DataFrame:
+        features = {}
+
+        for col in rot_df.columns:
+            values = rot_df[col].values
+
+            features[f'{col}_mean'] = np.mean(values)
+            features[f'{col}_std'] = np.std(values)
+            features[f'{col}_min'] = np.min(values)
+            features[f'{col}_max'] = np.max(values)
+            features[f'{col}_rms'] = np.sqrt(np.mean(values ** 2))
+            features[f'{col}_energy'] = np.sum(values ** 2)
+            features[f'{col}_abs_mean'] = np.mean(np.abs(values))
+            features[f'{col}_peak_to_peak'] = np.ptp(values)
+            features[f'{col}_zero_crossings'] = np.where(np.diff(np.sign(values)))[0].size
+
+        if combine_axes and len(rot_df.columns) >= 2:
+            combined = np.sqrt(np.sum([rot_df[col].values ** 2 for col in rot_df.columns], axis=0))
+
+            features['rot_magnitude_mean'] = np.mean(combined)
+            features['rot_magnitude_std'] = np.std(combined)
+            features['rot_magnitude_min'] = np.min(combined)
+            features['rot_magnitude_max'] = np.max(combined)
+            features['rot_magnitude_rms'] = np.sqrt(np.mean(combined ** 2))
+            features['rot_magnitude_energy'] = np.sum(combined ** 2)
+            features['rot_magnitude_abs_mean'] = np.mean(np.abs(combined))
+            features['rot_magnitude_peak_to_peak'] = np.ptp(combined)
+
+        return pd.DataFrame([features])
+
+    @staticmethod
+    def unwrap_angles(df: pd.DataFrame) -> pd.DataFrame:
+        return pd.DataFrame(
+            {col: np.unwrap(df[col].values) for col in df.columns},
+            index=df.index
+        )
+
+    def extract_rotation_frequency_features(self, rot_df: pd.DataFrame, combine_axes: bool = False) -> pd.DataFrame:
+        features = {}
+        freqs = rot_df.index.values
+
+        if self.band_edges is None:
+            max_freq = float(np.nanmax(freqs)) if len(freqs) > 0 else 0.0
+            band_edges = np.arange(0, max_freq + 10, 10)
+            if len(band_edges) < 2:
+                band_edges = np.array([0, max_freq + 1])
+        else:
+            band_edges = np.asarray(self.band_edges)
+
+        for col in rot_df.columns:
+            mags = rot_df[col].values
+            peak_idx = np.argmax(mags)
+
+            features[f'{col}_peak_freq'] = freqs[peak_idx]
+            features[f'{col}_peak_mag'] = mags[peak_idx]
+            features[f'{col}_total_energy'] = np.sum(mags ** 2)
+            features[f'{col}_mean'] = np.mean(mags)
+            features[f'{col}_std'] = np.std(mags)
+
+            for low, high in zip(band_edges[:-1], band_edges[1:]):
+                mask = (freqs >= low) & (freqs < high)
+                if np.any(mask):
+                    features[f'{col}_band_{low}_{high}_energy'] = np.sum(mags[mask] ** 2)
+
+        if combine_axes and len(rot_df.columns) >= 2:
+            combined = np.sqrt(np.sum([rot_df[col].values ** 2 for col in rot_df.columns], axis=0))
+            peak_idx = np.argmax(combined)
+
+            features['rot_all_peak_freq'] = freqs[peak_idx]
+            features['rot_all_peak_mag'] = combined[peak_idx]
+            features['rot_all_total_energy'] = np.sum(combined ** 2)
+            features['rot_all_mean'] = np.mean(combined)
+            features['rot_all_std'] = np.std(combined)
+
+            for low, high in zip(band_edges[:-1], band_edges[1:]):
+                mask = (freqs >= low) & (freqs < high)
+                if np.any(mask):
+                    features[f'rot_all_band_{low}_{high}_energy'] = np.sum(combined[mask] ** 2)
+
+        return pd.DataFrame([features])
+
+    def filter_signal(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df.loc[0:self.dc_offset] = 0
+        return df
+
+    def extract_thermopile_features(self, thm_df: pd.DataFrame) -> pd.DataFrame:
         if thm_df.empty:
             return pd.DataFrame()
 
-        features = {}
+        if self.thermopile_mode == 'baseline':
+            return self.extract_thermopile_baseline(thm_df)
+        elif self.thermopile_mode == 'spatial':
+            return self.extract_thermopile_spatial(thm_df)
+        else:
+            raise ValueError(f"Unknown thermopile_mode: {self.thermopile_mode}")
+
+    @staticmethod
+    def extract_thermopile_baseline(thm_df: pd.DataFrame) -> pd.DataFrame:
+        values = thm_df.astype(float).values.flatten()
+        values = values[np.isfinite(values)]
+
+        if len(values) == 0:
+            return pd.DataFrame([{
+                'thm_all_mean': 0.0,
+                'thm_all_std': 0.0,
+                'thm_all_min': 0.0,
+                'thm_all_max': 0.0,
+            }])
+
+        return pd.DataFrame([{
+            'thm_all_mean': np.mean(values),
+            'thm_all_std': np.std(values),
+            'thm_all_min': np.min(values),
+            'thm_all_max': np.max(values),
+        }])
+
+    @staticmethod
+    def extract_thermopile_spatial(thm_df: pd.DataFrame) -> pd.DataFrame:
+        thm_df = thm_df.astype(float)
+
+        sensor_means = thm_df.mean(axis=0)
+        sensor_stds = thm_df.std(axis=0)
+
+        all_values = thm_df.values.flatten()
+        all_values = all_values[np.isfinite(all_values)]
+
+        if len(all_values) == 0:
+            return pd.DataFrame([{
+                'thm_all_mean': 0.0,
+                'thm_all_std': 0.0,
+                'thm_all_min': 0.0,
+                'thm_all_max': 0.0,
+                'thm_spatial_range': 0.0,
+                'thm_hottest_sensor_idx': -1,
+                'thm_coolest_sensor_idx': -1,
+                'thm_left_right_diff': 0.0,
+                'thm_center_edge_diff': 0.0,
+                'thm_adjacent_diff_mean': 0.0,
+                'thm_adjacent_diff_max': 0.0,
+                'thm_sensor_mean_std': 0.0,
+            }])
+
+        sensor_mean_vals = sensor_means.values
+        hottest_idx = int(np.argmax(sensor_mean_vals))
+        coolest_idx = int(np.argmin(sensor_mean_vals))
+
+        adjacent_diffs = np.abs(np.diff(sensor_mean_vals))
+
+        # assumes thm_3 is roughly central and others are more peripheral
+        center_val = sensor_means.iloc[len(sensor_means) // 2]
+        edge_vals = sensor_means.drop(sensor_means.index[len(sensor_means) // 2]).values
+
+        # simple left/right split based on sensor order
+        left_mean = np.mean(sensor_mean_vals[:len(sensor_mean_vals) // 2])
+        right_mean = np.mean(sensor_mean_vals[len(sensor_mean_vals) // 2:])
+
+        features = {
+            'thm_all_mean': np.mean(all_values),
+            'thm_all_std': np.std(all_values),
+            'thm_all_min': np.min(all_values),
+            'thm_all_max': np.max(all_values),
+
+            'thm_spatial_range': np.max(sensor_mean_vals) - np.min(sensor_mean_vals),
+            'thm_hottest_sensor_idx': hottest_idx,
+            'thm_coolest_sensor_idx': coolest_idx,
+
+            'thm_left_right_diff': left_mean - right_mean,
+            'thm_center_edge_diff': center_val - np.mean(edge_vals),
+
+            'thm_adjacent_diff_mean': np.mean(adjacent_diffs) if len(adjacent_diffs) > 0 else 0.0,
+            'thm_adjacent_diff_max': np.max(adjacent_diffs) if len(adjacent_diffs) > 0 else 0.0,
+
+            'thm_sensor_mean_std': np.std(sensor_mean_vals),
+        }
+
+        # optional: per-sensor temporal stability
         for col in thm_df.columns:
-            features[f'{col}_mean'] = thm_df[col].mean()
-            features[f'{col}_std'] = thm_df[col].std()
-            features[f'{col}_min'] = thm_df[col].min()
-            features[f'{col}_max'] = thm_df[col].max()
+            values = thm_df[col].values
+            diffs = np.diff(values) if len(values) > 1 else np.array([0.0])
+
+            features[f'{col}_mean'] = np.mean(values)
+            features[f'{col}_std'] = np.std(values)
+            features[f'{col}_diff_mean'] = np.mean(diffs)
+            features[f'{col}_diff_std'] = np.std(diffs)
 
         return pd.DataFrame([features])
 
@@ -409,48 +649,6 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
             segments.append(group.assign(segment_id=i))
         return segments
 
-    def process_rotation_values(self, df: pd.DataFrame, domain: str) -> pd.DataFrame:
-        if domain != 'time':
-            rot_df = df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
-            rot_df = self.apply_domain_scaling(rot_df, rot_df.index, domain)
-            rot_df = self.filter_signal(rot_df)
-        else:
-            return df
-        return rot_df
-
-    @staticmethod
-    def extract_rotation_features(rot_df: pd.DataFrame, combine_axes: bool = False) -> pd.DataFrame:
-        """Extract simple stats from rotation quaternions"""
-        if rot_df.empty:
-            return pd.DataFrame()
-
-        features = {}
-
-        # Single axis features
-        for col in rot_df.columns:
-            features[f'{col}_mean'] = rot_df[col].mean()
-            features[f'{col}_std'] = rot_df[col].std()
-            features[f'{col}_min'] = rot_df[col].min()
-            features[f'{col}_max'] = rot_df[col].max()
-
-        # Combined magnitude (sqrt(w² + x² + y² + z²) = 1 for unit quaternions, but may vary)
-        if combine_axes and len(rot_df.columns) >= 2:
-            # Combined magnitude
-            combined = np.sqrt(np.sum([rot_df[col].values ** 2 for col in rot_df.columns], axis=0))
-            features['rot_magnitude_mean'] = np.mean(combined)
-            features['rot_magnitude_std'] = np.std(combined)
-            features['rot_magnitude_min'] = np.min(combined)
-            features['rot_magnitude_max'] = np.max(combined)
-
-            # Pairwise combinations
-            from itertools import combinations
-            for ax1, ax2 in combinations(rot_df.columns, 2):
-                pair = np.sqrt(rot_df[ax1].values ** 2 + rot_df[ax2].values ** 2)
-                features[f'{ax1}_{ax2}_mean'] = np.mean(pair)
-                features[f'{ax1}_{ax2}_std'] = np.std(pair)
-
-        return pd.DataFrame([features])
-
     @staticmethod
     def process_thermopile_values(df: pd.DataFrame) -> pd.DataFrame:
         """Extract stats from thermopile sensors (no FFT)"""
@@ -474,8 +672,10 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
             return pd.DataFrame()
 
         all_cols = segmented_sequence_df.columns
-        sensor_prefixes = sorted(list(set(['_'.join(c.split('_')[:-1])
-                                           for c in all_cols if '_v' in c])))
+        sensor_prefixes = sorted(list(set([
+            '_'.join(c.split('_')[:-1])
+            for c in all_cols if '_v' in c
+        ])))
 
         all_sensor_features = {}
 
@@ -490,11 +690,300 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
             raw_values = np.where((raw_values <= 0) | (raw_values >= 4000), np.nan, raw_values)
             frames = raw_values.reshape(-1, 8, 8)
 
-            if self.tof_mode == 'research':
+            if self.tof_mode == 'blob':
                 all_sensor_features.update(self.tof_research_logic(frames, sensor_id))
-            else:
+
+            elif self.tof_mode == 'baseline':
                 all_sensor_features.update(self.tof_simple_logic(frames, sensor_id))
+
+            elif self.tof_mode == 'spatial':
+                all_sensor_features.update(self.tof_spatial_logic(frames, sensor_id))
+
+            elif self.tof_mode == 'edge':
+                all_sensor_features.update(self.tof_edge_logic(frames, sensor_id))
+
+            elif self.tof_mode == 'fft2':
+                all_sensor_features.update(self.tof_fft2_logic(frames, sensor_id))
+
+            elif self.tof_mode == 'svd':
+                all_sensor_features.update(self.tof_svd_logic(frames, sensor_id))
+
+            elif self.tof_mode == 'wavelet':
+                all_sensor_features.update(self.tof_wavelet_logic(frames, sensor_id))
+
+            else:
+                raise ValueError(f"Unknown tof_mode: {self.tof_mode}")
+
         return pd.DataFrame([all_sensor_features])
+
+    @staticmethod
+    def tof_spatial_logic(frames: np.ndarray, sensor_id: str) -> dict:
+        frame_features = []
+
+        for frame in frames:
+            valid_mask = np.isfinite(frame)
+            valid_ratio = np.mean(valid_mask)
+
+            if valid_ratio == 0:
+                frame_features.append({
+                    'min': 4000.0,
+                    'mean': 4000.0,
+                    'std': 0.0,
+                    'center_mean': 4000.0,
+                    'top_mean': 4000.0,
+                    'bottom_mean': 4000.0,
+                    'left_mean': 4000.0,
+                    'right_mean': 4000.0,
+                    'q1_mean': 4000.0,
+                    'q2_mean': 4000.0,
+                    'q3_mean': 4000.0,
+                    'q4_mean': 4000.0,
+                    'row_com': 4.0,
+                    'col_com': 4.0,
+                    'valid_ratio': 0.0,
+                    'lr_asym': 0.0,
+                    'tb_asym': 0.0,
+                })
+                continue
+
+            filled = np.nan_to_num(frame, nan=4000.0)
+
+            weights = np.maximum(0, 4000.0 - filled)
+            if weights.sum() > 0:
+                row_com, col_com = center_of_mass(weights)
+            else:
+                row_com, col_com = 4.0, 4.0
+
+            top_mean = np.mean(filled[:4, :])
+            bottom_mean = np.mean(filled[4:, :])
+            left_mean = np.mean(filled[:, :4])
+            right_mean = np.mean(filled[:, 4:])
+
+            frame_features.append({
+                'min': np.min(filled),
+                'mean': np.mean(filled),
+                'std': np.std(filled),
+                'center_mean': np.mean(filled[2:6, 2:6]),
+                'top_mean': top_mean,
+                'bottom_mean': bottom_mean,
+                'left_mean': left_mean,
+                'right_mean': right_mean,
+                'q1_mean': np.mean(filled[:4, :4]),
+                'q2_mean': np.mean(filled[:4, 4:]),
+                'q3_mean': np.mean(filled[4:, :4]),
+                'q4_mean': np.mean(filled[4:, 4:]),
+                'row_com': row_com,
+                'col_com': col_com,
+                'valid_ratio': valid_ratio,
+                'lr_asym': left_mean - right_mean,
+                'tb_asym': top_mean - bottom_mean,
+            })
+
+        feat_df = pd.DataFrame(frame_features)
+
+        out = {}
+        for col in feat_df.columns:
+            out[f"{sensor_id}_{col}_mean"] = feat_df[col].mean()
+            out[f"{sensor_id}_{col}_std"] = feat_df[col].std()
+            out[f"{sensor_id}_{col}_min"] = feat_df[col].min()
+            out[f"{sensor_id}_{col}_max"] = feat_df[col].max()
+
+        return out
+
+    @staticmethod
+    def tof_edge_logic(frames: np.ndarray, sensor_id: str) -> dict:
+        frame_features = []
+
+        for frame in frames:
+            if np.all(~np.isfinite(frame)):
+                frame_features.append({
+                    'grad_mean': 0.0,
+                    'grad_std': 0.0,
+                    'grad_max': 0.0,
+                    'sobel_x_energy': 0.0,
+                    'sobel_y_energy': 0.0,
+                    'edge_density': 0.0,
+                })
+                continue
+
+            filled = np.nan_to_num(frame, nan=4000.0)
+
+            sobel_x = ndimage.sobel(filled, axis=1, mode='nearest')
+            sobel_y = ndimage.sobel(filled, axis=0, mode='nearest')
+            grad_mag = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+
+            thresh = np.mean(grad_mag) + np.std(grad_mag)
+            edge_density = np.mean(grad_mag > thresh)
+
+            frame_features.append({
+                'grad_mean': np.mean(grad_mag),
+                'grad_std': np.std(grad_mag),
+                'grad_max': np.max(grad_mag),
+                'sobel_x_energy': np.sum(sobel_x ** 2),
+                'sobel_y_energy': np.sum(sobel_y ** 2),
+                'edge_density': edge_density,
+            })
+
+        feat_df = pd.DataFrame(frame_features)
+
+        out = {}
+        for col in feat_df.columns:
+            out[f"{sensor_id}_{col}_mean"] = feat_df[col].mean()
+            out[f"{sensor_id}_{col}_std"] = feat_df[col].std()
+            out[f"{sensor_id}_{col}_min"] = feat_df[col].min()
+            out[f"{sensor_id}_{col}_max"] = feat_df[col].max()
+
+        return out
+
+    @staticmethod
+    def tof_fft2_logic(frames: np.ndarray, sensor_id: str) -> dict:
+        frame_features = []
+
+        for frame in frames:
+            if np.all(~np.isfinite(frame)):
+                frame_features.append({
+                    'fft_total_energy': 0.0,
+                    'fft_low_energy': 0.0,
+                    'fft_high_energy': 0.0,
+                    'fft_low_high_ratio': 0.0,
+                    'fft_dc': 0.0,
+                })
+                continue
+
+            filled = np.nan_to_num(frame, nan=4000.0)
+            centered = filled - np.mean(filled)
+
+            fft2 = np.fft.fft2(centered)
+            fft2_shift = np.fft.fftshift(fft2)
+            mag = np.abs(fft2_shift)
+
+            total_energy = np.sum(mag ** 2)
+
+            center_block = mag[3:5, 3:5]
+            low_energy = np.sum(center_block ** 2)
+            high_energy = total_energy - low_energy
+
+            ratio = low_energy / high_energy if high_energy > 0 else 0.0
+
+            frame_features.append({
+                'fft_total_energy': total_energy,
+                'fft_low_energy': low_energy,
+                'fft_high_energy': high_energy,
+                'fft_low_high_ratio': ratio,
+                'fft_dc': mag[4, 4],
+            })
+
+        feat_df = pd.DataFrame(frame_features)
+
+        out = {}
+        for col in feat_df.columns:
+            out[f"{sensor_id}_{col}_mean"] = feat_df[col].mean()
+            out[f"{sensor_id}_{col}_std"] = feat_df[col].std()
+            out[f"{sensor_id}_{col}_min"] = feat_df[col].min()
+            out[f"{sensor_id}_{col}_max"] = feat_df[col].max()
+
+        return out
+
+    @staticmethod
+    def tof_svd_logic(frames: np.ndarray, sensor_id: str) -> dict:
+        frame_features = []
+
+        for frame in frames:
+            if np.all(~np.isfinite(frame)):
+                frame_features.append({
+                    'sv1': 0.0,
+                    'sv2': 0.0,
+                    'sv3': 0.0,
+                    'sv1_ratio': 0.0,
+                    'sv12_ratio': 0.0,
+                    'rank_energy_2': 0.0,
+                })
+                continue
+
+            filled = np.nan_to_num(frame, nan=4000.0)
+            centered = filled - np.mean(filled)
+
+            _, s, _ = np.linalg.svd(centered, full_matrices=False)
+
+            total_sv = np.sum(s)
+            total_sv_sq = np.sum(s ** 2)
+
+            sv1 = s[0] if len(s) > 0 else 0.0
+            sv2 = s[1] if len(s) > 1 else 0.0
+            sv3 = s[2] if len(s) > 2 else 0.0
+
+            sv1_ratio = sv1 / total_sv if total_sv > 0 else 0.0
+            sv12_ratio = (sv1 + sv2) / total_sv if total_sv > 0 else 0.0
+            rank_energy_2 = np.sum(s[:2] ** 2) / total_sv_sq if total_sv_sq > 0 else 0.0
+
+            frame_features.append({
+                'sv1': sv1,
+                'sv2': sv2,
+                'sv3': sv3,
+                'sv1_ratio': sv1_ratio,
+                'sv12_ratio': sv12_ratio,
+                'rank_energy_2': rank_energy_2,
+            })
+
+        feat_df = pd.DataFrame(frame_features)
+
+        out = {}
+        for col in feat_df.columns:
+            out[f"{sensor_id}_{col}_mean"] = feat_df[col].mean()
+            out[f"{sensor_id}_{col}_std"] = feat_df[col].std()
+            out[f"{sensor_id}_{col}_min"] = feat_df[col].min()
+            out[f"{sensor_id}_{col}_max"] = feat_df[col].max()
+
+        return out
+
+    @staticmethod
+    def tof_wavelet_logic(frames: np.ndarray, sensor_id: str, wavelet: str = 'haar') -> dict:
+        frame_features = []
+
+        for frame in frames:
+            if np.all(~np.isfinite(frame)):
+                frame_features.append({
+                    'approx_energy': 0.0,
+                    'horiz_energy': 0.0,
+                    'vert_energy': 0.0,
+                    'diag_energy': 0.0,
+                    'detail_total_energy': 0.0,
+                    'approx_detail_ratio': 0.0,
+                })
+                continue
+
+            filled = np.nan_to_num(frame, nan=4000.0)
+            centered = filled - np.mean(filled)
+
+            cA, (cH, cV, cD) = pywt.dwt2(centered, wavelet)
+
+            approx_energy = np.sum(cA ** 2)
+            horiz_energy = np.sum(cH ** 2)
+            vert_energy = np.sum(cV ** 2)
+            diag_energy = np.sum(cD ** 2)
+
+            detail_total = horiz_energy + vert_energy + diag_energy
+            ratio = approx_energy / detail_total if detail_total > 0 else 0.0
+
+            frame_features.append({
+                'approx_energy': approx_energy,
+                'horiz_energy': horiz_energy,
+                'vert_energy': vert_energy,
+                'diag_energy': diag_energy,
+                'detail_total_energy': detail_total,
+                'approx_detail_ratio': ratio,
+            })
+
+        feat_df = pd.DataFrame(frame_features)
+
+        out = {}
+        for col in feat_df.columns:
+            out[f"{sensor_id}_{col}_mean"] = feat_df[col].mean()
+            out[f"{sensor_id}_{col}_std"] = feat_df[col].std()
+            out[f"{sensor_id}_{col}_min"] = feat_df[col].min()
+            out[f"{sensor_id}_{col}_max"] = feat_df[col].max()
+
+        return out
 
     @staticmethod
     def tof_simple_logic(frames: np.ndarray, sensor_id: str) -> dict:
@@ -768,3 +1257,376 @@ def find_data_root(local_dir='data', kaggle_root='/kaggle/input'):
         'Could not find the dataset locally or in /kaggle/input. '
         'Place the CSV files in ./data/ or attach the Kaggle dataset.'
     )
+
+
+class SequencePadder(BaseEstimator, TransformerMixin):
+    """
+    Convert a row-level feature table back into sequence tensors.
+
+    Expected input:
+        - pandas DataFrame
+        - index = sequence_id
+        - rows already in timestep order within each sequence
+          (your ImuExtractor currently preserves this when windowing)
+
+    Output:
+        {
+            "X": np.ndarray of shape (n_sequences, maxlen, n_features),
+            "sequence_ids": np.ndarray of shape (n_sequences,),
+            "lengths": np.ndarray of shape (n_sequences,)
+        }
+    """
+    def __init__(self, maxlen=None, padding_value=0.0, dtype=np.float32):
+        self.maxlen = maxlen
+        self.padding_value = padding_value
+        self.dtype = dtype
+
+    def fit(self, X, y=None):
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError(
+                "SequencePadder expects a pandas DataFrame. "
+                "Make sure your preprocessor uses .set_output(transform='pandas')."
+            )
+
+        if X.index.name != 'sequence_id':
+            # not fatal, but helps catch pipeline mistakes
+            pass
+
+        lengths = X.groupby(level=0, sort=False).size().to_numpy()
+
+        if len(lengths) == 0:
+            raise ValueError("SequencePadder received an empty DataFrame.")
+
+        self.n_features_in_ = X.shape[1]
+        self.maxlen_ = int(self.maxlen) if self.maxlen is not None else int(lengths.max())
+        self.feature_names_in_ = list(X.columns)
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self, ["n_features_in_", "maxlen_"])
+
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError(
+                "SequencePadder expects a pandas DataFrame. "
+                "Make sure your preprocessor uses .set_output(transform='pandas')."
+            )
+
+        grouped = list(X.groupby(level=0, sort=False))
+
+        if len(grouped) == 0:
+            return {
+                "X": np.empty((0, self.maxlen_, self.n_features_in_), dtype=self.dtype),
+                "sequence_ids": np.array([], dtype=object),
+                "lengths": np.array([], dtype=int),
+            }
+
+        n_sequences = len(grouped)
+        X_pad = np.full(
+            (n_sequences, self.maxlen_, self.n_features_in_),
+            fill_value=self.padding_value,
+            dtype=self.dtype,
+        )
+
+        sequence_ids = []
+        lengths = []
+
+        for i, (seq_id, grp) in enumerate(grouped):
+            arr = grp.to_numpy(dtype=self.dtype, copy=True)
+            seq_len = min(len(arr), self.maxlen_)
+
+            X_pad[i, :seq_len, :] = arr[:seq_len]
+            sequence_ids.append(seq_id)
+            lengths.append(len(arr))
+
+        return {
+            "X": X_pad,
+            "sequence_ids": np.asarray(sequence_ids, dtype=object),
+            "lengths": np.asarray(lengths, dtype=int),
+        }
+
+
+class KerasRNNClassifier(BaseEstimator, ClassifierMixin):
+    """
+    sklearn-compatible Keras classifier for sequence tensors.
+
+    Expected X:
+        - either raw 3D ndarray (n_samples, timesteps, n_features)
+        - or dict output from SequencePadder with key 'X'
+    """
+    def __init__(
+        self,
+        rnn_type='lstm',
+        rnn_units=(64,),
+        dense_units=(),
+        dropout=0.0,
+        recurrent_dropout=0.0,
+        dense_dropout=0.0,
+        learning_rate=1e-3,
+        batch_size=32,
+        epochs=30,
+        validation_split=0.1,
+        patience=5,
+        l2_reg=0.0,
+        bidirectional=False,
+        class_weight_mode=None,   # None or 'balanced'
+        verbose=0,
+        random_state=42,
+        mask_value=0.0,
+    ):
+        self.rnn_type = rnn_type
+        self.rnn_units = rnn_units
+        self.dense_units = dense_units
+        self.dropout = dropout
+        self.recurrent_dropout = recurrent_dropout
+        self.dense_dropout = dense_dropout
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.validation_split = validation_split
+        self.patience = patience
+        self.l2_reg = l2_reg
+        self.bidirectional = bidirectional
+        self.class_weight_mode = class_weight_mode
+        self.verbose = verbose
+        self.random_state = random_state
+        self.mask_value = mask_value
+
+    def _extract_array(self, X):
+        if isinstance(X, dict):
+            return X["X"]
+        return X
+
+    def _get_rnn_layer(self):
+        rnn_type = str(self.rnn_type).lower()
+        if rnn_type == 'lstm':
+            return layers.LSTM
+        if rnn_type == 'gru':
+            return layers.GRU
+        if rnn_type in ('rnn', 'simplernn', 'simple_rnn'):
+            return layers.SimpleRNN
+        raise ValueError(f"Unknown rnn_type: {self.rnn_type}")
+
+    def _build_model(self, input_shape, n_classes):
+        tf.keras.backend.clear_session()
+        tf.keras.utils.set_random_seed(self.random_state)
+
+        reg = keras.regularizers.l2(self.l2_reg) if self.l2_reg and self.l2_reg > 0 else None
+        RNNLayer = self._get_rnn_layer()
+
+        inputs = keras.Input(shape=input_shape)
+        x = layers.Masking(mask_value=self.mask_value)(inputs)
+
+        units_list = list(self.rnn_units) if isinstance(self.rnn_units, (list, tuple)) else [self.rnn_units]
+        for i, units in enumerate(units_list):
+            return_sequences = i < (len(units_list) - 1)
+            layer = RNNLayer(
+                units=units,
+                return_sequences=return_sequences,
+                dropout=self.dropout,
+                recurrent_dropout=self.recurrent_dropout,
+                kernel_regularizer=reg,
+                recurrent_regularizer=reg,
+            )
+            if self.bidirectional:
+                x = layers.Bidirectional(layer)(x)
+            else:
+                x = layer(x)
+
+        dense_list = list(self.dense_units) if isinstance(self.dense_units, (list, tuple)) else [self.dense_units]
+        dense_list = [u for u in dense_list if u not in (None, 0)]
+
+        for units in dense_list:
+            x = layers.Dense(units, activation='relu', kernel_regularizer=reg)(x)
+            if self.dense_dropout and self.dense_dropout > 0:
+                x = layers.Dropout(self.dense_dropout)(x)
+
+        outputs = layers.Dense(n_classes, activation='softmax')(x)
+
+        model = keras.Model(inputs=inputs, outputs=outputs)
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy'],
+        )
+        return model
+
+    def fit(self, X, y):
+        X_arr = self._extract_array(X)
+
+        if X_arr.ndim != 3:
+            raise ValueError(
+                f"KerasRNNClassifier expected 3D input, got shape {X_arr.shape}. "
+                "Make sure SequencePadder is in the pipeline before the classifier."
+            )
+
+        self.label_encoder_ = LabelEncoder()
+        y_enc = self.label_encoder_.fit_transform(pd.Series(y))
+        self.classes_ = self.label_encoder_.classes_
+
+        n_classes = len(self.classes_)
+        if n_classes < 2:
+            raise ValueError("Need at least 2 classes in this fold.")
+
+        self.model_ = self._build_model(
+            input_shape=(X_arr.shape[1], X_arr.shape[2]),
+            n_classes=n_classes,
+        )
+
+        callbacks = [
+            keras.callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=self.patience,
+                restore_best_weights=True,
+            )
+        ]
+
+        class_weight = None
+        if self.class_weight_mode == 'balanced':
+            classes = np.unique(y_enc)
+            weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_enc)
+            class_weight = {int(c): float(w) for c, w in zip(classes, weights)}
+
+        self.history_ = self.model_.fit(
+            X_arr,
+            y_enc,
+            batch_size=self.batch_size,
+            epochs=self.epochs,
+            validation_split=self.validation_split,
+            callbacks=callbacks,
+            class_weight=class_weight,
+            verbose=self.verbose,
+            shuffle=True,
+        )
+        return self
+
+    def predict_proba(self, X):
+        check_is_fitted(self, ["model_", "label_encoder_"])
+        X_arr = self._extract_array(X)
+        proba = self.model_.predict(X_arr, verbose=0)
+        return proba
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        pred_idx = np.argmax(proba, axis=1)
+        return self.label_encoder_.inverse_transform(pred_idx)
+
+    def score(self, X, y):
+        y_pred = self.predict(X)
+        y_true = np.asarray(y)
+        return np.mean(y_true == y_pred)
+
+
+class ManyToOneWrapperRNN(BaseEstimator, ClassifierMixin):
+    def __init__(self, estimator, extractor, mode=None, target: str = 'gesture', **kwargs):
+        self.estimator = estimator
+        self.extractor = extractor
+        self.mode = mode
+        self.target = target
+
+    def _extract_sequence_ids(self, X):
+        # SequencePadder output
+        if isinstance(X, dict):
+            if "sequence_ids" not in X:
+                raise ValueError("Sequence input dict must contain 'sequence_ids'.")
+            return pd.Index(X["sequence_ids"], name="sequence_id")
+
+        # Old 2D dataframe path
+        if isinstance(X, pd.DataFrame):
+            return pd.Index(X.index, name="sequence_id")
+
+        raise TypeError(
+            "Unsupported X type in ManyToOneWrapper. "
+            "Expected pandas DataFrame or dict output from SequencePadder."
+        )
+
+    def _extract_model_input(self, X):
+        if isinstance(X, dict):
+            return X
+        return X
+
+    def _collapse_y_to_sequence(self, X, y):
+        seq_ids = self._extract_sequence_ids(X)
+
+        target_map = (
+            y.drop_duplicates(subset='sequence_id')
+             .set_index('sequence_id')[self.target]
+        )
+
+        y_seq = pd.Series(seq_ids.map(target_map), index=np.arange(len(seq_ids)), name=self.target)
+
+        if y_seq.isna().any():
+            missing_ids = seq_ids[y_seq.isna()].tolist()
+            raise ValueError(
+                "Missing labels after aligning to sequence ids. "
+                f"Example missing sequence_id values: {missing_ids[:10]}"
+            )
+
+        if len(y_seq) == 0:
+            raise ValueError("y_seq is empty after collapsing to sequence level.")
+
+        return y_seq
+
+    def fit(self, X, y):
+        y_seq = self._collapse_y_to_sequence(X, y)
+        X_model = self._extract_model_input(X)
+
+        if self.mode == 'xgboost':
+            self.label_encoder_ = LabelEncoder()
+            y_enc = self.label_encoder_.fit_transform(y_seq)
+
+            if len(np.unique(y_enc)) == 0:
+                raise ValueError("No classes in this fold.")
+
+            self.estimator_ = clone(self.estimator)
+            self.estimator_.fit(X_model, y_enc)
+        else:
+            self.estimator_ = clone(self.estimator)
+            self.estimator_.fit(X_model, y_seq)
+
+        return self
+
+    def predict(self, X):
+        X_model = self._extract_model_input(X)
+        preds = self.estimator_.predict(X_model)
+
+        if self.mode == 'xgboost':
+            preds = self.label_encoder_.inverse_transform(np.asarray(preds).astype(int))
+
+        return preds
+
+    def predict_proba(self, X):
+        X_model = self._extract_model_input(X)
+        return self.estimator_.predict_proba(X_model)
+
+    def score(self, X, y, sample_weight=None):
+        y_true = self._collapse_y_to_sequence(X, y).to_numpy()
+        y_pred = self.predict(X)
+
+        if sample_weight is not None:
+            correct = (y_true == y_pred).astype(int)
+            return np.average(correct, weights=sample_weight)
+
+        return np.mean(y_true == y_pred)
+
+
+def attach_metadata(grid_search):
+    model = grid_search.best_estimator_
+
+    wrapped_clf = model.named_steps["classifier"]
+    est = wrapped_clf.estimator_
+
+    model.metadata_ = {
+        "best_score": float(grid_search.best_score_),
+        "best_params": grid_search.best_params_,
+    }
+
+    if hasattr(model.named_steps["preprocessor"], "get_feature_names_out"):
+        model.metadata_["feature_names"] = model.named_steps["preprocessor"].get_feature_names_out().tolist()
+
+    if hasattr(est, "feature_importances_"):
+        model.feature_importances_ = {
+            "feature_names": model.named_steps["preprocessor"].get_feature_names_out().tolist(),
+            "importances": est.feature_importances_.tolist()
+        }
+
+    return model
