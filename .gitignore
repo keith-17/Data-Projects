@@ -43,3 +43,6 @@ cmi_kaggle/__pycache__/
 cmi_kaggle/.idea/
 cmi_kaggle/model_runs/
 cmi_kaggle/trained_models/
+evpurchase_kaggle/data/
+evpurchase_kaggle/src/__pycache__/
+evpurchase_kaggle/notebooks/results/
