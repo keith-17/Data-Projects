@@ -48,3 +48,6 @@ evpurchase_kaggle/src/__pycache__/
 evpurchase_kaggle/notebooks/results/
 cmi_internet_use/Context/
 cmi_internet_use/Data
+cmi_internet_use/results_*/
+cmi_internet_use/submission.csv
+cmi_internet_use/Src/__pycache__/
