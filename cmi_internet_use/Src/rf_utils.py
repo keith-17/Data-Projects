@@ -762,13 +762,24 @@ class RandomForestSequenceEstimator(BaseEstimator):
     def _fit_thresholds(self, y_cal: np.ndarray, scores_cal: np.ndarray) -> np.ndarray:
         tc = _structured(self.threshold_calibration)
         mode = "none" if _is_none_like(tc) else str(tc).strip().lower()
-        if mode == "optimize_qwk":
-            return optimize_thresholds_qwk(y_cal, scores_cal)
-        if mode == "quantile":
-            p0, p1, p2 = float(np.mean(y_cal <= 0)), float(np.mean(y_cal <= 1)), float(np.mean(y_cal <= 2))
-            return np.sort(np.quantile(scores_cal, [p0, p1, p2])).astype(np.float64)
-        if mode in {"fixed_midpoint", "round", "none"}:
+        sc = np.asarray(scores_cal, dtype=np.float64).ravel()
+        yc = np.asarray(y_cal, dtype=np.int64).ravel()
+        sd = float(np.nanstd(sc)) if len(sc) else 0.0
+        if mode in {"fixed_midpoint", "round", "none"} or len(sc) < 4 or not np.isfinite(sd) or sd <= 1e-12:
             return np.array([0.5, 1.5, 2.5], dtype=np.float64)
+        if mode == "optimize_qwk":
+            return optimize_thresholds_qwk(yc, sc)
+        if mode == "quantile":
+            p0 = float(np.clip(np.mean(yc <= 0), 0.05, 0.90))
+            p1 = float(np.clip(np.mean(yc <= 1), 0.15, 0.96))
+            p2 = float(np.clip(np.mean(yc <= 2), 0.70, 0.99))
+            q = np.sort(np.quantile(sc, [p0, p1, p2])).astype(np.float64)
+            min_gap = max(1e-4, 0.02 * sd)
+            if int((yc == 3).sum()) == 0:
+                q[2] = max(q[2], float(np.nanmax(sc)) + min_gap)
+            q[1] = max(q[1], q[0] + min_gap)
+            q[2] = max(q[2], q[1] + min_gap)
+            return q
         raise InvalidParams(f"Unsupported threshold_calibration: {self.threshold_calibration!r}")
 
     def fit(self, X: pd.DataFrame, y: Any):
