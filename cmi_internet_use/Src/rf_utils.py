@@ -464,6 +464,7 @@ class RandomForestSequenceEstimator(BaseEstimator):
         n_jobs = int(_structured(self.rf_n_jobs))
         rs = int(_structured(self.random_state)) + int(seed_offset)
         oob = bool(use_oob and bs and n_est >= 10)
+        rf_verbose = max(0, int(self.verbose or 0) - 2) if seed_offset == 0 else 0
 
         if task_mode == "regressor":
             crit = str(_structured(self.reg_criterion)).strip().lower()
@@ -482,6 +483,7 @@ class RandomForestSequenceEstimator(BaseEstimator):
                 max_samples=max_samp,
                 ccp_alpha=ccp,
                 n_jobs=n_jobs,
+                verbose=rf_verbose,
                 random_state=rs,
             )
 
@@ -503,6 +505,7 @@ class RandomForestSequenceEstimator(BaseEstimator):
             ccp_alpha=ccp,
             class_weight=cw,
             n_jobs=n_jobs,
+            verbose=rf_verbose,
             random_state=rs,
         )
 
@@ -783,6 +786,8 @@ class RandomForestSequenceEstimator(BaseEstimator):
         raise InvalidParams(f"Unsupported threshold_calibration: {self.threshold_calibration!r}")
 
     def fit(self, X: pd.DataFrame, y: Any):
+        t_start = time.perf_counter()
+        v_lvl = int(self.verbose or 0)
         self.fit_failed_ = False
         validate_rf_params(self.get_params(deep=False))
 
@@ -815,8 +820,21 @@ class RandomForestSequenceEstimator(BaseEstimator):
         aug = self._get_augmentor()
         self.augmentor_ = aug
 
+        n_act = int(X["has_actigraphy"].sum()) if isinstance(X, pd.DataFrame) and "has_actigraphy" in X.columns else 0
+        if v_lvl >= 2:
+            fams_str = str(getattr(ext, "feature_families", "none"))
+            if len(fams_str) > 64:
+                fams_str = fams_str[:61] + "..."
+            print(
+                f"  [RF fit] Extracting features: n={len(X)} (act={n_act}) | bin={ext.bin_minutes}m | "
+                f"missing={ext.missing_feature_strategy} | families={fams_str}",
+                flush=True,
+            )
+
+        t_ext0 = time.perf_counter()
         X_clean = strip_leaky_columns(X)
         feat_df = ext.fit_transform(X_clean, y_arr)
+        t_ext = time.perf_counter() - t_ext0
         self.feature_names_in_ = list(feat_df.columns)
         self.selected_static_cols_ = list(getattr(ext, "selected_static_cols_", []))
 
@@ -835,6 +853,8 @@ class RandomForestSequenceEstimator(BaseEstimator):
         y_fit_orig = y_arr[sup_idx]
         X_fit_raw = X_clean.iloc[sup_idx].reset_index(drop=True)
 
+        raw_nan_pct = float(100.0 * feat_fit_orig.reindex(columns=self.feature_names_out_).isna().to_numpy().mean()) if len(feat_fit_orig) and self.feature_names_out_ else 0.0
+
         # Optional training-only augmentation
         feat_fit_train, y_fit_train, n_aug_rows = self._apply_training_augmentation(
             feat_fit_orig, y_fit_orig, X_fit_raw, ext, aug
@@ -849,7 +869,30 @@ class RandomForestSequenceEstimator(BaseEstimator):
         # Enable native OOB scoring when bootstrap=True and no augmented duplicates exist
         use_oob = _coerce_bool(self.bootstrap, default=True) and not aug_applied
         rf_model = self._build_rf_model(use_oob=use_oob)
+
+        if v_lvl >= 2:
+            cls_name = type(rf_model).__name__
+            extra_lbl = (
+                f"sw={self.sample_weight_mode}"
+                if str(self.task_mode).strip().lower() == "regressor"
+                else f"cw={rf_model.class_weight} pred={self.clf_prediction_mode}"
+            )
+            print(
+                f"  [RF fit] Features ready in {t_ext:.2f}s: retained={self.n_samples_retained_}/{len(X)} "
+                f"(outliers_dropped={self.n_samples_removed_}, aug=+{self.n_augmented_rows_}) | "
+                f"features={len(self.feature_names_out_)} ({raw_nan_pct:.1f}% NaN -> {self.effective_nan_handling_})",
+                flush=True,
+            )
+            print(
+                f"  [RF fit] Training {cls_name}(n_estimators={rf_model.n_estimators}, criterion={rf_model.criterion}, "
+                f"max_depth={rf_model.max_depth}, min_leaf={rf_model.min_samples_leaf}, max_feat={rf_model.max_features}, "
+                f"bootstrap={rf_model.bootstrap}, ccp={rf_model.ccp_alpha}, {extra_lbl}) on {X_train_mat.shape}...",
+                flush=True,
+            )
+
+        t_rf0 = time.perf_counter()
         rf_model = self._fit_single_rf(rf_model, X_train_mat, y_fit_train, sw_train)
+        t_rf = time.perf_counter() - t_rf0
         self.model_ = rf_model
         # Re-align X_orig_mat if native NaN handling fell back to median
         if self.effective_nan_handling_ != str(_structured(self.nan_handling)).strip().lower():
@@ -859,6 +902,7 @@ class RandomForestSequenceEstimator(BaseEstimator):
         self.feature_importances_ = np.asarray(getattr(rf_model, "feature_importances_", np.zeros(len(self.feature_names_out_))), dtype=np.float64)
 
         # Calibrate ordinal thresholds using out-of-sample (OOB / OOF) continuous predictions
+        t_cal0 = time.perf_counter()
         use_argmax = (
             str(self.task_mode).strip().lower() == "classifier"
             and str(_structured(self.clf_prediction_mode)).strip().lower() == "argmax"
@@ -877,6 +921,7 @@ class RandomForestSequenceEstimator(BaseEstimator):
             self.calib_qwk_ = float(quadratic_weighted_kappa(cal_y, apply_thresholds(cal_scores, self.thresholds_)))
             train_scores = self._continuous_from_model(rf_model, X_orig_mat)
             train_preds = apply_thresholds(train_scores, self.thresholds_)
+        t_cal = time.perf_counter() - t_cal0
 
         self.train_qwk_ = float(quadratic_weighted_kappa(y_fit_orig, train_preds))
         self.history_: Dict[str, List[float]] = {
@@ -886,6 +931,21 @@ class RandomForestSequenceEstimator(BaseEstimator):
             "calib_qwk": [float(self.calib_qwk_)],
         }
         self.classes_ = np.array([0, 1, 2, 3], dtype=np.int64)
+
+        if v_lvl >= 2:
+            t_tot = time.perf_counter() - t_start
+            oob_str = f"{self.oob_score_:.4f}" if np.isfinite(self.oob_score_) else "N/A"
+            th_str = "[" + ", ".join(f"{float(t):.3f}" for t in self.thresholds_) + "]"
+            print(
+                f"  [RF fit] Done in {t_tot:.2f}s (ext={t_ext:.2f}s, rf={t_rf:.2f}s, cal={t_cal:.2f}s) | "
+                f"OOB={oob_str} | cal_src={self.calibration_source_} | thresholds={th_str} | "
+                f"calib_QWK={self.calib_qwk_:.5f} | train_QWK={self.train_qwk_:.5f}",
+                flush=True,
+            )
+        if v_lvl >= 3 and len(self.feature_names_out_) > 0:
+            top_mdi = self.get_feature_importances_df().head(5)
+            top_str = ", ".join(f"{r['feature']}={r['rf_importance']:.4f}" for _, r in top_mdi.iterrows())
+            print(f"  [RF fit] Top 5 MDI features: {top_str}", flush=True)
         return self
 
     def get_history_dict(self) -> Dict[str, List[float]]:
@@ -1054,6 +1114,94 @@ def deduplicate_rf_param_grid(
     return [{k: [v] for k, v in cand.items()} for cand in kept]
 
 
+def _rf_candidate_brief(decoded: Mapping[str, Any]) -> str:
+    """Compact summary of active RF & key extractor params for verbose >= 2 logging."""
+    def _g(key: str, default: Any = "?") -> Any:
+        return decoded.get(f"estimator__{key}", decoded.get(key, default))
+
+    tm = str(_g("task_mode", "regressor")).strip().lower()
+    crit = _g("reg_criterion") if tm == "regressor" else _g("clf_criterion")
+    extra = (
+        f"sw={_g('sample_weight_mode')}"
+        if tm == "regressor"
+        else f"cw={_g('class_weight')} pred={_g('clf_prediction_mode')}"
+    )
+    return (
+        f"task={tm} crit={crit} trees={_g('n_estimators')} depth={_g('max_depth')} "
+        f"leaf={_g('min_samples_leaf')} max_feat={_g('max_features')} boot={_g('bootstrap')} "
+        f"ccp={_g('ccp_alpha')} {extra} nan={_g('nan_handling')} cal={_g('threshold_calibration')}({_g('threshold_calibration_source')}) | "
+        f"bin={_g('extractor__bin_minutes')}m miss={_g('extractor__missing_feature_strategy')} "
+        f"fs={_g('extractor__feature_selection_method')} aug_p={_g('augmentor__prob')}"
+    )
+
+
+def _evaluate_rf_candidate_cv(
+    estimator: Any,
+    params: Mapping[str, Any],
+    X: pd.DataFrame,
+    y: Any,
+    groups: Optional[Any],
+    cv: Any,
+    scoring: Any,
+    *,
+    error_score: float = -1.0,
+    verbose: int = 0,
+) -> Tuple[List[float], List[float], float]:
+    """CV evaluator with verbose fold progress, exception reporting, and verbosity propagation."""
+    t0 = time.perf_counter()
+    v_lvl = int(verbose or 0)
+    qwk_scores: List[float] = []
+    acc_pct_scores: List[float] = []
+    use_default_qwk = scoring is None or scoring is candidate_score
+
+    splits = list(cv.split(X, y, groups))
+    n_splits = len(splits)
+    for f_idx, (tr_idx, va_idx) in enumerate(splits):
+        t_f0 = time.perf_counter()
+        cand_est = clone(estimator).set_params(**params)
+        # Propagate search verbosity down into RandomForestSequenceEstimator so raising search verbose works immediately
+        if hasattr(cand_est, "named_steps") and "estimator" in cand_est.named_steps:
+            inner = cand_est.named_steps["estimator"]
+            if hasattr(inner, "verbose"):
+                inner.verbose = max(int(getattr(inner, "verbose", 0) or 0), v_lvl)
+        elif hasattr(cand_est, "verbose"):
+            cand_est.verbose = max(int(getattr(cand_est, "verbose", 0) or 0), v_lvl)
+
+        y_tr = y.iloc[tr_idx] if isinstance(y, (pd.Series, pd.DataFrame)) else np.asarray(y)[tr_idx]
+        y_va = y.iloc[va_idx] if isinstance(y, (pd.Series, pd.DataFrame)) else np.asarray(y)[va_idx]
+        if v_lvl >= 2:
+            print(f"  [Fold {f_idx + 1}/{n_splits}] train={len(tr_idx)} val={len(va_idx)}", flush=True)
+        try:
+            cand_est.fit(X.iloc[tr_idx], y_tr)
+            preds = np.asarray(cand_est.predict(X.iloc[va_idx]), dtype=np.int64).ravel()
+            yt_va = (
+                np.asarray(y_va[TARGET_COL], dtype=np.int64).ravel()
+                if isinstance(y_va, pd.DataFrame) and TARGET_COL in y_va.columns
+                else np.asarray(y_va, dtype=np.int64).ravel()
+            )
+            acc_pct = float(100.0 * np.mean(yt_va == preds)) if len(yt_va) == len(preds) and len(yt_va) > 0 else -1.0
+            if use_default_qwk:
+                qwk = float(competition_score(yt_va, preds))
+            else:
+                qwk = float(scoring(cand_est, X.iloc[va_idx], y_va))
+            qwk_val = qwk if np.isfinite(qwk) else error_score
+            acc_val = acc_pct if np.isfinite(acc_pct) else -1.0
+            qwk_scores.append(qwk_val)
+            acc_pct_scores.append(acc_val)
+            if v_lvl >= 2:
+                print(
+                    f"  [Fold {f_idx + 1}/{n_splits}] val Normal={acc_val:.2f}% | val QWK={qwk_val:.5f} "
+                    f"({time.perf_counter() - t_f0:.2f}s)",
+                    flush=True,
+                )
+        except Exception as exc:
+            qwk_scores.append(error_score)
+            acc_pct_scores.append(-1.0)
+            if v_lvl >= 1:
+                print(f"  [Fold {f_idx + 1}/{n_splits} ERROR] {type(exc).__name__}: {exc}", flush=True)
+    return qwk_scores, acc_pct_scores, float(time.perf_counter() - t0)
+
+
 class RFHierarchicalBayesSearchCV(BaseEstimator):
     """Bayesian optimization over ``SequenceExtractor``, ``TSAugmentor`` & Random Forest hyperparameters."""
 
@@ -1137,22 +1285,31 @@ class RFHierarchicalBayesSearchCV(BaseEstimator):
         scorer = self.scoring or candidate_score
         best_so_far = -np.inf
         total = max(1, int(self.n_iter))
+        v_lvl = int(self.verbose or 0)
 
         for it in range(total):
             x_pt = init_pt if it == 0 else opt.ask()
             decoded = _decode_skopt_params(dict(zip(keys, x_pt)))
             sig = _canonical_rf_candidate_key(decoded, base_params=base_params)
+            if v_lvl >= 2:
+                print(f"\n[Bayes {it + 1}/{total} START] {_rf_candidate_brief(decoded)}", flush=True)
+            if v_lvl >= 3:
+                inactive = inactive_rf_parameters_for_candidate({**base_params, **decoded})
+                active_d = {k: v for k, v in sorted(decoded.items()) if k not in inactive}
+                print(f"  [Active params ({len(active_d)})]: {active_d}", flush=True)
             if sig in cache:
                 fold_qwks, fold_accs, elapsed = cache[sig]
                 cached_tag = " (cached)"
             else:
                 err = rf_candidate_error(decoded, base_params=base_params)
                 if err is not None:
+                    if v_lvl >= 1:
+                        print(f"  [Bayes {it + 1}/{total} INVALID] {err}", flush=True)
                     n_sp = cv.get_n_splits(X, y, groups) if hasattr(cv, "get_n_splits") else 1
                     err_val = -1.0 if self.error_score == "raise" else float(self.error_score)
                     fold_qwks, fold_accs, elapsed = [err_val] * n_sp, [-1.0] * n_sp, 0.0
                 else:
-                    fold_qwks, fold_accs, elapsed = _evaluate_candidate_cv(
+                    fold_qwks, fold_accs, elapsed = _evaluate_rf_candidate_cv(
                         self.estimator,
                         decoded,
                         X,
@@ -1161,6 +1318,7 @@ class RFHierarchicalBayesSearchCV(BaseEstimator):
                         cv,
                         scorer,
                         error_score=-1.0 if self.error_score == "raise" else float(self.error_score),
+                        verbose=v_lvl,
                     )
                 cache[sig] = (fold_qwks, fold_accs, elapsed)
                 cached_tag = ""
@@ -1175,7 +1333,7 @@ class RFHierarchicalBayesSearchCV(BaseEstimator):
             all_fold_acc_pct.append(fold_accs)
             all_times.append(elapsed)
 
-            if self.verbose and int(self.verbose) > 0:
+            if v_lvl >= 1:
                 tm = decoded.get("estimator__task_mode", decoded.get("task_mode", "?"))
                 nt = decoded.get("estimator__n_estimators", decoded.get("n_estimators", "?"))
                 md = decoded.get("estimator__max_depth", decoded.get("max_depth", "?"))
@@ -1225,7 +1383,13 @@ class RFHierarchicalBayesSearchCV(BaseEstimator):
         self.best_params_ = dict(all_params[self.best_index_])
         self.best_score_ = float(means[self.best_index_])
         if self.refit:
+            if v_lvl >= 2:
+                print(f"\n[Bayes REFIT] Refitting best candidate #{self.best_index_ + 1} (CV QWK={self.best_score_:.5f}): {_rf_candidate_brief(self.best_params_)}", flush=True)
             self.best_estimator_ = clone(self.estimator).set_params(**self.best_params_)
+            if hasattr(self.best_estimator_, "named_steps") and "estimator" in self.best_estimator_.named_steps:
+                inner = self.best_estimator_.named_steps["estimator"]
+                if hasattr(inner, "verbose"):
+                    inner.verbose = max(int(getattr(inner, "verbose", 0) or 0), v_lvl)
             self.best_estimator_.fit(X, y)
         return self
 
@@ -1303,6 +1467,7 @@ class RFGASearchCV(BaseEstimator):
         n_gen = max(1, int(self.generations))
         t_size = max(1, min(int(self.tournament_size), pop_size))
         n_elite = max(0, min(int(self.elitism), pop_size - 1))
+        v_lvl = int(self.verbose or 0)
 
         cache: Dict[str, Tuple[List[float], List[float], float]] = {}
         all_params: List[Dict[str, Any]] = []
@@ -1320,17 +1485,25 @@ class RFGASearchCV(BaseEstimator):
             for c_idx, raw_cand in enumerate(population):
                 decoded = _decode_skopt_params(raw_cand)
                 sig = _canonical_rf_candidate_key(decoded, base_params=base_params)
+                if v_lvl >= 2:
+                    print(f"\n[GA gen {gen + 1}/{n_gen} | cand {c_idx + 1}/{pop_size} START] {_rf_candidate_brief(decoded)}", flush=True)
+                if v_lvl >= 3:
+                    inactive = inactive_rf_parameters_for_candidate({**base_params, **decoded})
+                    active_d = {k: v for k, v in sorted(decoded.items()) if k not in inactive}
+                    print(f"  [Active params ({len(active_d)})]: {active_d}", flush=True)
                 if sig in cache:
                     fold_qwks, fold_accs, elapsed = cache[sig]
                     cached_tag = " (cached)"
                 else:
                     err = rf_candidate_error(decoded, base_params=base_params)
                     if err is not None:
+                        if v_lvl >= 1:
+                            print(f"  [GA gen {gen + 1}/{n_gen} | cand {c_idx + 1}/{pop_size} INVALID] {err}", flush=True)
                         n_sp = cv.get_n_splits(X, y, groups) if hasattr(cv, "get_n_splits") else 1
                         err_val = -1.0 if self.error_score == "raise" else float(self.error_score)
                         fold_qwks, fold_accs, elapsed = [err_val] * n_sp, [-1.0] * n_sp, 0.0
                     else:
-                        fold_qwks, fold_accs, elapsed = _evaluate_candidate_cv(
+                        fold_qwks, fold_accs, elapsed = _evaluate_rf_candidate_cv(
                             self.estimator,
                             decoded,
                             X,
@@ -1339,6 +1512,7 @@ class RFGASearchCV(BaseEstimator):
                             cv,
                             scorer,
                             error_score=-1.0 if self.error_score == "raise" else float(self.error_score),
+                            verbose=v_lvl,
                         )
                     cache[sig] = (fold_qwks, fold_accs, elapsed)
                     cached_tag = ""
@@ -1353,17 +1527,27 @@ class RFGASearchCV(BaseEstimator):
                 all_fold_acc_pct.append(fold_accs)
                 all_times.append(elapsed)
 
-                if self.verbose and int(self.verbose) > 0:
+                if v_lvl >= 1:
                     tm = decoded.get("estimator__task_mode", decoded.get("task_mode", "?"))
                     nt = decoded.get("estimator__n_estimators", decoded.get("n_estimators", "?"))
                     md = decoded.get("estimator__max_depth", decoded.get("max_depth", "?"))
                     bm = decoded.get("estimator__extractor__bin_minutes", decoded.get("extractor__bin_minutes", "?"))
+                    fold_str = " | ".join(f"F{i + 1}: {fold_accs[i]:.2f}% -> QWK={fold_qwks[i]:.5f}" for i in ok_idx)
                     acc_lbl = f"{mean_acc:.2f}%" if np.isfinite(mean_acc) else "nan%"
                     print(
                         f"[GA gen {gen + 1}/{n_gen} | cand {c_idx + 1}/{pop_size}] task={tm} trees={nt} depth={md} bin={bm}m | "
                         f"Normal={acc_lbl} -> Comp QWK={mean_qwk:.5f} | best={best_so_far:.5f} ({elapsed:.2f}s){cached_tag}",
                         flush=True,
                     )
+                    if ok_idx and v_lvl >= 2:
+                        print(f"  Successful folds ({len(ok_idx)}/{len(fold_qwks)}): {fold_str}", flush=True)
+
+            if v_lvl >= 2 and gen_scores:
+                print(
+                    f"[GA gen {gen + 1}/{n_gen} SUMMARY] gen_best={max(gen_scores):.5f} | "
+                    f"gen_mean={float(np.mean(gen_scores)):.5f} | overall_best={best_so_far:.5f}",
+                    flush=True,
+                )
 
             if gen + 1 >= n_gen:
                 break
@@ -1425,7 +1609,13 @@ class RFGASearchCV(BaseEstimator):
         self.best_params_ = dict(all_params[self.best_index_])
         self.best_score_ = float(means[self.best_index_])
         if self.refit:
+            if v_lvl >= 2:
+                print(f"\n[GA REFIT] Refitting best candidate #{self.best_index_ + 1} (CV QWK={self.best_score_:.5f}): {_rf_candidate_brief(self.best_params_)}", flush=True)
             self.best_estimator_ = clone(self.estimator).set_params(**self.best_params_)
+            if hasattr(self.best_estimator_, "named_steps") and "estimator" in self.best_estimator_.named_steps:
+                inner = self.best_estimator_.named_steps["estimator"]
+                if hasattr(inner, "verbose"):
+                    inner.verbose = max(int(getattr(inner, "verbose", 0) or 0), v_lvl)
             self.best_estimator_.fit(X, y)
         return self
 
