@@ -3482,6 +3482,8 @@ def prepare_bayesian_space(space: Mapping[str, Any], skopt_available: bool = SKO
             out[k] = v.to_skopt()
         elif isinstance(v, (list, tuple)):
             out[k] = SkCategorical([_encode_skopt_item(x) for x in v])
+        elif hasattr(v, "categories"):
+            out[k] = SkCategorical([_encode_skopt_item(x) for x in v.categories])
         else:
             out[k] = v
     return out
