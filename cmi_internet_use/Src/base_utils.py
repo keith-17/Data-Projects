@@ -39,8 +39,9 @@ import pandas as pd
 from scipy import interpolate as sp_interp, signal as sps
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.feature_selection import f_classif
 from sklearn.impute import IterativeImputer, KNNImputer, MissingIndicator, SimpleImputer
-from sklearn.metrics import classification_report, confusion_matrix, mean_absolute_error
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, mean_absolute_error
 from sklearn.model_selection import (
     GridSearchCV,
     ParameterGrid,
@@ -478,9 +479,18 @@ NOOP_MOTION_ATOMS = (
     "enmo_ac_rms", "jerk_rms", "jerk_floor", "posture_var",
     "motion_cv", "sedentary_frac", "dog_var", "baevsky_si",
 )
-NOOP_PERIODICITY_MODES = (None, "none", "acf_circadian", "acf_kimmitch", "cosinor", "acf_kimmitch|cosinor")
-NOOP_SPECTRAL_ATOMS = ("band_fractions", "spectral_entropy", "peak_period", "parseval_ratio")
-NOOP_QUALITY_MODES = (None, "none", "basic")
+NOOP_PERIODICITY_MODES = (
+    None, "none", "acf", "acf_harmonic_checked", "acf_cadence",
+    "acf_circadian", "acf_sublag_fundamental", "acf_kimmitch",
+    "cosinor", "acf_sublag_fundamental|cosinor", "acf_kimmitch|cosinor",
+)
+NOOP_SPECTRAL_ATOMS = (
+    "peak_fraction", "peak_neighbourhood_fraction", "band_fractions",
+    "entropy", "peakedness", "spectral_entropy", "peak_period", "parseval_ratio",
+)
+NOOP_QUALITY_MODES = (None, "none", "basic", "report", "features")
+NOOP_SIGNALS = ("raw", "linear", "anglez_rate", "angular_speed", "log_enmo", "enmo", "dyn_amp")
+NOOP_POWER_BRANCHES = ("enmo", "light", "battery", "imu", "thm", "tof")
 
 
 class NoopActigraphyOptions(BaseEstimator):
@@ -489,44 +499,100 @@ class NoopActigraphyOptions(BaseEstimator):
     def __init__(
         self,
         motion_stats: Optional[str] = "kimmitch",
-        periodicity: Optional[str] = "acf_kimmitch|cosinor",
+        periodicity: Optional[str] = "acf_sublag_fundamental|cosinor",
         spectral_stats: Optional[str] = "all",
-        quality: Optional[str] = "basic",
+        quality: Optional[str] = "features",
+        signal: str = "raw",
+        band: Tuple[float, float] = (18.0, 30.0),
+        bands: Tuple[Tuple[float, float], ...] = ((18.0, 30.0), (8.0, 18.0), (2.0, 8.0)),
+        min_cycles: float = 2.0,
+        min_samples: int = 16,
+        max_gap_samples: int = 4,
+        acf_harmonic_tolerance: float = 0.1,
+        spectral_neighbourhood_hz: float = 0.00001,
         detrend: str = "linear",
+        cadence_band: Tuple[float, float] = (1.5, 10.0),
+        min_cadence_strength: float = 0.08,
+        power_branches: str = "enmo|light|battery",
+        nyquist_policy: str = "clip",
         period_band_hours: Tuple[float, float] = (18.0, 30.0),
         fundamental_ratio: float = 0.85,
         min_acf_strength: float = 0.08,
-        nyquist_policy: str = "clip",
     ):
         self.motion_stats = motion_stats
         self.periodicity = periodicity
         self.spectral_stats = spectral_stats
         self.quality = quality
+        self.signal = signal
+        self.band = band
+        self.bands = bands
+        self.min_cycles = min_cycles
+        self.min_samples = min_samples
+        self.max_gap_samples = max_gap_samples
+        self.acf_harmonic_tolerance = acf_harmonic_tolerance
+        self.spectral_neighbourhood_hz = spectral_neighbourhood_hz
         self.detrend = detrend
+        self.cadence_band = cadence_band
+        self.min_cadence_strength = min_cadence_strength
+        self.power_branches = power_branches
+        self.nyquist_policy = nyquist_policy
         self.period_band_hours = period_band_hours
         self.fundamental_ratio = fundamental_ratio
         self.min_acf_strength = min_acf_strength
-        self.nyquist_policy = nyquist_policy
 
     def mode_names(self) -> Tuple[set, set]:
         raw_m = self.motion_stats
-        if raw_m == "kimmitch":
-            raw_m = "enmo_ac_rms|jerk_rms|jerk_floor|posture_var|motion_cv|sedentary_frac|dog_var|baevsky_si"
+        if raw_m in {"kimmitch", "full"}:
+            raw_m = "|".join(NOOP_MOTION_ATOMS)
         elif raw_m == "basic":
             raw_m = "enmo_ac_rms|sedentary_frac"
         motion = _pipe_modes(raw_m, NOOP_MOTION_ATOMS, name="noop__motion_stats")
-        spectral = _pipe_modes(self.spectral_stats, NOOP_SPECTRAL_ATOMS, name="noop__spectral_stats")
+        raw_s = self.spectral_stats
+        if raw_s == "all":
+            raw_s = "|".join(NOOP_SPECTRAL_ATOMS)
+        spectral = _pipe_modes(raw_s, NOOP_SPECTRAL_ATOMS, name="noop__spectral_stats")
         if self.periodicity not in NOOP_PERIODICITY_MODES:
             raise InvalidExtractorParams(f"noop__periodicity must be one of {NOOP_PERIODICITY_MODES}")
         if self.quality not in NOOP_QUALITY_MODES:
             raise InvalidExtractorParams(f"noop__quality must be one of {NOOP_QUALITY_MODES}")
+        if self.signal not in NOOP_SIGNALS:
+            raise InvalidExtractorParams(f"noop__signal must be one of {NOOP_SIGNALS}")
         if self.nyquist_policy not in {"clip", "error"}:
             raise InvalidExtractorParams("noop__nyquist_policy must be 'clip' or 'error'")
         return motion, spectral
 
+    def periodicity_names(self) -> set:
+        raw_p = self.periodicity
+        if raw_p is None or str(raw_p).strip().lower() in {"", "none"}:
+            return set()
+        mapped = str(raw_p).replace("acf_kimmitch", "acf_sublag_fundamental").replace("acf_circadian", "acf")
+        return _pipe_modes(
+            mapped,
+            ("acf", "acf_harmonic_checked", "acf_cadence", "acf_sublag_fundamental", "cosinor"),
+            name="noop__periodicity",
+        )
+
+    def quality_names(self) -> set:
+        raw_q = self.quality
+        if raw_q is None or str(raw_q).strip().lower() in {"", "none"}:
+            return set()
+        return _pipe_modes(str(raw_q), ("basic", "report", "features"), name="noop__quality")
+
+    def branch_names(self) -> set:
+        raw_b = self.power_branches
+        if raw_b is None or str(raw_b).strip().lower() in {"", "none"}:
+            return set()
+        mapped = (
+            str(raw_b)
+            .replace("imu", "enmo")
+            .replace("thm", "light")
+            .replace("tof", "battery")
+        )
+        return _pipe_modes(mapped, ("enmo", "light", "battery"), name="noop__power_branches")
+
 
 class SignalCleaner(HoneycombBase):
-    """Signal cleaning, anti-alias binning, missingness/gap imputation & baseline separation."""
+    """Signal cleaning, anti-alias binning, cropping, problematic skew filtering & gap imputation."""
 
     def __init__(
         self,
@@ -542,6 +608,11 @@ class SignalCleaner(HoneycombBase):
         linear_acc_mode: str = "rolling_mean",
         baseline_window_bins: int = 16,
         highpass_hz: float = 0.00015,
+        maxlen_days: Optional[float] = None,
+        sequence_crop_mode: str = "none",
+        filter_problematic_sequences: bool = False,
+        ideal_skew_threshold: float = 3.5,
+        problematic_features_threshold: int = 3,
     ):
         self.bin_minutes = bin_minutes
         self.resample_method = resample_method
@@ -555,6 +626,11 @@ class SignalCleaner(HoneycombBase):
         self.linear_acc_mode = linear_acc_mode
         self.baseline_window_bins = baseline_window_bins
         self.highpass_hz = highpass_hz
+        self.maxlen_days = maxlen_days
+        self.sequence_crop_mode = sequence_crop_mode
+        self.filter_problematic_sequences = filter_problematic_sequences
+        self.ideal_skew_threshold = ideal_skew_threshold
+        self.problematic_features_threshold = problematic_features_threshold
 
     def _add_linear_motion(self, grid: Dict[str, Any]) -> Dict[str, Any]:
         """Separate slow baseline posture/activity envelope from rapid transitions (``base_utils.py``)."""
@@ -672,6 +748,62 @@ class SignalCleaner(HoneycombBase):
         m[idx_fill] = True
         return x, m
 
+    def _crop_grid(self, grid: Dict[str, Any]) -> Dict[str, Any]:
+        """Crop sequence grid using open-source ``seglearn.transform.PadTrunc`` / ``tsaug.Crop`` first, then custom anchor slices."""
+        crop_mode = str(self.sequence_crop_mode or "none").strip().lower()
+        if crop_mode == "none" or self.maxlen_days is None:
+            return grid
+        try:
+            max_days = float(self.maxlen_days)
+        except (TypeError, ValueError):
+            return grid
+        if not np.isfinite(max_days) or max_days <= 0:
+            return grid
+        bin_m = max(1, int(grid.get("bin_minutes", self.bin_minutes)))
+        maxlen_bins = max(16, int(round(max_days * 24.0 * 60.0 / float(bin_m))))
+        n = int(grid.get("n_bins", len(grid["mask"])))
+        if n <= maxlen_bins:
+            return grid
+
+        arr_keys = [k for k, v in grid.items() if isinstance(v, np.ndarray) and v.ndim == 1 and len(v) == n]
+        out = dict(grid)
+
+        # 1. Open-source libraries first: seglearn PadTrunc or tsaug Crop
+        if crop_mode in {"pad_trunc", "head"} and SEGLEARN_AVAILABLE and PadTrunc is not None:
+            pt = PadTrunc(width=maxlen_bins)
+            for k in arr_keys:
+                v = out[k]
+                if v.dtype == bool:
+                    tr, _, _ = pt.fit_transform([v.astype(np.float64)[:, None]], [0])
+                    out[k] = (tr[0, :, 0] > 0.5)
+                else:
+                    tr, _, _ = pt.fit_transform([v[:, None]], [0])
+                    out[k] = tr[0, :, 0].astype(v.dtype)
+            out["n_bins"] = int(len(out["mask"]))
+            return out
+
+        if crop_mode == "tsaug_crop" and TSAUG_AVAILABLE and tsaug is not None:
+            idx_track = np.arange(n, dtype=np.float64)[None, :, None]
+            cropped_idx = tsaug.Crop(size=maxlen_bins, seed=42).augment(idx_track)
+            start = int(np.clip(round(float(cropped_idx[0, 0, 0])), 0, max(0, n - maxlen_bins)))
+            sl = slice(start, start + maxlen_bins)
+        elif crop_mode in {"head", "pad_trunc"}:
+            sl = slice(0, maxlen_bins)
+        elif crop_mode == "tail":
+            sl = slice(n - maxlen_bins, n)
+        elif crop_mode in {"center", "tsaug_crop"}:
+            start = max(0, (n - maxlen_bins) // 2)
+            sl = slice(start, start + maxlen_bins)
+        else:
+            raise InvalidExtractorParams(
+                f"sequence_crop_mode must be 'none', 'pad_trunc', 'tsaug_crop', 'head', 'tail', or 'center', got {crop_mode!r}"
+            )
+
+        for k in arr_keys:
+            out[k] = out[k][sl].copy()
+        out["n_bins"] = int(len(out["mask"]))
+        return out
+
     def clean_series(self, parquet_path_or_df: Any) -> Optional[Dict[str, Any]]:
         grid = bin_actigraphy_series(
             parquet_path_or_df,
@@ -682,6 +814,29 @@ class SignalCleaner(HoneycombBase):
             clip_enmo=(None if self.clip_enmo is None else float(self.clip_enmo)),
         )
         if grid is None or not grid["mask"].any():
+            return None
+
+        grid = self._crop_grid(grid)
+        if not grid["mask"].any():
+            return None
+
+        # ProblematicSequenceFilter skew diagnostic across actigraphy channels
+        raw_m = np.asarray(grid["mask"], dtype=bool)
+        skew_thresh = float(self.ideal_skew_threshold) if self.ideal_skew_threshold is not None else 3.5
+        prob_thresh = max(1, int(self.problematic_features_threshold or 3))
+        skew_cnt = 0
+        for ch_key in ("enmo", "log_enmo", "dyn_amp", "anglez", "light", "battery_voltage"):
+            if ch_key in grid and isinstance(grid[ch_key], np.ndarray):
+                vals = grid[ch_key][raw_m & np.isfinite(grid[ch_key])]
+                if len(vals) >= 16:
+                    sd = float(np.std(vals))
+                    if sd > 1e-9:
+                        sk = abs(float(np.mean(((vals - float(np.mean(vals))) / sd) ** 3)))
+                        if sk > skew_thresh:
+                            skew_cnt += 1
+        grid["problematic_skew_count"] = int(skew_cnt)
+        grid["is_problematic_sequence"] = bool(skew_cnt >= prob_thresh)
+        if bool(self.filter_problematic_sequences) and grid["is_problematic_sequence"]:
             return None
 
         bin_h = float(grid["bin_minutes"]) / 60.0
@@ -709,6 +864,10 @@ class SignalCleaner(HoneycombBase):
         dyn_f, _ = self._impute_1d_channel(
             grid["dyn_amp"], raw_mask, grid["hour_of_day"], mode=eff_mode, max_gap=gap_lim, impute_long_gaps=eff_long, nonnegative=True
         )
+        bat_raw = grid.get("battery_voltage", np.full_like(enmo_f, np.nan))
+        bat_f, _ = self._impute_1d_channel(
+            bat_raw, raw_mask, grid["hour_of_day"], mode=eff_mode, max_gap=gap_lim, impute_long_gaps=eff_long, nonnegative=True
+        )
 
         out = dict(grid)
         out["raw_mask"] = raw_mask
@@ -719,6 +878,7 @@ class SignalCleaner(HoneycombBase):
         out["light_filled"] = lgt_f
         out["anglez_filled"] = ang_f
         out["dyn_amp_filled"] = dyn_f
+        out["battery_filled"] = bat_f
         return self._add_linear_motion(out)
 
 
@@ -796,7 +956,7 @@ class MotionFilter(HoneycombBase):
 
 
 class ActigraphyBranchExtractor(HoneycombBase):
-    """Build parallel branches (``raw|smoothed|jerk|velocity|linear|kalman``) & statistics."""
+    """Build parallel branches (``raw|smoothed|jerk|velocity|freq_velocity|freq_displacement|linear|kalman``) & statistics."""
 
     def __init__(
         self,
@@ -804,16 +964,42 @@ class ActigraphyBranchExtractor(HoneycombBase):
         smooth_window_bins: int = 4,
         smooth_alpha: Optional[float] = None,
         branch_stats: str = "mean|std|p90|rms",
+        dc_offset_bins: int = 2,
     ):
         self.acc_modes = acc_modes
         self.smooth_window_bins = smooth_window_bins
         self.smooth_alpha = smooth_alpha
         self.branch_stats = branch_stats
+        self.dc_offset_bins = dc_offset_bins
+
+    def _fft_integrate_channel(self, arr: np.ndarray, mask: np.ndarray, dt_h: float, order: int = 1) -> np.ndarray:
+        """Complex FFT frequency-domain integration (``ImuExtractor._scale_frequency_domain``) with DC offset cutoff."""
+        out = np.full_like(arr, np.nan, dtype=np.float64)
+        dc_cut = max(1, int(self.dc_offset_bins or 1))
+        for s, e in contiguous_true_runs(mask):
+            seg = arr[s:e]
+            n = len(seg)
+            if n < 8:
+                continue
+            zm = seg - float(np.mean(seg))
+            spec = np.fft.fft(zm)
+            freqs = np.fft.fftfreq(n, d=max(dt_h, 1e-6))
+            cut = min(dc_cut, n // 2)
+            spec[:cut] = 0.0
+            if cut > 1:
+                spec[-(cut - 1):] = 0.0
+            safe_f = np.where(np.abs(freqs) < 1e-9, 1.0, freqs)
+            if order == 1:
+                scale = np.where(np.abs(freqs) < 1e-9, 0.0, 1.0 / (2.0j * np.pi * safe_f))
+            else:
+                scale = np.where(np.abs(freqs) < 1e-9, 0.0, -1.0 / np.square(2.0 * np.pi * safe_f))
+            out[s:e] = np.real(np.fft.ifft(spec * scale))
+        return out
 
     def build_and_summarize(self, grid: Dict[str, Any]) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
         modes = _pipe_modes(
             self.acc_modes,
-            ("raw", "smoothed", "jerk", "velocity", "linear", "kalman"),
+            ("raw", "smoothed", "jerk", "velocity", "freq_velocity", "freq_displacement", "linear", "kalman"),
             name="acc_modes",
         )
         stats_wanted = _pipe_modes(
@@ -861,6 +1047,12 @@ class ActigraphyBranchExtractor(HoneycombBase):
         if "velocity" in modes and "dr_vel" in grid:
             branches["dr_velocity"] = grid["dr_vel"]
             branches["dr_displacement"] = grid["dr_pos"]
+
+        if "freq_velocity" in modes:
+            branches["freq_velocity"] = self._fft_integrate_channel(enmo_f, mask_f, dt_h, order=1)
+
+        if "freq_displacement" in modes:
+            branches["freq_displacement"] = self._fft_integrate_channel(enmo_f, mask_f, dt_h, order=2)
 
         if "linear" in modes and "lin_enmo" in grid:
             branches["lin_enmo"] = grid["lin_enmo"]
@@ -1121,6 +1313,234 @@ class StatsmodelsAndAutocorrExtractor(HoneycombBase):
         return out
 
 
+class LagLeadAndRollingExtractor(HoneycombBase):
+    """Directional lag, lead, cross-channel causality, pre-sleep lead / post-wake lag & rolling history extractor.
+
+    All switches (`include_lags`, `include_leads`, `include_rolling`, `lag_lead_hours`,
+    `rolling_window_hours`, `lag_lead_channels`) support `'none'` / `None` / `False`.
+    """
+
+    def __init__(
+        self,
+        include_lags: Any = True,
+        include_leads: Any = True,
+        include_rolling: Any = True,
+        lag_lead_hours: Any = (0.5, 1.0, 2.0, 4.0),
+        rolling_window_hours: Any = (1.0, 3.0, 6.0),
+        lag_lead_channels: Optional[str] = "log_enmo|light|anglez",
+        sedentary_threshold_g: float = 0.025,
+    ):
+        self.include_lags = include_lags
+        self.include_leads = include_leads
+        self.include_rolling = include_rolling
+        self.lag_lead_hours = lag_lead_hours
+        self.rolling_window_hours = rolling_window_hours
+        self.lag_lead_channels = lag_lead_channels
+        self.sedentary_threshold_g = sedentary_threshold_g
+
+    @staticmethod
+    def _is_on(flag: Any) -> bool:
+        if flag is None:
+            return False
+        if isinstance(flag, str):
+            return flag.strip().lower() not in {"", "none", "false", "0", "off"}
+        return bool(flag)
+
+    @staticmethod
+    def _hours_tuple(raw: Any) -> Tuple[float, ...]:
+        val = _structured(raw)
+        if val is None or (isinstance(val, str) and val.strip().lower() in {"", "none"}):
+            return ()
+        if isinstance(val, (int, float, np.number)):
+            return (float(val),) if float(val) > 0 else ()
+        return tuple(float(h) for h in val if h is not None and str(h).strip().lower() != "none" and float(h) > 0)
+
+    @staticmethod
+    def _masked_lag_corr(x: np.ndarray, y: np.ndarray, mask: np.ndarray, k_bins: int) -> float:
+        """Correlation corr(x[t - k], y[t]) where x leads y by k_bins >= 1."""
+        n = len(mask)
+        if k_bins <= 0 or k_bins >= n - 6:
+            return np.nan
+        valid = mask[:-k_bins] & mask[k_bins:] & np.isfinite(x[:-k_bins]) & np.isfinite(y[k_bins:])
+        if int(valid.sum()) < 10:
+            return np.nan
+        xv = x[:-k_bins][valid]
+        yv = y[k_bins:][valid]
+        sx = float(np.std(xv))
+        sy = float(np.std(yv))
+        if sx <= 1e-9 or sy <= 1e-9:
+            return 0.0
+        return float(np.mean((xv - float(np.mean(xv))) * (yv - float(np.mean(yv)))) / (sx * sy))
+
+    def extract(self, grid: Dict[str, Any]) -> Dict[str, float]:
+        do_lags = self._is_on(self.include_lags)
+        do_leads = self._is_on(self.include_leads)
+        do_roll = self._is_on(self.include_rolling)
+        if not (do_lags or do_leads or do_roll):
+            return {}
+
+        ch_set = _pipe_modes(
+            self.lag_lead_channels,
+            ("log_enmo", "enmo", "dyn_amp", "light", "anglez", "lin_enmo"),
+            name="lag_lead_channels",
+        )
+        if not ch_set:
+            return {}
+
+        mask = grid["mask"]
+        fill_m = grid["mask_filled"]
+        bin_m = max(1, int(grid["bin_minutes"]))
+        bin_h = float(bin_m) / 60.0
+        n = int(grid["n_bins"])
+        out: Dict[str, float] = {}
+
+        ch_map: Dict[str, np.ndarray] = {
+            "log_enmo": grid["log_enmo_filled"],
+            "enmo": grid["enmo_filled"],
+            "dyn_amp": grid["dyn_amp_filled"],
+            "light": np.log1p(np.maximum(grid["light_filled"], 0.0)),
+            "anglez": grid["anglez_filled"],
+            "lin_enmo": np.nan_to_num(grid.get("lin_enmo", grid["enmo_filled"]), nan=0.0),
+        }
+
+        ll_hours = self._hours_tuple(self.lag_lead_hours)
+        # 1. Multi-horizon backward lags, forward leads, lead-lag acceleration & cross-channel lead-lag asymmetry
+        if (do_lags or do_leads) and ll_hours:
+            asym_light_enmo_vals: List[float] = []
+            light_leads_enmo_vals: List[float] = []
+            accel_enmo_vals: List[float] = []
+
+            for h in ll_hours:
+                k = max(1, int(round(float(h) / max(bin_h, 1e-6))))
+                if k >= n - 4:
+                    continue
+                h_tag = f"{int(round(h * 60))}m" if h < 1.0 else f"{h:g}h"
+
+                for ch in sorted(ch_set):
+                    arr = ch_map[ch]
+                    valid_lag = fill_m[k:] & fill_m[:-k] & np.isfinite(arr[k:]) & np.isfinite(arr[:-k])
+                    if int(valid_lag.sum()) < 8:
+                        continue
+                    diff_lag = arr[k:][valid_lag] - arr[:-k][valid_lag]  # x_t - x_{t-k} (backward lag difference)
+                    diff_lead = arr[k:][valid_lag] - arr[:-k][valid_lag]  # x_{t+k} - x_t on valid pairs
+
+                    if do_lags:
+                        out[f"seq_lag_diff_{ch}_{h_tag}_rms"] = float(np.sqrt(np.mean(np.square(diff_lag))))
+                        out[f"seq_lag_diff_{ch}_{h_tag}_p90"] = float(np.percentile(np.abs(diff_lag), 90))
+                    if do_leads:
+                        pos_leads = diff_lead[diff_lead > 0]
+                        neg_lags = -diff_lag[diff_lag < 0]
+                        up_ramp = float(np.mean(pos_leads)) if len(pos_leads) else 0.0
+                        down_taper = float(np.mean(neg_lags)) if len(neg_lags) else 0.0
+                        out[f"seq_lead_ramp_{ch}_{h_tag}"] = up_ramp
+                        if do_lags:
+                            out[f"seq_lag_lead_ramp_asym_{ch}_{h_tag}"] = float(up_ramp - down_taper)
+
+                    if do_lags and do_leads and 2 * k < n - 4:
+                        v3 = fill_m[:-2 * k] & fill_m[k:-k] & fill_m[2 * k:]
+                        if int(v3.sum()) >= 8:
+                            # Second-order lead-lag curvature: (x_{t+k} - x_t) - (x_t - x_{t-k})
+                            curv = (arr[2 * k:][v3] - arr[k:-k][v3]) - (arr[k:-k][v3] - arr[:-2 * k][v3])
+                            c_rms = float(np.sqrt(np.mean(np.square(curv))))
+                            out[f"seq_lag_lead_accel_{ch}_{h_tag}_rms"] = c_rms
+                            if ch == "log_enmo":
+                                accel_enmo_vals.append(c_rms)
+
+                # Directional cross-channel lead-lag correlations: Light <-> Motion and Motion <-> Posture
+                if "light" in ch_set and "log_enmo" in ch_set:
+                    c_l_leads_e = self._masked_lag_corr(ch_map["light"], ch_map["log_enmo"], fill_m, k)
+                    c_e_leads_l = self._masked_lag_corr(ch_map["log_enmo"], ch_map["light"], fill_m, k)
+                    if do_lags and np.isfinite(c_l_leads_e):
+                        out[f"seq_lag_light_leads_enmo_{h_tag}"] = c_l_leads_e
+                        light_leads_enmo_vals.append(c_l_leads_e)
+                    if do_leads and np.isfinite(c_e_leads_l):
+                        out[f"seq_lead_enmo_leads_light_{h_tag}"] = c_e_leads_l
+                    if do_lags and do_leads and np.isfinite(c_l_leads_e) and np.isfinite(c_e_leads_l):
+                        asym = float(c_l_leads_e - c_e_leads_l)
+                        out[f"seq_lag_lead_light_enmo_asym_{h_tag}"] = asym
+                        asym_light_enmo_vals.append(asym)
+
+                if "log_enmo" in ch_set and "anglez" in ch_set:
+                    c_e_leads_a = self._masked_lag_corr(ch_map["log_enmo"], np.abs(np.gradient(ch_map["anglez"])), fill_m, k)
+                    c_a_leads_e = self._masked_lag_corr(np.abs(np.gradient(ch_map["anglez"])), ch_map["log_enmo"], fill_m, k)
+                    if do_lags and do_leads and np.isfinite(c_e_leads_a) and np.isfinite(c_a_leads_e):
+                        out[f"seq_lag_lead_enmo_anglez_asym_{h_tag}"] = float(c_e_leads_a - c_a_leads_e)
+
+            out["seq_lag_light_leads_enmo_mean"] = float(np.mean(light_leads_enmo_vals)) if light_leads_enmo_vals else np.nan
+            out["seq_lag_lead_light_enmo_asym_mean"] = float(np.mean(asym_light_enmo_vals)) if asym_light_enmo_vals else np.nan
+            out["seq_lag_lead_accel_enmo_mean"] = float(np.mean(accel_enmo_vals)) if accel_enmo_vals else np.nan
+
+        # 2. Pre-Sleep Lead Window (-2h before sleep onset) vs. Post-Wake Lag Window (+2h after wake)
+        sib = grid.get("van_hees_sib", np.zeros(n, dtype=np.float64))
+        sleep_state = fill_m & np.isfinite(sib) & (sib >= 0.65)
+        sleep_runs = [(s, e) for s, e in contiguous_true_runs(sleep_state) if (e - s) * bin_h >= 2.0]
+        w_2h = max(2, int(round(2.0 / max(bin_h, 1e-6))))
+        presleep_enmo, presleep_light, postwake_enmo = [], [], []
+        for s, e in sleep_runs:
+            if do_leads and s >= w_2h and fill_m[s - w_2h:s].sum() >= max(2, w_2h // 2):
+                presleep_enmo.append(float(np.nanmean(grid["enmo_filled"][s - w_2h:s])))
+                presleep_light.append(float(np.nanmean(ch_map["light"][s - w_2h:s])))
+            if do_lags and (e + w_2h) <= n and fill_m[e:e + w_2h].sum() >= max(2, w_2h // 2):
+                postwake_enmo.append(float(np.nanmean(grid["enmo_filled"][e:e + w_2h])))
+
+        if do_leads:
+            out["seq_lead_presleep_enmo_2h"] = float(np.mean(presleep_enmo)) if presleep_enmo else np.nan
+            out["seq_lead_presleep_light_2h"] = float(np.mean(presleep_light)) if presleep_light else np.nan
+        if do_lags:
+            out["seq_lag_postwake_enmo_2h"] = float(np.mean(postwake_enmo)) if postwake_enmo else np.nan
+        if do_leads and do_lags and presleep_enmo and postwake_enmo:
+            out["seq_presleep_lead_postwake_lag_ratio"] = float(
+                np.mean(presleep_enmo) / max(float(np.mean(postwake_enmo)), 1e-4)
+            )
+
+        # 3. Day d Nocturnal Activity Leading Day d+1 Daytime Sedentary Rebound
+        bins_day = max(4, int(round(24.0 / max(bin_h, 1e-6))))
+        n_days = n // bins_day
+        if (do_lags or do_leads) and n_days >= 3:
+            hod = grid["hour_of_day"]
+            night_act_by_day: List[float] = []
+            day_sed_by_day: List[float] = []
+            for d in range(n_days):
+                sl = slice(d * bins_day, (d + 1) * bins_day)
+                m_d = mask[sl]
+                h_d = hod[sl]
+                e_d = grid["enmo"][sl]
+                night_m = m_d & ((h_d >= 22.0) | (h_d < 6.0))
+                day_m = m_d & (h_d >= 8.0) & (h_d < 20.0)
+                night_act_by_day.append(float(np.nanmean(e_d[night_m])) if night_m.any() else np.nan)
+                day_sed_by_day.append(float(np.nanmean(e_d[day_m] < float(self.sedentary_threshold_g))) if day_m.any() else np.nan)
+            na_arr = np.asarray(night_act_by_day[:-1], dtype=np.float64)
+            ds_arr = np.asarray(day_sed_by_day[1:], dtype=np.float64)
+            ok_d = np.isfinite(na_arr) & np.isfinite(ds_arr)
+            if int(ok_d.sum()) >= 2 and np.std(na_arr[ok_d]) > 1e-9 and np.std(ds_arr[ok_d]) > 1e-9:
+                out["seq_day_lag1_night_to_nextday_sed_corr"] = float(
+                    np.corrcoef(na_arr[ok_d], ds_arr[ok_d])[0, 1]
+                )
+
+        # 4. Multi-Scale Rolling History Windows (include_rolling)
+        roll_hours = self._hours_tuple(self.rolling_window_hours)
+        if do_roll and roll_hours:
+            for rh in roll_hours:
+                w = max(3, int(round(float(rh) / max(bin_h, 1e-6))))
+                if w >= n - 4:
+                    continue
+                r_tag = f"{int(round(rh * 60))}m" if rh < 1.0 else f"{rh:g}h"
+                x_e = np.where(fill_m, grid["log_enmo_filled"], np.nan)
+                s_ser = pd.Series(x_e)
+                r_mean = s_ser.rolling(window=w, min_periods=max(2, w // 2)).mean().to_numpy(dtype=np.float64)
+                r_std = s_ser.rolling(window=w, min_periods=max(2, w // 2)).std().to_numpy(dtype=np.float64)
+                fin_m = np.isfinite(r_mean)
+                fin_s = np.isfinite(r_std)
+                if fin_m.sum() >= 6:
+                    out[f"seq_roll_enmo_{r_tag}_iqr"] = float(
+                        np.percentile(r_mean[fin_m], 75) - np.percentile(r_mean[fin_m], 25)
+                    )
+                if fin_s.sum() >= 6:
+                    med_s = max(float(np.median(r_std[fin_s])), 1e-5)
+                    out[f"seq_roll_enmo_{r_tag}_burst_ratio"] = float(np.percentile(r_std[fin_s], 95) / med_s)
+        return out
+
+
 class SleepRegularityAndOrientationExtractor(HoneycombBase):
     """``OpenStrap/analytics`` van Hees SIB, Phillips SRI, circular SJL, dynAmp, MAD & posture proxy."""
 
@@ -1365,7 +1785,7 @@ class PRSAAndChangepointExtractor(HoneycombBase):
 
 
 class STFTAndWelchExtractor(HoneycombBase):
-    """Windowed ``scipy.signal.stft`` edge-corrected spectrogram + Hann ``scipy.signal.welch`` PSD."""
+    """Windowed ``scipy.signal.stft`` edge-corrected spectrogram + Hann ``scipy.signal.welch`` PSD + pumpflow spectral moments."""
 
     def __init__(
         self,
@@ -1376,6 +1796,7 @@ class STFTAndWelchExtractor(HoneycombBase):
         stft_detrend: str = "constant",
         stft_bands_hours: Tuple[Tuple[float, float], ...] = ((16.0, 36.0), (4.0, 16.0), (1.0, 4.0)),
         max_gap_bins: int = 4,
+        spectral_moment_max_peaks: int = 6,
     ):
         self.stft_window_days = stft_window_days
         self.stft_overlap_ratio = stft_overlap_ratio
@@ -1384,6 +1805,23 @@ class STFTAndWelchExtractor(HoneycombBase):
         self.stft_detrend = stft_detrend
         self.stft_bands_hours = stft_bands_hours
         self.max_gap_bins = max_gap_bins
+        self.spectral_moment_max_peaks = spectral_moment_max_peaks
+
+    @staticmethod
+    def _moments_auc(u: np.ndarray, v: np.ndarray) -> Tuple[float, float, float, float, float]:
+        """Distributional moments & AUC of a spectrum (ported from ``V1CargoExtractor`` / ``pumpflow``)."""
+        if len(u) == 0 or len(v) == 0:
+            return 0.0, 0.0, 0.0, 0.0, 0.0
+        vmin, vmax = float(np.min(v)), float(np.max(v))
+        w = (v - vmin) / max(vmax - vmin, 1e-10)
+        total_w = float(np.sum(w)) + 1e-10
+        mean = float(np.sum(w * u) / total_w)
+        var = float(np.sum(w * np.square(u - mean)) / total_w)
+        std = float(np.sqrt(max(var, 0.0))) + 1e-10
+        skew = float(np.sum(w * ((u - mean) ** 3)) / (total_w * (std ** 3)))
+        kurt = float(np.sum(w * ((u - mean) ** 4)) / (total_w * (std ** 4)))
+        auc = float(np.sum(w))
+        return mean, std, skew, kurt, auc
 
     def extract(self, grid: Dict[str, Any]) -> Dict[str, float]:
         out: Dict[str, float] = {
@@ -1391,6 +1829,8 @@ class STFTAndWelchExtractor(HoneycombBase):
             "seq_stft_centroid_hz": np.nan, "seq_stft_spread_hz": np.nan, "seq_stft_entropy_bits": np.nan,
             "seq_stft_temporal_power_slope": np.nan, "seq_stft_flux_mean": np.nan, "seq_stft_flux_max": np.nan,
             "seq_stft_circadian_frac": np.nan, "seq_stft_ultradian_frac": np.nan, "seq_stft_bout_frac": np.nan,
+            "seq_spec_moment_mean": np.nan, "seq_spec_moment_std": np.nan, "seq_spec_moment_skew": np.nan,
+            "seq_spec_moment_kurt": np.nan, "seq_spec_moment_auc": np.nan, "seq_spec_n_prominent_peaks": np.nan,
         }
         spec = compute_welch_circadian_spectrum(grid["log_enmo"], grid["mask"], grid["fs_bin_hz"], max_gap_bins=int(self.max_gap_bins))
         for k, v in spec.items():
@@ -1408,7 +1848,7 @@ class STFTAndWelchExtractor(HoneycombBase):
         bins_per_day = max(8, int(round(86400.0 * fs)))
         nperseg = max(16, min(len(seg), int(round(float(self.stft_window_days) * bins_per_day))))
         noverlap = min(nperseg - 1, max(0, int(round(nperseg * float(self.stft_overlap_ratio)))))
-        sc_mode = "psd" if self.stft_scaling == "psd" else "spectrum"
+        sc_mode = "psd" if str(self.stft_scaling).lower() in {"psd", "density"} else "spectrum"
         win_arg = "boxcar" if (self.stft_window_type is None or str(self.stft_window_type).strip().lower() in {"", "none"}) else str(self.stft_window_type)
         det_arg: Any = False if (self.stft_detrend is None or self.stft_detrend is False or str(self.stft_detrend).strip().lower() in {"", "none"}) else str(self.stft_detrend)
         f, t, Zxx = sps.stft(
@@ -1452,6 +1892,20 @@ class STFTAndWelchExtractor(HoneycombBase):
         out["seq_stft_flux_mean"] = float(np.mean(flux))
         out["seq_stft_flux_max"] = float(np.max(flux))
 
+        # Pumpflow / V1CargoExtractor distributional spectral moments & prominence peak cut-points
+        f_cph = f[1:] * 3600.0  # cycles per hour
+        psd_ac = mean_psd[1:]
+        if len(f_cph) >= 3 and np.max(psd_ac) > 1e-15:
+            m_mean, m_std, m_skew, m_kurt, m_auc = self._moments_auc(f_cph, psd_ac)
+            out["seq_spec_moment_mean"] = m_mean
+            out["seq_spec_moment_std"] = m_std
+            out["seq_spec_moment_skew"] = m_skew
+            out["seq_spec_moment_kurt"] = m_kurt
+            out["seq_spec_moment_auc"] = m_auc
+            max_pks = max(1, int(self.spectral_moment_max_peaks or 6))
+            pk_idx, _ = sps.find_peaks(psd_ac, prominence=max(1e-6 * float(np.max(psd_ac)), 1e-12))
+            out["seq_spec_n_prominent_peaks"] = float(min(len(pk_idx), max_pks))
+
         nyq = 0.5 * fs
         bands = tuple(tuple(map(float, b)) for b in _structured(self.stft_bands_hours))
         for bname, (lo_h, hi_h) in zip(("circadian", "ultradian", "bout"), bands):
@@ -1467,7 +1921,7 @@ class STFTAndWelchExtractor(HoneycombBase):
 
 
 class WaveletAndRecurrenceExtractor(HoneycombBase):
-    """Open-source ``pywt`` (CWT + orthogonal DWT) and ``pyts.image.RecurrencePlot`` features."""
+    """Open-source ``pywt`` (CWT with COI & ridges + orthogonal DWT) and ``pyts.image.RecurrencePlot`` features."""
 
     def __init__(
         self,
@@ -1491,6 +1945,9 @@ class WaveletAndRecurrenceExtractor(HoneycombBase):
             "seq_cwt_dominant_period_h": np.nan, "seq_cwt_scale_entropy": np.nan,
             "seq_cwt_circadian_energy": np.nan, "seq_cwt_ultradian_energy": np.nan,
             "seq_cwt_ultradian_circadian_ratio": np.nan,
+            "seq_cwt_boundary_fraction": np.nan, "seq_cwt_valid_coeff_fraction": np.nan,
+            "seq_cwt_ridge_mean": np.nan, "seq_cwt_ridge_std": np.nan,
+            "seq_cwt_ridge_count_per_bin": np.nan, "seq_cwt_var_to_mean_scale_mag": np.nan,
         }
         runs = contiguous_true_runs(grid["mask_filled"])
         if not runs:
@@ -1502,7 +1959,7 @@ class WaveletAndRecurrenceExtractor(HoneycombBase):
             return out
         seg_zm = seg - float(np.mean(seg))
 
-        # 1. PyWavelets CWT
+        # 1. PyWavelets CWT (with Honeycomb Cone-of-Influence & Ridge Extraction)
         cwt_wav = str(self.cwt_wavelet or "none").strip()
         if PYWT_AVAILABLE and pywt is not None and cwt_wav.lower() not in {"", "none"} and int(self.cwt_n_scales) > 0:
             wlet = pywt.ContinuousWavelet(cwt_wav)
@@ -1524,6 +1981,7 @@ class WaveletAndRecurrenceExtractor(HoneycombBase):
                         if edge > 0:
                             valid[idx, : min(edge, len(seg))] = False
                             valid[idx, max(0, len(seg) - edge) :] = False
+                    raw_valid_frac = float(valid.mean())
                     if not valid.any():
                         valid[:] = True
                     valid_counts = valid.sum(axis=1)
@@ -1537,6 +1995,25 @@ class WaveletAndRecurrenceExtractor(HoneycombBase):
                     out["seq_cwt_dominant_period_h"] = float(periods_h[int(np.argmax(scale_mean))])
                     p_s = scale_mean[scale_mean > 0] / max(float(np.sum(scale_mean)), 1e-15)
                     out["seq_cwt_scale_entropy"] = float(-np.sum(p_s * np.log2(p_s))) if len(p_s) else 0.0
+                    out["seq_cwt_boundary_fraction"] = float(1.0 - raw_valid_frac)
+                    out["seq_cwt_valid_coeff_fraction"] = raw_valid_frac
+                    out["seq_cwt_var_to_mean_scale_mag"] = (
+                        float(np.var(scale_mean) / np.mean(scale_mean)) if float(np.mean(scale_mean)) > 1e-12 else 0.0
+                    )
+
+                    # Wavelet ridge energy & density across time bins via argrelextrema
+                    masked_mag = np.where(valid, mag, 0.0)
+                    if masked_mag.shape[0] > 2:
+                        max_r, max_c = sps.argrelextrema(masked_mag, np.greater, axis=0)
+                        if len(max_r) > 0:
+                            ridge_vals = masked_mag[max_r, max_c]
+                            out["seq_cwt_ridge_mean"] = float(np.mean(ridge_vals))
+                            out["seq_cwt_ridge_std"] = float(np.std(ridge_vals))
+                            out["seq_cwt_ridge_count_per_bin"] = float(len(ridge_vals) / max(len(seg), 1))
+                        else:
+                            out["seq_cwt_ridge_mean"] = 0.0
+                            out["seq_cwt_ridge_std"] = 0.0
+                            out["seq_cwt_ridge_count_per_bin"] = 0.0
 
                     circ_m = (periods_h >= 16.0) & (periods_h <= 36.0)
                     ult_m = (periods_h >= 4.0) & (periods_h < 16.0)
@@ -2009,7 +2486,7 @@ class TsflexMultiScaleExtractor(HoneycombBase):
 class TSAugmentor(BaseEstimator):
     """Time-series chunk augmentor powered by ``tsaug`` (ported from ``utils_v3.py``).
 
-    Configurable via sklearn ``estimator__augmentor__*`` params in Grid/Bayesian searches.
+    Configurable via sklearn ``estimator__augmentor__*`` params in Grid/Bayesian/Evolutionary searches.
     Baseline defaults set ``prob=0.0`` (inactive during baseline fit unless enabled).
     """
 
@@ -2032,6 +2509,8 @@ class TSAugmentor(BaseEstimator):
         temporal_mask_frac: float = 0.0,
         temporal_mask_fill: str = "ffill",
         channel_drop_prob: float = 0.0,
+        sensor_drop_prob: float = 0.0,
+        sensor_drop_joint_prob: float = 0.0,
         random_state: Optional[int] = 42,
     ):
         self.prob = prob
@@ -2051,6 +2530,8 @@ class TSAugmentor(BaseEstimator):
         self.temporal_mask_frac = temporal_mask_frac
         self.temporal_mask_fill = temporal_mask_fill
         self.channel_drop_prob = channel_drop_prob
+        self.sensor_drop_prob = sensor_drop_prob
+        self.sensor_drop_joint_prob = sensor_drop_joint_prob
         self.random_state = random_state
 
     def allowed_ops(self) -> set:
@@ -2070,17 +2551,29 @@ class TSAugmentor(BaseEstimator):
             "jitter": float(self.jitter_sigma) > 0,
             "noise": float(self.noise_std) > 0,
             "scaling": float(self.scaling_sigma) > 0,
-            "magnitude_warp": float(self.warp_sigma) > 0,
-            "time_warp": float(self.time_warp_max_speed_ratio) > 1.0,
+            "magnitude_warp": float(self.warp_sigma) > 0 and int(self.warp_num_knots) > 0,
+            "time_warp": float(self.time_warp_max_speed_ratio) > 1.0 and int(self.time_warp_n_speed_change) > 0,
             "time_shift": float(self.time_shift_frac) > 0,
             "crop": hi < 1.0,
-            "temporal_mask": int(self.temporal_num_masks) > 0 and float(self.temporal_mask_frac) > 0,
+            "temporal_mask": int(self.temporal_num_masks) > 0 and float(self.temporal_mask_frac) > 0 and str(self.temporal_mask_fill).strip().lower() not in {"", "none"},
             "channel_drop": float(self.channel_drop_prob) > 0,
         }
         return [op for op in AUGMENTATIONS if op in allowed and strengths[op]]
 
     def enabled(self) -> bool:
-        return int(self.n_copies) > 0 and float(self.prob) > 0 and float(self.per_aug_prob) > 0 and bool(self.active_ops())
+        has_ops = bool(self.active_ops()) or float(self.sensor_drop_prob) > 0 or float(self.sensor_drop_joint_prob) > 0
+        return int(self.n_copies) > 0 and float(self.prob) > 0 and float(self.per_aug_prob) > 0 and has_ops
+
+    def sample_modality_keep(self, n: int, rng: Optional[np.random.Generator] = None) -> np.ndarray:
+        """Sample actigraphy sensor drop mask for training subjects (mirrors ``utils_v3.py``)."""
+        if rng is None:
+            rng = np.random.default_rng(self.random_state)
+        keep = np.ones(n, dtype=bool)
+        p_drop = max(float(self.sensor_drop_prob), float(self.sensor_drop_joint_prob))
+        if p_drop > 0.0:
+            drop = rng.random(n) < p_drop
+            keep[drop] = False
+        return keep
 
     def _tsaug_op(self, op: str, length: int, seed: int):
         if op == "jitter":
@@ -2098,7 +2591,9 @@ class TSAugmentor(BaseEstimator):
         if op == "temporal_mask":
             n_masks = max(1, int(self.temporal_num_masks))
             size = max(1, int(round(float(self.temporal_mask_frac) * length / n_masks)))
-            return tsaug.Dropout(p=float(self.temporal_mask_frac), size=[size], fill=str(self.temporal_mask_fill), per_channel=False, seed=seed)
+            fill_raw = self.temporal_mask_fill
+            fill_arg: Any = 0.0 if fill_raw in (0, 0.0, "0", "0.0") else str(fill_raw)
+            return tsaug.Dropout(p=float(self.temporal_mask_frac), size=[size], fill=fill_arg, per_channel=False, seed=seed)
         if op == "channel_drop":
             return tsaug.Dropout(p=float(self.channel_drop_prob), size=[length], fill=0.0, per_channel=True, seed=seed)
         return None
@@ -2134,11 +2629,16 @@ class TSAugmentor(BaseEstimator):
                 if aug_op is not None:
                     sub = (aug_op.augment(sub / ref) * ref) if op == "noise" else aug_op.augment(sub)
             arr[idx] = sub
+        if float(self.sensor_drop_prob) > 0 or float(self.sensor_drop_joint_prob) > 0:
+            keep = self.sample_modality_keep(n, rng=rng)
+            arr[~keep] = 0.0
         return arr.astype(x.dtype if x.dtype == np.float32 else np.float64)
 
 
 class NoopPhysiologyExtractor(HoneycombBase):
-    """``cr7_kimmitch`` / NOOP descriptors: DoG variability, Baevsky SI, quiescent jerk floor & sedentary bouts."""
+    """``cr7_kimmitch`` / NOOP descriptors: DoG variability, Baevsky SI, quiescent jerk floor,
+    sub-harmonic checked ACF, cadence band, spectral peakedness/Parseval & power-branch telemetry.
+    """
 
     def __init__(self, noop: Optional[NoopActigraphyOptions] = None, sedentary_threshold_g: float = 0.025):
         self.noop = noop
@@ -2174,29 +2674,60 @@ class NoopPhysiologyExtractor(HoneycombBase):
         counts, edges = np.histogram(clipped, bins=16, range=(float(p2), float(p98)))
         pk = int(np.argmax(counts))
         amo = 100.0 * float(counts[pk]) / float(len(clipped))
-        mo = 0.5 * float(edges[pk] + edges[pk + 1])
+        mo = 0.5 * (edges[pk] + edges[pk + 1])
         scale = max(abs(mo), float(np.std(clipped)), 1e-3)
         return amo, mxdmn, float(amo / (2.0 * scale * max(mxdmn, 1e-3)))
 
     def extract(self, grid: Dict[str, Any]) -> Dict[str, float]:
         mask = grid["mask"]
+        fill_m = grid["mask_filled"]
         bin_m = int(grid["bin_minutes"])
         bin_h = float(bin_m) / 60.0
+        fs_cph = 1.0 / max(bin_h, 1e-6)
         enmo_v = grid["enmo"][mask]
         sed_m = mask & (grid["enmo"] < float(self.sedentary_threshold_g))
         runs = contiguous_true_runs(sed_m)
 
         out: Dict[str, float] = {
-            "seq_sedentary_frac": float(np.mean(enmo_v < float(self.sedentary_threshold_g))),
+            "seq_sedentary_frac": float(np.mean(enmo_v < float(self.sedentary_threshold_g))) if len(enmo_v) else np.nan,
             "seq_sedentary_max_bout_h": float(max(e - s for s, e in runs) * bin_h) if runs else 0.0,
         }
         opts = self.noop if self.noop is not None else NoopActigraphyOptions()
-        m_atoms, _ = opts.mode_names()
+        m_atoms, s_atoms = opts.mode_names()
+        p_atoms = opts.periodicity_names()
+        q_atoms = opts.quality_names()
+        br_atoms = opts.branch_names()
+
+        sig_key = str(opts.signal or "raw").strip().lower()
+        sig_map = {
+            "raw": "log_enmo_filled",
+            "log_enmo": "log_enmo_filled",
+            "enmo": "enmo_filled",
+            "dyn_amp": "dyn_amp_filled",
+            "linear": "lin_enmo",
+            "anglez_rate": "turn_deg",
+            "angular_speed": "turn_deg",
+        }
+        sig_filled = np.nan_to_num(grid.get(sig_map.get(sig_key, "log_enmo_filled"), grid["log_enmo_filled"]), nan=0.0)
+        sig_valid = sig_filled[fill_m]
+        sig_valid = sig_valid[np.isfinite(sig_valid)]
+
+        out["noop_motion_stats_supported"] = float(bool(m_atoms) and len(enmo_v) >= max(4, int(opts.min_samples) // 4))
+        out["noop_periodicity_supported"] = float(bool(p_atoms) and len(sig_valid) >= int(opts.min_samples))
+        out["noop_spectral_supported"] = float(bool(s_atoms) and len(sig_valid) >= max(16, int(opts.min_samples) // 2))
+
+        if q_atoms:
+            out["noop_quality_n_samples"] = float(len(enmo_v))
+            out["noop_quality_max_gap_bins"] = float(max((e - s for s, e in contiguous_true_runs(~grid["raw_mask"])), default=0))
+            if "report" in q_atoms or "features" in q_atoms:
+                out["noop_quality_gap_exceeded"] = float(out["noop_quality_max_gap_bins"] > float(opts.max_gap_samples))
+                out["noop_quality_wear_coverage"] = float(grid.get("raw_wear_frac", np.mean(mask)))
+
         jerk_v = grid["jerk_rms"][mask]
         jerk_v = jerk_v[np.isfinite(jerk_v)]
-        if "enmo_ac_rms" in m_atoms:
+        if ("enmo_ac_rms" in m_atoms or "ac_rms" in m_atoms) and len(enmo_v) > 0:
             out["noop_enmo_ac_rms"] = float(np.std(enmo_v))
-        if "motion_cv" in m_atoms:
+        if ("motion_cv" in m_atoms or "cv" in m_atoms) and len(enmo_v) > 0:
             out["noop_motion_cv"] = float(np.std(enmo_v) / max(float(np.mean(enmo_v)), 1e-6))
         if "posture_var" in m_atoms:
             av = grid["anglez_var"][mask]
@@ -2207,13 +2738,170 @@ class NoopPhysiologyExtractor(HoneycombBase):
             out["noop_move_fraction"] = float(np.mean(jerk_v > 2.0 * j_med))
             out["noop_still_fraction"] = float(np.mean(jerk_v <= 1.25 * j_med))
             out["noop_jerk_gate_ratio"] = float(np.percentile(jerk_v, 95) / j_med)
-        if "dog_var" in m_atoms and grid["mask_filled"].any():
-            out["noop_dog_variability"] = self._dog_var(grid["log_enmo_filled"][grid["mask_filled"]], bin_m)
-        if "baevsky_si" in m_atoms:
+        if "dog_var" in m_atoms and len(sig_valid) >= 6:
+            out["noop_dog_variability"] = self._dog_var(sig_valid, bin_m)
+        if "baevsky_si" in m_atoms and mask.any():
             amo, mxdmn, si = self._baevsky(grid["log_enmo"][mask])
             out["noop_baevsky_amo_pct"] = amo
             out["noop_baevsky_mxdmn"] = mxdmn
             out["noop_baevsky_si"] = si
+
+        # Periodicity: distinct calculations for 'acf', 'acf_harmonic_checked', 'acf_cadence',
+        # 'acf_sublag_fundamental' (fundamental-preferred parabolic sub-lag ACF with concavity), and 'cosinor'
+        if p_atoms and len(sig_valid) >= max(24, int(opts.min_samples)):
+            p_lo, p_hi = tuple(map(float, _structured(opts.period_band_hours)))
+            c_lo, c_hi = tuple(map(float, _structured(opts.cadence_band)))
+            max_search_h = max(p_hi, c_hi, 30.0)
+            max_lag_bins = min(len(sig_valid) - 2, max(16, int(np.ceil(max_search_h / max(bin_h, 1e-6))) + 2))
+            acf, _ = masked_unbiased_autocovariance(
+                sig_filled,
+                fill_m,
+                max_lag=max_lag_bins,
+                min_pair_count=8,
+                detrend=str(opts.detrend or "linear"),
+                bias="unbiased",
+                normalize=True,
+            )
+            acf = np.nan_to_num(acf, nan=0.0)
+
+            # 1. 'acf' and 'acf_harmonic_checked': dominant peak inside period_band_hours (+ explicit 2x sub-harmonic check)
+            if "acf" in p_atoms or "acf_harmonic_checked" in p_atoms:
+                lag_lo = max(2, int(round(p_lo / max(bin_h, 1e-6))))
+                lag_hi = min(len(acf) - 2, int(round(p_hi / max(bin_h, 1e-6))))
+                if lag_hi > lag_lo:
+                    seg = acf[lag_lo:lag_hi + 1]
+                    best_rel = int(np.argmax(seg))
+                    best_lag = lag_lo + best_rel
+                    best_str = float(seg[best_rel])
+                    harmonic_ambiguous = 0.0
+                    if "acf_harmonic_checked" in p_atoms and best_lag >= 4:
+                        half_lag = max(2, best_lag // 2)
+                        tol = float(opts.acf_harmonic_tolerance)
+                        w_lo = max(2, int(round(half_lag * (1.0 - tol))))
+                        w_hi = min(len(acf) - 1, int(round(half_lag * (1.0 + tol))))
+                        sub_pk = float(np.max(acf[w_lo:w_hi + 1])) if w_hi >= w_lo else -1.0
+                        if sub_pk >= float(opts.fundamental_ratio) * best_str and sub_pk >= float(opts.min_acf_strength):
+                            best_lag = int(w_lo + np.argmax(acf[w_lo:w_hi + 1]))
+                            best_str = sub_pk
+                            harmonic_ambiguous = 1.0
+                        out["noop_acf_harmonic_ambiguous"] = harmonic_ambiguous
+                    out["noop_acf_period_h"] = float(best_lag * bin_h) if best_str >= float(opts.min_acf_strength) else np.nan
+                    out["noop_acf_strength"] = best_str
+
+            # 2. 'acf_cadence': raw global maximum inside ultradian cadence_band (hours) without fundamental preference or sub-lag fit
+            if "acf_cadence" in p_atoms:
+                c_lag_lo = max(1, int(np.floor(min(c_lo, c_hi) / max(bin_h, 1e-6))))
+                c_lag_hi = min(len(acf) - 2, max(c_lag_lo + 1, int(np.ceil(max(c_lo, c_hi) / max(bin_h, 1e-6)))))
+                if c_lag_hi > c_lag_lo and len(acf) > c_lag_hi:
+                    c_seg = acf[c_lag_lo:c_lag_hi + 1]
+                    c_rel = int(np.argmax(c_seg))
+                    c_lag = c_lag_lo + c_rel
+                    c_str = float(c_seg[c_rel])
+                    out["noop_cadence_period_h"] = float(c_lag * bin_h) if c_str >= float(opts.min_cadence_strength) else np.nan
+                    out["noop_cadence_acf_strength"] = c_str
+                    out["noop_cadence_supported"] = float(c_str >= float(opts.min_cadence_strength))
+
+            # 3. 'acf_sublag_fundamental': fundamental-preferred local peak inside cadence_band + 3-point parabolic sub-lag interpolation & concavity
+            if "acf_sublag_fundamental" in p_atoms:
+                u_lo = max(2, int(np.floor(min(c_lo, c_hi) / max(bin_h, 1e-6))))
+                u_hi = min(len(acf) - 2, max(u_lo + 1, int(np.ceil(max(c_lo, c_hi) / max(bin_h, 1e-6)))))
+                if u_hi > u_lo and len(acf) > u_hi + 1:
+                    peaks = [
+                        k for k in range(u_lo, u_hi + 1)
+                        if acf[k] > acf[k - 1] and acf[k] >= acf[k + 1] and acf[k] > 0
+                    ]
+                    if peaks:
+                        max_pk = max(float(acf[p]) for p in peaks)
+                        thresh = float(opts.fundamental_ratio) * max_pk
+                        chosen = min(p for p in peaks if float(acf[p]) >= thresh)
+                    else:
+                        chosen = int(u_lo + int(np.argmax(acf[u_lo:u_hi + 1])))
+                    y1 = float(np.clip(acf[chosen], 0.0, 1.0))
+                    if 0 < chosen < len(acf) - 1:
+                        y0, y2 = float(acf[chosen - 1]), float(acf[chosen + 1])
+                        denom = y0 - 2.0 * y1 + y2
+                        delta = float(np.clip(0.5 * (y0 - y2) / denom, -0.5, 0.5)) if abs(denom) > 1e-12 else 0.0
+                        concavity = float(max(0.0, 2.0 * y1 - y0 - y2))
+                    else:
+                        delta = 0.0
+                        concavity = 0.0
+                    refined_h = float(max(1e-6, float(chosen) + delta) * bin_h)
+                    usable_sub = y1 >= float(opts.min_cadence_strength)
+                    out["noop_sublag_fundamental_period_h"] = refined_h if usable_sub else np.nan
+                    out["noop_sublag_fundamental_cph"] = (1.0 / refined_h) if usable_sub else 0.0
+                    out["noop_sublag_fundamental_strength"] = y1
+                    out["noop_sublag_concavity"] = concavity
+
+            if "cosinor" in p_atoms:
+                t_h = grid.get("rel_hours", np.arange(grid["n_bins"], dtype=np.float64) * bin_h)[fill_m][:len(sig_valid)]
+                omega = 2.0 * np.pi / 24.0
+                X_cos = np.column_stack([np.ones_like(t_h), np.cos(omega * t_h), np.sin(omega * t_h)])
+                beta, _, _, _ = np.linalg.lstsq(X_cos, sig_valid, rcond=None)
+                amp = float(np.hypot(beta[1], beta[2]))
+                y_hat = X_cos @ beta
+                ss_tot = float(np.sum(np.square(sig_valid - np.mean(sig_valid))))
+                r2 = float(1.0 - np.sum(np.square(sig_valid - y_hat)) / max(ss_tot, 1e-9)) if ss_tot > 1e-9 else 0.0
+                out["noop_cosinor_amp"] = amp
+                out["noop_cosinor_r2"] = r2
+
+        # Spectral stats: peak_fraction, peak_neighbourhood_fraction, band_fractions, entropy, peakedness, parseval_ratio
+        if s_atoms and len(sig_valid) >= 16:
+            sig_zero = sig_valid - float(np.mean(sig_valid))
+            td_energy = float(np.mean(np.square(sig_zero)))
+            nperseg = min(len(sig_zero), max(16, int(round(24.0 / max(bin_h, 1e-6)))))
+            freqs, psd = sps.welch(sig_zero, fs=fs_cph, nperseg=nperseg, detrend="constant")
+            pos = freqs > 0
+            f_p, p_p = freqs[pos], np.maximum(psd[pos], 0.0)
+            tot_p = float(np.sum(p_p))
+            if len(p_p) > 0 and tot_p > 1e-12:
+                pk_idx = int(np.argmax(p_p))
+                if "peak_fraction" in s_atoms or "peakedness" in s_atoms:
+                    out["noop_spec_peak_fraction"] = float(p_p[pk_idx] / tot_p)
+                if "peak_period" in s_atoms:
+                    out["noop_spec_peak_period_h"] = float(1.0 / max(f_p[pk_idx], 1e-6))
+                if "peak_neighbourhood_fraction" in s_atoms:
+                    lo_i = max(0, pk_idx - 1)
+                    hi_i = min(len(p_p), pk_idx + 2)
+                    out["noop_spec_peak_neigh_fraction"] = float(np.sum(p_p[lo_i:hi_i]) / tot_p)
+                if "entropy" in s_atoms or "spectral_entropy" in s_atoms:
+                    prob = p_p / tot_p
+                    prob = prob[prob > 1e-12]
+                    out["noop_spec_entropy"] = float(-np.sum(prob * np.log2(prob)) / max(np.log2(len(p_p)), 1.0))
+                if "parseval_ratio" in s_atoms and td_energy > 1e-12:
+                    df_step = float(f_p[1] - f_p[0]) if len(f_p) > 1 else fs_cph / max(len(sig_zero), 1)
+                    fd_energy = float(np.sum(p_p) * df_step)
+                    out["noop_spec_parseval_ratio"] = float(fd_energy / td_energy)
+                if "band_fractions" in s_atoms:
+                    circ_m = (f_p >= 1.0 / 30.0) & (f_p <= 1.0 / 18.0)
+                    ultr_m = f_p > 1.0 / 18.0
+                    out["noop_spec_circadian_band_frac"] = float(np.sum(p_p[circ_m]) / tot_p)
+                    out["noop_spec_ultradian_band_frac"] = float(np.sum(p_p[ultr_m]) / tot_p)
+
+        # Power / telemetry branches (enmo, light, battery): drift slope, deviation RMS, step-delta CV
+        if br_atoms:
+            t_h = grid.get("rel_hours", grid.get("t_hours", np.arange(grid["n_bins"], dtype=np.float64) * bin_h))[fill_m]
+            for b_name in ("enmo", "light", "battery"):
+                if b_name not in br_atoms:
+                    continue
+                arr_key = "enmo_filled" if b_name == "enmo" else ("light_filled" if b_name == "light" else "battery_filled")
+                arr = grid.get(arr_key)
+                if arr is None:
+                    continue
+                v = np.asarray(arr[fill_m], dtype=np.float64)
+                ok = np.isfinite(v) & np.isfinite(t_h)
+                if int(ok.sum()) < 6:
+                    continue
+                vv, tt = v[ok], t_h[ok]
+                t_c = tt - float(np.mean(tt))
+                denom = float(np.sum(np.square(t_c)))
+                slope = float(np.sum(t_c * (vv - float(np.mean(vv)))) / denom) if denom > 1e-9 else 0.0
+                trend = float(np.mean(vv)) + slope * t_c
+                dev_rms = float(np.sqrt(np.mean(np.square(vv - trend))))
+                diffs = np.abs(np.diff(vv))
+                step_cv = float(np.std(diffs) / max(float(np.mean(diffs)), 1e-6)) if len(diffs) > 1 else 0.0
+                out[f"noop_branch_{b_name}_drift_slope"] = slope
+                out[f"noop_branch_{b_name}_dev_rms"] = dev_rms
+                out[f"noop_branch_{b_name}_step_cv"] = step_cv
         return out
 
 
@@ -2227,6 +2915,13 @@ DEFAULT_SEQUENCE_EXTRACTOR_PARAMS: Dict[str, Any] = {
     "max_gap_bins": 4,                             # bounded fill up to 1h gaps unless impute_long_gaps=True
     "impute_long_gaps": False,
     "min_valid_wear_days": 0.0,
+    "maxlen_days": None,
+    "sequence_crop_mode": "none",                  # "none", "pad_trunc", "tsaug_crop", "head", "tail", "center"
+    "window_cap_policy": "uniform",                # "uniform", "first", "last"
+    "final_window_mode": "overlap",                # "overlap", "pad", "drop"
+    "filter_problematic_sequences": False,
+    "ideal_skew_threshold": 3.5,
+    "problematic_features_threshold": 3,
     "clip_enmo": 4.0,
     "linear_acc_mode": "rolling_mean",
     "baseline_window_bins": 16,
@@ -2237,11 +2932,12 @@ DEFAULT_SEQUENCE_EXTRACTOR_PARAMS: Dict[str, Any] = {
     "use_dead_reckoning": True,
     "dead_reckoning_detrend": True,
     "acc_modes": "raw|smoothed|jerk|velocity|linear|kalman",
+    "dc_offset_bins": 2,
     "smooth_window_bins": 4,
     "smooth_alpha": None,
     "sedentary_threshold_g": 0.025,
     "feature_families": (
-        "autocorr|circadian|sleep_arch|motion|spectral|stft|wavelet|seglearn|catch22|tsfel|tsfresh|tsflex|prsa_cusum|branches|compliance"
+        "autocorr|lag_lead|circadian|sleep_arch|motion|spectral|stft|wavelet|seglearn|catch22|tsfel|tsfresh|tsflex|prsa_cusum|branches|compliance"
     ),
     "acf_detrend": "linear",
     "acf_bias": "unbiased",
@@ -2249,9 +2945,18 @@ DEFAULT_SEQUENCE_EXTRACTOR_PARAMS: Dict[str, Any] = {
     "period_band_hours": (18.0, 30.0),
     "fundamental_ratio": 0.85,
     "min_acf_strength": 0.08,
+    "include_lags": True,
+    "include_leads": True,
+    "include_rolling": True,
+    "lag_lead_hours": (0.5, 1.0, 2.0, 4.0),
+    "rolling_window_hours": (1.0, 3.0, 6.0),
+    "lag_lead_channels": "log_enmo|light|anglez",
     "stft_window_days": 2.0,
     "stft_overlap_ratio": 0.5,
     "stft_window_type": "hann",
+    "stft_scaling": "psd",
+    "stft_detrend": "constant",
+    "spectral_moment_max_peaks": 6,
     "cwt_wavelet": "morl",
     "cwt_n_scales": 16,
     "cwt_min_period_h": 2.0,
@@ -2272,6 +2977,12 @@ DEFAULT_SEQUENCE_EXTRACTOR_PARAMS: Dict[str, Any] = {
     "tsflex_windows": ("2h", "6h", "12h"),
     "tsflex_strides": "2h",
     "tsflex_channels": "log_enmo|dyn_amp",
+    "feature_selection_method": "none",            # "none", "correlation", "f_classif"
+    "static_top_k": None,
+    "feature_selection_percentile": None,
+    "filter_method": "none",                       # "none", "iqr", "zscore"
+    "filter_threshold": 2.5,
+    "max_outlier_features": 3,
     "chunk_window_days": 3.0,
     "chunk_overlap": 0.5,
     "max_windows_per_sequence": 12,
@@ -2288,15 +2999,16 @@ DEFAULT_SEQUENCE_EXTRACTOR_PARAMS: Dict[str, Any] = {
 class SequenceExtractor(HoneycombBase):
     """Modular Multi-Library ``SequenceExtractor`` for CMI PIU.
 
-    Combines ``SignalCleaner`` (including time-series gap/diurnal imputation & missingness tracking),
-    ``MotionFilter``, ``ActigraphyBranchExtractor``, ``SeglearnWindowFeatureExtractor``,
-    ``StatsmodelsAndAutocorrExtractor``, ``SleepRegularityAndOrientationExtractor``,
-    ``SleepArchitectureAndMultiWindowExtractor`` (``mad-lab-fau/sleep_analysis`` Cole-Kripke,
-    Sadeh, Webster endpoints, causal vs centered NAT windows & FOD bursts),
-    ``PRSAAndChangepointExtractor``, ``STFTAndWelchExtractor``, ``WaveletAndRecurrenceExtractor``,
-    ``TsfelVectorizedExtractor``, ``NoopPhysiologyExtractor``, and fold-safe tabular/feature
-    missingness & imputation experiments (``SimpleImputer``, ``KNNImputer``, ``IterativeImputer``,
-    ``MissingIndicator``, ``group_age_median``).
+    Combines ``SignalCleaner`` (including time-series gap/diurnal imputation, cropping & skewness quality filter),
+    ``MotionFilter``, ``ActigraphyBranchExtractor`` (including complex-FFT frequency integration),
+    ``SeglearnWindowFeatureExtractor``, ``StatsmodelsAndAutocorrExtractor``, ``LagLeadAndRollingExtractor``
+    (directional lags, leads, cross-channel causality, pre-sleep lead / post-wake lag & rolling history),
+    ``SleepRegularityAndOrientationExtractor``, ``SleepArchitectureAndMultiWindowExtractor``,
+    ``PRSAAndChangepointExtractor``, ``STFTAndWelchExtractor`` (spectral moments + prominent peaks),
+    ``WaveletAndRecurrenceExtractor`` (CWT cone-of-influence + wavelet ridge extraction),
+    ``TsfelVectorizedExtractor``, ``NoopPhysiologyExtractor``, training-fold IQR / Z-score subject outlier
+    filtering (``filter_method``), leak-free correlation / ANOVA F-test feature selection
+    (``feature_selection_method``, ``static_top_k``, ``feature_selection_percentile``), and fold-safe imputation.
     """
 
     def __init__(
@@ -2311,6 +3023,13 @@ class SequenceExtractor(HoneycombBase):
         max_gap_bins: int = 4,
         impute_long_gaps: bool = False,
         min_valid_wear_days: float = 0.0,
+        maxlen_days: Optional[float] = None,
+        sequence_crop_mode: str = "none",
+        window_cap_policy: str = "uniform",
+        final_window_mode: str = "overlap",
+        filter_problematic_sequences: bool = False,
+        ideal_skew_threshold: float = 3.5,
+        problematic_features_threshold: int = 3,
         clip_enmo: float = 4.0,
         linear_acc_mode: str = "rolling_mean",
         baseline_window_bins: int = 16,
@@ -2321,19 +3040,29 @@ class SequenceExtractor(HoneycombBase):
         use_dead_reckoning: bool = True,
         dead_reckoning_detrend: bool = True,
         acc_modes: str = "raw|smoothed|jerk|velocity|linear|kalman",
+        dc_offset_bins: int = 2,
         smooth_window_bins: int = 4,
         smooth_alpha: Optional[float] = None,
         sedentary_threshold_g: float = 0.025,
-        feature_families: str = "autocorr|circadian|sleep_arch|motion|spectral|stft|wavelet|seglearn|catch22|tsfel|tsfresh|tsflex|prsa_cusum|branches|compliance",
+        feature_families: str = "autocorr|lag_lead|circadian|sleep_arch|motion|spectral|stft|wavelet|seglearn|catch22|tsfel|tsfresh|tsflex|prsa_cusum|branches|compliance",
         acf_detrend: str = "linear",
         acf_bias: str = "unbiased",
         short_lags_h: Tuple[float, ...] = (0.25, 0.5, 1.0, 2.0),
         period_band_hours: Tuple[float, float] = (18.0, 30.0),
         fundamental_ratio: float = 0.85,
         min_acf_strength: float = 0.08,
+        include_lags: Any = True,
+        include_leads: Any = True,
+        include_rolling: Any = True,
+        lag_lead_hours: Any = (0.5, 1.0, 2.0, 4.0),
+        rolling_window_hours: Any = (1.0, 3.0, 6.0),
+        lag_lead_channels: Optional[str] = "log_enmo|light|anglez",
         stft_window_days: float = 2.0,
         stft_overlap_ratio: float = 0.5,
         stft_window_type: str = "hann",
+        stft_scaling: str = "psd",
+        stft_detrend: str = "constant",
+        spectral_moment_max_peaks: int = 6,
         cwt_wavelet: str = "morl",
         cwt_n_scales: int = 16,
         cwt_min_period_h: float = 2.0,
@@ -2354,6 +3083,12 @@ class SequenceExtractor(HoneycombBase):
         tsflex_windows: Tuple[str, ...] = ("2h", "6h", "12h"),
         tsflex_strides: str = "2h",
         tsflex_channels: str = "log_enmo|dyn_amp",
+        feature_selection_method: str = "none",
+        static_top_k: Optional[int] = None,
+        feature_selection_percentile: Optional[float] = None,
+        filter_method: str = "none",
+        filter_threshold: float = 2.5,
+        max_outlier_features: int = 3,
         chunk_window_days: float = 3.0,
         chunk_overlap: float = 0.5,
         max_windows_per_sequence: int = 12,
@@ -2377,6 +3112,13 @@ class SequenceExtractor(HoneycombBase):
         self.max_gap_bins = max_gap_bins
         self.impute_long_gaps = impute_long_gaps
         self.min_valid_wear_days = min_valid_wear_days
+        self.maxlen_days = maxlen_days
+        self.sequence_crop_mode = sequence_crop_mode
+        self.window_cap_policy = window_cap_policy
+        self.final_window_mode = final_window_mode
+        self.filter_problematic_sequences = filter_problematic_sequences
+        self.ideal_skew_threshold = ideal_skew_threshold
+        self.problematic_features_threshold = problematic_features_threshold
         self.clip_enmo = clip_enmo
         self.linear_acc_mode = linear_acc_mode
         self.baseline_window_bins = baseline_window_bins
@@ -2387,6 +3129,7 @@ class SequenceExtractor(HoneycombBase):
         self.use_dead_reckoning = use_dead_reckoning
         self.dead_reckoning_detrend = dead_reckoning_detrend
         self.acc_modes = acc_modes
+        self.dc_offset_bins = dc_offset_bins
         self.smooth_window_bins = smooth_window_bins
         self.smooth_alpha = smooth_alpha
         self.sedentary_threshold_g = sedentary_threshold_g
@@ -2397,9 +3140,18 @@ class SequenceExtractor(HoneycombBase):
         self.period_band_hours = period_band_hours
         self.fundamental_ratio = fundamental_ratio
         self.min_acf_strength = min_acf_strength
+        self.include_lags = include_lags
+        self.include_leads = include_leads
+        self.include_rolling = include_rolling
+        self.lag_lead_hours = lag_lead_hours
+        self.rolling_window_hours = rolling_window_hours
+        self.lag_lead_channels = lag_lead_channels
         self.stft_window_days = stft_window_days
         self.stft_overlap_ratio = stft_overlap_ratio
         self.stft_window_type = stft_window_type
+        self.stft_scaling = stft_scaling
+        self.stft_detrend = stft_detrend
+        self.spectral_moment_max_peaks = spectral_moment_max_peaks
         self.cwt_wavelet = cwt_wavelet
         self.cwt_n_scales = cwt_n_scales
         self.cwt_min_period_h = cwt_min_period_h
@@ -2420,6 +3172,12 @@ class SequenceExtractor(HoneycombBase):
         self.tsflex_windows = tsflex_windows
         self.tsflex_strides = tsflex_strides
         self.tsflex_channels = tsflex_channels
+        self.feature_selection_method = feature_selection_method
+        self.static_top_k = static_top_k
+        self.feature_selection_percentile = feature_selection_percentile
+        self.filter_method = filter_method
+        self.filter_threshold = filter_threshold
+        self.max_outlier_features = max_outlier_features
         self.chunk_window_days = chunk_window_days
         self.chunk_overlap = chunk_overlap
         self.max_windows_per_sequence = max_windows_per_sequence
@@ -2463,6 +3221,11 @@ class SequenceExtractor(HoneycombBase):
             max_gap_bins=int(self.max_gap_bins),
             impute_long_gaps=bool(self.impute_long_gaps),
             min_valid_wear_days=float(self.min_valid_wear_days),
+            maxlen_days=(None if self.maxlen_days is None else float(self.maxlen_days)),
+            sequence_crop_mode=("none" if self.sequence_crop_mode is None else str(self.sequence_crop_mode)),
+            filter_problematic_sequences=bool(self.filter_problematic_sequences),
+            ideal_skew_threshold=float(self.ideal_skew_threshold),
+            problematic_features_threshold=int(self.problematic_features_threshold),
             clip_enmo=(None if self.clip_enmo is None else float(self.clip_enmo)),
             linear_acc_mode=("none" if self.linear_acc_mode is None else str(self.linear_acc_mode)),
             baseline_window_bins=int(self.baseline_window_bins),
@@ -2479,6 +3242,7 @@ class SequenceExtractor(HoneycombBase):
             acc_modes=("none" if self.acc_modes is None else str(self.acc_modes)),
             smooth_window_bins=int(self.smooth_window_bins),
             smooth_alpha=self.smooth_alpha,
+            dc_offset_bins=int(self.dc_offset_bins),
         )
         self.autocorr_sm_extractor = StatsmodelsAndAutocorrExtractor(
             acf_detrend=("none" if self.acf_detrend is None else str(self.acf_detrend)),
@@ -2489,6 +3253,15 @@ class SequenceExtractor(HoneycombBase):
             min_acf_strength=float(self.min_acf_strength),
             sedentary_threshold_g=float(self.sedentary_threshold_g),
         )
+        self.lag_lead_extractor = LagLeadAndRollingExtractor(
+            include_lags=self.include_lags,
+            include_leads=self.include_leads,
+            include_rolling=self.include_rolling,
+            lag_lead_hours=_structured(self.lag_lead_hours),
+            rolling_window_hours=_structured(self.rolling_window_hours),
+            lag_lead_channels=("none" if self.lag_lead_channels is None else str(self.lag_lead_channels)),
+            sedentary_threshold_g=float(self.sedentary_threshold_g),
+        )
         self.sleep_sri_extractor = SleepRegularityAndOrientationExtractor()
         self.sleep_arch_extractor = SleepArchitectureAndMultiWindowExtractor()
         self.prsa_cusum_extractor = PRSAAndChangepointExtractor()
@@ -2496,6 +3269,9 @@ class SequenceExtractor(HoneycombBase):
             stft_window_days=float(self.stft_window_days),
             stft_overlap_ratio=float(self.stft_overlap_ratio),
             stft_window_type=("none" if self.stft_window_type is None else str(self.stft_window_type)),
+            stft_scaling=("psd" if self.stft_scaling is None else str(self.stft_scaling)),
+            stft_detrend=("none" if self.stft_detrend is None else str(self.stft_detrend)),
+            spectral_moment_max_peaks=int(self.spectral_moment_max_peaks),
             max_gap_bins=int(self.max_gap_bins),
         )
         self.wavelet_rec_extractor = WaveletAndRecurrenceExtractor(
@@ -2548,6 +3324,8 @@ class SequenceExtractor(HoneycombBase):
             return row
 
         row["seq_has_actigraphy"] = 1.0
+        row["seq_problematic_skew_count"] = float(clean_grid.get("problematic_skew_count", 0))
+        row["seq_is_problematic_sequence"] = float(bool(clean_grid.get("is_problematic_sequence", False)))
         bin_h = float(clean_grid["bin_minutes"]) / 60.0
         raw_m = clean_grid["raw_mask"]
         fill_m = clean_grid["mask_filled"]
@@ -2586,6 +3364,8 @@ class SequenceExtractor(HoneycombBase):
             row.update(br_feats)
         if "autocorr" in families:
             row.update(self.autocorr_sm_extractor.extract(grid))
+        if "lag_lead" in families:
+            row.update(self.lag_lead_extractor.extract(grid))
         if "circadian" in families:
             row.update(self.sleep_sri_extractor.extract(grid))
         if "sleep_arch" in families:
@@ -2614,6 +3394,69 @@ class SequenceExtractor(HoneycombBase):
         if "tsflex" in families:
             row.update(self.tsflex_extractor.extract(grid))
         return row
+
+    def select_finetuning_sequences(self, X: pd.DataFrame, y: Any = None) -> pd.DataFrame:
+        """Return subject table filtered for sequence quality if ``filter_problematic_sequences`` is enabled."""
+        if not bool(self.filter_problematic_sequences) or not isinstance(X, pd.DataFrame):
+            return X.copy() if isinstance(X, pd.DataFrame) else X
+        return X.copy()
+
+    def _compute_outlier_support_mask(self, X_values: np.ndarray) -> np.ndarray:
+        """Training-fold IQR / Z-score subject outlier filter ported from ``general_utils.py``."""
+        n_rows = len(X_values)
+        if n_rows < 3:
+            self.support_mask_ = np.ones(n_rows, dtype=bool)
+            self.n_samples_removed_ = 0
+            self.n_samples_retained_ = n_rows
+            return self.support_mask_
+
+        method = "none" if (self.filter_method is None or str(self.filter_method).strip().lower() in {"", "none"}) else str(self.filter_method).strip().lower()
+        if method not in {"none", "iqr", "zscore"}:
+            raise InvalidExtractorParams(f"filter_method must be 'none', 'iqr', or 'zscore', got {self.filter_method!r}")
+
+        thresh = float(self.filter_threshold)
+        max_out = max(0, int(self.max_outlier_features))
+        outlier_counts = np.zeros(n_rows, dtype=int)
+
+        if method == "iqr":
+            for col_idx in range(X_values.shape[1]):
+                col = X_values[:, col_idx]
+                fin = col[np.isfinite(col)]
+                if fin.size < 4:
+                    continue
+                q25, q75 = np.percentile(fin, [25.0, 75.0])
+                iqr = q75 - q25
+                if iqr <= np.finfo(float).eps:
+                    continue
+                lo = q25 - thresh * iqr
+                hi = q75 + thresh * iqr
+                outlier_counts += (np.isfinite(col) & ((col < lo) | (col > hi))).astype(int)
+        elif method == "zscore":
+            for col_idx in range(X_values.shape[1]):
+                col = X_values[:, col_idx]
+                fin = col[np.isfinite(col)]
+                if fin.size < 3:
+                    continue
+                sd = float(np.std(fin))
+                if sd <= np.finfo(float).eps:
+                    continue
+                z = np.abs((col - float(np.mean(fin))) / sd)
+                outlier_counts += (np.isfinite(col) & (z > thresh)).astype(int)
+
+        support = outlier_counts <= max_out
+        if int(support.sum()) < max(4, min(8, n_rows // 3)):
+            support = np.ones(n_rows, dtype=bool)
+        self.support_mask_ = support
+        self.n_samples_removed_ = int((~support).sum())
+        self.n_samples_retained_ = int(support.sum())
+        return support
+
+    def fit_resample(self, X: Any, y: Any) -> Tuple[np.ndarray, np.ndarray]:
+        """Compatibility helper matching ``general_utils.SequenceExtractor.fit_resample``."""
+        X_values = np.asarray(X, dtype=np.float64)
+        y_values = np.asarray(y)
+        support = self._compute_outlier_support_mask(X_values)
+        return X_values[support], y_values[support]
 
     @staticmethod
     def _build_tabular_block(
@@ -2713,7 +3556,7 @@ class SequenceExtractor(HoneycombBase):
         families = _pipe_modes(
             self.feature_families,
             (
-                "autocorr", "circadian", "sleep_arch", "motion", "spectral", "stft",
+                "autocorr", "lag_lead", "circadian", "sleep_arch", "motion", "spectral", "stft",
                 "wavelet", "seglearn", "catch22", "tsfel", "tsfresh", "tsflex",
                 "prsa_cusum", "branches", "compliance",
             ),
@@ -2748,14 +3591,105 @@ class SequenceExtractor(HoneycombBase):
             for k, v in sorted(self.get_params(deep=True).items())
             if k not in {
                 "use_cache", "chunk_window_days", "chunk_overlap", "max_windows_per_sequence",
+                "window_cap_policy", "final_window_mode",
                 "missing_feature_strategy", "add_missing_indicators", "impute_knn_neighbors", "impute_max_iter",
+                "feature_selection_method", "static_top_k", "feature_selection_percentile",
+                "filter_method", "filter_threshold", "max_outlier_features",
             }
         }
         return tuple(p.items())
 
+    # Core actigraphy columns required by HandcraftedSequenceBaselineEstimator domain rules
+    _CORE_RULE_SEQ_COLS: Tuple[str, ...] = (
+        "seq_has_actigraphy", "seq_missing_bin_frac", "seq_imputed_bin_frac",
+        "seq_acf_log_24h", "seq_m10_l5_ra", "seq_acf_sedentary_30m", "seq_acf_short_mean",
+        "seq_sri", "seq_circ_sjl_abs_h", "seq_night_day_enmo_ratio", "seq_upright_night_frac",
+        "seq_cosinor_acrophase_h", "seq_circadian_period_err_h", "seq_stft_flux_mean",
+        "seq_cwt_ultradian_circadian_ratio", "seq_seg_variation_log_enmo_wstd", "seq_seg_std_dyn_amp_wstd",
+        "seq_cusum_enmo_max", "seq_prsa_asym", "seq_webster_fragmentation_idx", "seq_sadeh_night_efficiency",
+        "seq_lag_light_leads_enmo_mean", "seq_lag_lead_light_enmo_asym_mean", "seq_presleep_lead_postwake_lag_ratio",
+    )
+
+    def _fit_static_feature_selection(self, seq_df: pd.DataFrame, y: Any, support_mask: Optional[np.ndarray] = None) -> None:
+        """Rank sequence descriptors via training-only correlation (``general_utils.py``) or ANOVA ``f_classif``."""
+        self.selected_static_cols_: List[str] = []
+        self.feature_f_scores_: Dict[str, float] = {}
+        self._kept_seq_cols_: Optional[List[str]] = None
+
+        fs_method = "none" if (self.feature_selection_method is None or str(self.feature_selection_method).strip().lower() in {"", "none", "false"}) else str(self.feature_selection_method).strip().lower()
+        top_k = None if self.static_top_k in (None, "none", "", 0) else int(self.static_top_k)
+        pct = None if self.feature_selection_percentile in (None, "none", "", 0, 100, 100.0) else float(self.feature_selection_percentile)
+        if fs_method == "none":
+            return
+        if (top_k is None or top_k <= 0) and (pct is None or pct <= 0 or pct >= 100.0):
+            return
+        if y is None or seq_df.shape[1] == 0:
+            return
+
+        y_arr = np.asarray(
+            y[TARGET_COL] if isinstance(y, pd.DataFrame) and TARGET_COL in y.columns else y,
+            dtype=np.float64,
+        ).ravel()
+        valid_y = np.isfinite(y_arr)
+        if support_mask is not None and len(support_mask) == len(valid_y):
+            valid_y = valid_y & support_mask
+        if int(valid_y.sum()) < 6 or len(np.unique(y_arr[valid_y])) < 2:
+            return
+
+        cand_cols = [c for c in seq_df.columns if c not in {"seq_has_actigraphy"}]
+        if not cand_cols:
+            return
+
+        sub = seq_df.loc[valid_y, cand_cols].to_numpy(dtype=np.float64, copy=True)
+        y_sub = y_arr[valid_y]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            med = np.nan_to_num(np.nanmedian(sub, axis=0), nan=0.0)
+            nan_m = ~np.isfinite(sub)
+            if nan_m.any():
+                r_i, c_i = np.where(nan_m)
+                sub[r_i, c_i] = med[c_i]
+
+            if fs_method == "correlation":
+                # Fast vectorized matrix-product Pearson correlation from general_utils.py
+                centered_X = sub - np.mean(sub, axis=0)
+                centered_y = y_sub - float(np.mean(y_sub))
+                denom = np.sqrt(np.sum(np.square(centered_X), axis=0) * float(np.sum(np.square(centered_y))))
+                scores = np.divide(
+                    np.abs(centered_X.T @ centered_y),
+                    denom,
+                    out=np.zeros(sub.shape[1], dtype=np.float64),
+                    where=denom > np.finfo(float).eps,
+                )
+                scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+            else:
+                scores, _ = f_classif(sub, y_sub)
+                scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+        self.feature_f_scores_ = {c: float(scores[i]) for i, c in enumerate(cand_cols)}
+        n_cand = len(cand_cols)
+        k_keep = n_cand
+        if top_k is not None and top_k > 0:
+            k_keep = min(k_keep, int(top_k))
+        if pct is not None and 0.0 < pct < 100.0:
+            k_keep = min(k_keep, max(1, int(round(n_cand * (pct / 100.0)))))
+
+        order = np.argsort(-scores, kind="stable")[:k_keep]
+        self.selected_static_cols_ = [cand_cols[int(i)] for i in order]
+        keep_set = set(self._CORE_RULE_SEQ_COLS) | set(self.selected_static_cols_)
+        self._kept_seq_cols_ = [
+            c for c in seq_df.columns
+            if c in keep_set or not str(c).startswith(("seq_tsfel_", "seq_tsfresh_", "seq_tsflex_", "seq_c22_"))
+        ]
+
     def fit(self, X: pd.DataFrame, y: Any = None):
-        """Fit missing-data indicators and imputation statistics strictly on training samples."""
+        """Fit training-fold outlier mask, feature selection, missing indicators, and imputation statistics."""
         tab_df, seq_df = self._extract_raw_blocks(X)
+        raw_pre = pd.concat([tab_df, seq_df], axis=1)
+        support_mask = self._compute_outlier_support_mask(raw_pre.to_numpy(dtype=np.float64))
+        self._fit_static_feature_selection(seq_df, y, support_mask=support_mask)
+        if getattr(self, "_kept_seq_cols_", None):
+            seq_df = seq_df.reindex(columns=self._kept_seq_cols_)
         raw_df = pd.concat([tab_df, seq_df], axis=1)
         self._base_feature_cols_ = list(raw_df.columns)
         self._tab_cols_ = list(tab_df.columns)
@@ -2768,8 +3702,9 @@ class SequenceExtractor(HoneycombBase):
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            mat = raw_df.to_numpy(dtype=np.float64)
-            self._fallback_medians_ = np.nan_to_num(np.nanmedian(mat, axis=0), nan=0.0) if len(mat) else np.zeros(mat.shape[1])
+            full_mat = raw_df.to_numpy(dtype=np.float64)
+            mat = full_mat[support_mask] if support_mask is not None and support_mask.any() else full_mat
+            self._fallback_medians_ = np.nan_to_num(np.nanmedian(mat, axis=0), nan=0.0) if len(mat) else np.zeros(full_mat.shape[1])
 
             if bool(self.add_missing_indicators) and len(tab_df) > 0:
                 mi = MissingIndicator(features="missing-only", error_on_new=False)
@@ -2791,7 +3726,8 @@ class SequenceExtractor(HoneycombBase):
                 imp.fit(mat)
                 self._imputer_ = imp
             elif strat == "group_age_median":
-                groups = self._age_group_labels(X)
+                X_sup = X.iloc[np.flatnonzero(support_mask)] if support_mask is not None and support_mask.any() else X
+                groups = self._age_group_labels(X_sup)
                 for g in np.unique(groups):
                     gm = groups == g
                     if gm.any():
@@ -2841,6 +3777,8 @@ class SequenceExtractor(HoneycombBase):
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         """Extract unified multi-library actigraphy + tabular features with optional leak-free imputation."""
         tab_df, seq_df = self._extract_raw_blocks(X)
+        if getattr(self, "_is_fitted_", False) and getattr(self, "_kept_seq_cols_", None):
+            seq_df = seq_df.reindex(columns=self._kept_seq_cols_)
         raw_df = pd.concat([tab_df, seq_df], axis=1)
         if getattr(self, "_is_fitted_", False) and getattr(self, "_base_feature_cols_", None):
             raw_df = raw_df.reindex(columns=self._base_feature_cols_)
@@ -2919,6 +3857,8 @@ class SequenceExtractor(HoneycombBase):
         bins_per_day = max(4, int(round(24.0 * 60.0 / max(int(self.bin_minutes), 1))))
         width = max(8, int(round(float(self.chunk_window_days) * bins_per_day)))
         max_w = max(1, int(self.max_windows_per_sequence))
+        cap_pol = str(self.window_cap_policy or "uniform").strip().lower()
+        final_m = str(self.final_window_mode or "overlap").strip().lower()
 
         channel_order = (
             "log_enmo_filled", "dyn_amp_filled", "enmo_smooth",
@@ -2940,6 +3880,8 @@ class SequenceExtractor(HoneycombBase):
             branches, _ = self.branch_extractor.build_and_summarize(g)
             g["enmo_smooth"] = branches.get("enmo_smooth", g["enmo_filled"])
             n = len(g["mask_filled"])
+            if final_m == "drop" and n < width:
+                continue
             mat = np.column_stack([np.nan_to_num(g.get(ch, np.zeros(n)), nan=0.0) for ch in channel_order]).astype(np.float32)
             raw_mats.append(mat)
             mask_mats.append(g["mask_filled"].astype(np.float32)[:, None])
@@ -2971,7 +3913,12 @@ class SequenceExtractor(HoneycombBase):
             for s_idx in range(len(kept_ids)):
                 pos = np.flatnonzero(yt == s_idx)
                 if len(pos) > max_w:
-                    pos = pos[np.linspace(0, len(pos) - 1, max_w, dtype=int)]
+                    if cap_pol == "first":
+                        pos = pos[:max_w]
+                    elif cap_pol == "last":
+                        pos = pos[-max_w:]
+                    else:
+                        pos = pos[np.linspace(0, len(pos) - 1, max_w, dtype=int)]
                 keep_rows.extend(pos.tolist())
             Xt = Xt[keep_rows].astype(np.float32)
             Mt = (Mt[keep_rows, :, 0] > 0.5)
@@ -3022,6 +3969,16 @@ def validate_sequence_extractor_params(params: Mapping[str, Any]) -> None:
         "none", None, "zero", "bounded_ffill", "bounded_linear", "bounded_pchip", "bounded_cubic", "diurnal_median"
     }:
         raise InvalidExtractorParams(f"Unsupported interp_mode: {params.get('interp_mode')!r}")
+    if params.get("sequence_crop_mode", "none") not in {"none", None, "pad_trunc", "tsaug_crop", "head", "tail", "center"}:
+        raise InvalidExtractorParams(f"Unsupported sequence_crop_mode: {params.get('sequence_crop_mode')!r}")
+    if params.get("window_cap_policy", "uniform") not in {"uniform", "first", "last"}:
+        raise InvalidExtractorParams(f"Unsupported window_cap_policy: {params.get('window_cap_policy')!r}")
+    if params.get("final_window_mode", "overlap") not in {"overlap", "pad", "drop"}:
+        raise InvalidExtractorParams(f"Unsupported final_window_mode: {params.get('final_window_mode')!r}")
+    if params.get("stft_scaling", "psd") not in {"psd", "spectrum", "none", None}:
+        raise InvalidExtractorParams(f"Unsupported stft_scaling: {params.get('stft_scaling')!r}")
+    if params.get("stft_detrend", "constant") not in {"constant", "linear", "none", False, None}:
+        raise InvalidExtractorParams(f"Unsupported stft_detrend: {params.get('stft_detrend')!r}")
     if params.get("missing_feature_strategy", "keep_nan") not in {
         "keep_nan", "none", None, "median", "mean", "constant_zero", "knn", "iterative", "group_age_median"
     }:
@@ -3047,18 +4004,69 @@ def validate_sequence_extractor_params(params: Mapping[str, Any]) -> None:
         raise InvalidExtractorParams(f"Unsupported static_backend: {params.get('static_backend')!r}")
     if params.get("tsfresh_profile", "minimal") not in TSFRESH_PROFILES:
         raise InvalidExtractorParams(f"tsfresh_profile must be one of {TSFRESH_PROFILES}")
+    if params.get("filter_method", "none") not in {"none", None, "iqr", "zscore"}:
+        raise InvalidExtractorParams(f"Unsupported filter_method: {params.get('filter_method')!r}")
+    if float(params.get("filter_threshold", 3.0)) <= 0.0:
+        raise InvalidExtractorParams("filter_threshold must be > 0")
+    if int(params.get("max_outlier_features", 3)) < 1:
+        raise InvalidExtractorParams("max_outlier_features must be >= 1")
+    if params.get("feature_selection_method", "f_classif") not in {"none", None, "correlation", "f_classif"}:
+        raise InvalidExtractorParams(f"Unsupported feature_selection_method: {params.get('feature_selection_method')!r}")
+    for flag_name in ("include_lags", "include_leads", "include_rolling"):
+        if params.get(flag_name, True) not in {True, False, "none", None, "true", "false"}:
+            raise InvalidExtractorParams(f"Unsupported {flag_name}: {params.get(flag_name)!r}")
+    _pipe_modes(
+        params.get("lag_lead_channels", "log_enmo|light|anglez"),
+        ("log_enmo", "enmo", "dyn_amp", "light", "anglez", "lin_enmo"),
+        name="lag_lead_channels",
+    )
     _pipe_modes(
         params.get(
             "feature_families",
-            "autocorr|circadian|sleep_arch|motion|spectral|stft|wavelet|seglearn|catch22|tsfel|tsfresh|tsflex|prsa_cusum|branches|compliance",
+            "autocorr|lag_lead|circadian|sleep_arch|motion|spectral|stft|wavelet|seglearn|catch22|tsfel|tsfresh|tsflex|prsa_cusum|branches|compliance",
         ),
         (
-            "autocorr", "circadian", "sleep_arch", "motion", "spectral", "stft",
+            "autocorr", "lag_lead", "circadian", "sleep_arch", "motion", "spectral", "stft",
             "wavelet", "seglearn", "catch22", "tsfel", "tsfresh", "tsflex",
             "prsa_cusum", "branches", "compliance",
         ),
         name="feature_families",
     )
+
+
+def inactive_noop_parameters(p: Mapping[str, Any], prefix: str = "") -> set:
+    """Identify inactive ``extractor__noop__*`` options for candidate deduplication."""
+    inactive: set = set()
+    opts = NoopActigraphyOptions(
+        motion_stats=p.get("extractor__noop__motion_stats", "enmo_ac_rms|motion_cv|posture_var|jerk_floor|dog_var|baevsky_si"),
+        periodicity=p.get("extractor__noop__periodicity", "acf_sublag_fundamental|cosinor"),
+        spectral_stats=p.get("extractor__noop__spectral_stats", "peakedness|spectral_entropy|peak_period|parseval_ratio"),
+        quality=p.get("extractor__noop__quality", "basic"),
+        power_branches=p.get("extractor__noop__power_branches", "enmo|light"),
+    )
+    p_atoms = opts.periodicity_names()
+    _, s_atoms = opts.mode_names()
+    q_atoms = opts.quality_names()
+    if not p_atoms:
+        for name in ("min_cycles", "detrend", "period_band_hours", "fundamental_ratio", "min_acf_strength", "acf_harmonic_tolerance", "cadence_band", "min_cadence_strength"):
+            inactive.add(f"{prefix}extractor__noop__{name}")
+    else:
+        if "acf_harmonic_checked" not in p_atoms:
+            inactive.add(f"{prefix}extractor__noop__acf_harmonic_tolerance")
+        if "acf_harmonic_checked" not in p_atoms and "acf_sublag_fundamental" not in p_atoms:
+            inactive.add(f"{prefix}extractor__noop__fundamental_ratio")
+        if "acf" not in p_atoms and "acf_harmonic_checked" not in p_atoms:
+            inactive.add(f"{prefix}extractor__noop__period_band_hours")
+            inactive.add(f"{prefix}extractor__noop__min_acf_strength")
+        if "acf_cadence" not in p_atoms and "acf_sublag_fundamental" not in p_atoms:
+            inactive.add(f"{prefix}extractor__noop__cadence_band")
+            inactive.add(f"{prefix}extractor__noop__min_cadence_strength")
+    if not s_atoms:
+        for name in ("band", "bands", "spectral_neighbourhood_hz", "nyquist_policy"):
+            inactive.add(f"{prefix}extractor__noop__{name}")
+    if not q_atoms:
+        inactive.add(f"{prefix}extractor__noop__max_gap_samples")
+    return inactive
 
 
 def inactive_sequence_parameters(params: Mapping[str, Any]) -> set:
@@ -3072,10 +4080,10 @@ def inactive_sequence_parameters(params: Mapping[str, Any]) -> set:
     families = _pipe_modes(
         p.get(
             "extractor__feature_families",
-            "autocorr|circadian|sleep_arch|motion|spectral|stft|wavelet|seglearn|catch22|tsfel|tsfresh|tsflex|prsa_cusum|branches|compliance",
+            "autocorr|lag_lead|circadian|sleep_arch|motion|spectral|stft|wavelet|seglearn|catch22|tsfel|tsfresh|tsflex|prsa_cusum|branches|compliance",
         ),
         (
-            "autocorr", "circadian", "sleep_arch", "motion", "spectral", "stft",
+            "autocorr", "lag_lead", "circadian", "sleep_arch", "motion", "spectral", "stft",
             "wavelet", "seglearn", "catch22", "tsfel", "tsfresh", "tsflex",
             "prsa_cusum", "branches", "compliance",
         ),
@@ -3085,15 +4093,39 @@ def inactive_sequence_parameters(params: Mapping[str, Any]) -> set:
         for name in (
             "linear_acc_mode", "baseline_window_bins", "highpass_hz", "motion_filter_mode",
             "kalman_process_noise", "kalman_measurement_noise", "use_dead_reckoning", "dead_reckoning_detrend",
-            "acc_modes", "smooth_window_bins", "smooth_alpha", "sedentary_threshold_g",
+            "acc_modes", "dc_offset_bins", "smooth_window_bins", "smooth_alpha", "sedentary_threshold_g",
         ):
             inactive.add(f"{prefix}extractor__{name}")
     if "autocorr" not in families:
         for name in ("acf_detrend", "acf_bias", "short_lags_h", "period_band_hours", "fundamental_ratio", "min_acf_strength"):
             inactive.add(f"{prefix}extractor__{name}")
-    if "stft" not in families:
-        for name in ("stft_window_days", "stft_overlap_ratio", "stft_window_type"):
+    ll_ch = p.get("extractor__lag_lead_channels", "log_enmo|light|anglez")
+    if "lag_lead" not in families or ll_ch in ("none", None, ""):
+        for name in ("include_lags", "include_leads", "include_rolling", "lag_lead_hours", "rolling_window_hours", "lag_lead_channels"):
             inactive.add(f"{prefix}extractor__{name}")
+    else:
+        inc_lags = p.get("extractor__include_lags", True) not in (False, "none", None, "", 0, "false")
+        inc_leads = p.get("extractor__include_leads", True) not in (False, "none", None, "", 0, "false")
+        inc_roll = p.get("extractor__include_rolling", True) not in (False, "none", None, "", 0, "false")
+        if not inc_lags and not inc_leads:
+            inactive.add(f"{prefix}extractor__lag_lead_hours")
+        if not inc_roll:
+            inactive.add(f"{prefix}extractor__rolling_window_hours")
+    if p.get("extractor__filter_method", "none") in ("none", None, "", False):
+        inactive.add(f"{prefix}extractor__filter_threshold")
+        inactive.add(f"{prefix}extractor__max_outlier_features")
+    if p.get("extractor__feature_selection_method", "f_classif") in ("none", None, "", False):
+        inactive.add(f"{prefix}extractor__static_top_k")
+        inactive.add(f"{prefix}extractor__feature_selection_percentile")
+    if "stft" not in families and "spectral" not in families:
+        for name in ("stft_window_days", "stft_overlap_ratio", "stft_window_type", "stft_scaling", "stft_detrend", "spectral_moment_max_peaks"):
+            inactive.add(f"{prefix}extractor__{name}")
+    if "motion" not in families:
+        for k_name in p:
+            if k_name.startswith("extractor__noop__"):
+                inactive.add(f"{prefix}{k_name}")
+    else:
+        inactive |= inactive_noop_parameters(p, prefix=prefix)
     if "wavelet" not in families:
         for name in ("cwt_wavelet", "cwt_n_scales", "cwt_min_period_h", "cwt_max_period_h", "dwt_wavelet", "dwt_level"):
             inactive.add(f"{prefix}extractor__{name}")
@@ -3128,6 +4160,14 @@ def inactive_sequence_parameters(params: Mapping[str, Any]) -> set:
     if "tsfel" not in families and "tsfresh" not in families:
         for name in ("static_backend", "static_channels"):
             inactive.add(f"{prefix}extractor__{name}")
+    if p.get("extractor__maxlen_days") in (None, "none", "") or float(p.get("extractor__maxlen_days") or 0.0) <= 0.0:
+        inactive.add(f"{prefix}extractor__sequence_crop_mode")
+    if not bool(p.get("extractor__filter_problematic_sequences", False)):
+        inactive.add(f"{prefix}extractor__ideal_skew_threshold")
+        inactive.add(f"{prefix}extractor__problematic_features_threshold")
+    acc_m = str(p.get("extractor__acc_modes", "raw|smoothed|jerk|velocity|linear|kalman") or "")
+    if "freq_velocity" not in acc_m and "freq_displacement" not in acc_m:
+        inactive.add(f"{prefix}extractor__dc_offset_bins")
     lin_m = p.get("extractor__linear_acc_mode", "rolling_mean")
     if lin_m != "highpass_sos":
         inactive.add(f"{prefix}extractor__highpass_hz")
@@ -3157,7 +4197,9 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
     **Zero supervised machine learning models**: uses explicit domain priors across clinical
     assessment terms + open-source actigraphy calculations (`seq_acf_*`, `seq_sri`,
     `seq_circ_sjl_abs_h`, `seq_upright_night_frac`, `seq_cusum_enmo_max`, `seq_prsa_asym`,
-    `seq_stft_flux_mean`, `seq_cwt_ultradian_circadian_ratio`, `seq_seg_*` waveform variance).
+    `seq_stft_flux_mean`, `seq_cwt_ultradian_circadian_ratio`, `seq_seg_*` waveform variance)
+    plus optional univariate ANOVA top-K selected sequence features (`static_top_k` /
+    `feature_selection_percentile`).
     """
 
     def __init__(
@@ -3183,8 +4225,20 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
         w_seglearn_kinematic: float = 0.25,
         w_cusum_prsa: float = 0.20,
         w_sleep_fragmentation: float = 0.25,
+        w_lag_lead_coupling: float = 0.25,
+        w_selected_static: float = 0.25,
         coupling_alpha: float = 0.35,
         threshold_calibration: str = "optimize_qwk",
+        feature_selection_method: Optional[str] = None,
+        static_top_k: Optional[int] = None,
+        feature_selection_percentile: Optional[float] = None,
+        filter_method: Optional[str] = None,
+        filter_threshold: Optional[float] = None,
+        max_outlier_features: Optional[int] = None,
+        validation_split: float = 0.20,
+        invalid_candidate_policy: str = "penalize",
+        invalid_candidate_score: float = -1.0,
+        candidate_failure_log: Optional[str] = None,
         primary_target: str = TARGET_COL,
         validation_group_column: Optional[str] = None,
         verbose: int = 0,
@@ -3211,8 +4265,20 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
         self.w_seglearn_kinematic = w_seglearn_kinematic
         self.w_cusum_prsa = w_cusum_prsa
         self.w_sleep_fragmentation = w_sleep_fragmentation
+        self.w_lag_lead_coupling = w_lag_lead_coupling
+        self.w_selected_static = w_selected_static
         self.coupling_alpha = coupling_alpha
         self.threshold_calibration = threshold_calibration
+        self.feature_selection_method = feature_selection_method
+        self.static_top_k = static_top_k
+        self.feature_selection_percentile = feature_selection_percentile
+        self.filter_method = filter_method
+        self.filter_threshold = filter_threshold
+        self.max_outlier_features = max_outlier_features
+        self.validation_split = validation_split
+        self.invalid_candidate_policy = invalid_candidate_policy
+        self.invalid_candidate_score = invalid_candidate_score
+        self.candidate_failure_log = candidate_failure_log
         self.primary_target = primary_target
         self.validation_group_column = validation_group_column
         self.verbose = verbose
@@ -3239,7 +4305,20 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
         return super().set_params(**clean)
 
     def _get_extractor(self) -> SequenceExtractor:
-        return self.extractor if self.extractor is not None else SequenceExtractor()
+        ext = clone(self.extractor) if self.extractor is not None else SequenceExtractor()
+        if self.feature_selection_method is not None:
+            ext.feature_selection_method = self.feature_selection_method
+        if self.static_top_k is not None and ext.static_top_k is None:
+            ext.static_top_k = self.static_top_k
+        if self.feature_selection_percentile is not None and ext.feature_selection_percentile is None:
+            ext.feature_selection_percentile = self.feature_selection_percentile
+        if self.filter_method is not None:
+            ext.filter_method = self.filter_method
+        if self.filter_threshold is not None:
+            ext.filter_threshold = self.filter_threshold
+        if self.max_outlier_features is not None:
+            ext.max_outlier_features = self.max_outlier_features
+        return ext
 
     def _get_augmentor(self) -> TSAugmentor:
         return self.augmentor if self.augmentor is not None else TSAugmentor()
@@ -3294,7 +4373,6 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
         if self.scoring_rule in {"autocorr_spectral_rule", "multiplicative_hazard"}:
             r["term_stft_flux"] = _col("seq_stft_flux_mean")
             r["term_cwt_ultradian"] = _col("seq_cwt_ultradian_circadian_ratio")
-            # seglearn inter-window instability across diurnal segments (inverse regularity)
             seg_wstd = _col("seq_seg_variation_log_enmo_wstd")
             seg_var = _col("seq_seg_std_dyn_amp_wstd")
             r["term_seglearn_kinematic"] = np.where(
@@ -3316,6 +4394,38 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
                 0.65 * frag + 0.35 * (1.0 - sa_eff),
                 np.where(np.isfinite(frag), frag, 1.0 - sa_eff),
             )
+            ll_xcorr = _col("seq_lag_light_leads_enmo_mean")
+            ll_asym = _col("seq_lag_lead_light_enmo_asym_mean")
+            ll_ramp = _col("seq_presleep_lead_postwake_lag_ratio")
+            ll_base = np.where(
+                np.isfinite(ll_xcorr) & np.isfinite(ll_asym),
+                0.60 * ll_xcorr + 0.40 * ll_asym,
+                np.where(np.isfinite(ll_xcorr), ll_xcorr, ll_asym),
+            )
+            r["term_lag_lead_coupling"] = np.where(
+                np.isfinite(ll_base) & np.isfinite(ll_ramp),
+                0.70 * ll_base + 0.30 * np.log1p(np.maximum(ll_ramp, 0.0)),
+                np.where(np.isfinite(ll_base), ll_base, np.where(np.isfinite(ll_ramp), np.log1p(np.maximum(ll_ramp, 0.0)), np.nan)),
+            )
+
+        sel_cols = getattr(self, "selected_static_cols_", [])
+        if sel_cols:
+            acc_z = np.zeros(len(F), dtype=np.float64)
+            cnt_z = np.zeros(len(F), dtype=np.float64)
+            for sc in sel_cols:
+                if sc not in F.columns:
+                    continue
+                vals = _col(sc)
+                fin = np.isfinite(vals)
+                if not fin.any():
+                    continue
+                mu = self.selected_static_means_.get(sc, 0.0)
+                sd = self.selected_static_stds_.get(sc, 1.0)
+                sgn = self.selected_static_signs_.get(sc, 1.0)
+                z_sc = np.clip((vals - mu) / max(sd, 1e-6), -4.0, 4.0) * sgn
+                acc_z = np.where(fin, acc_z + z_sc, acc_z)
+                cnt_z = np.where(fin, cnt_z + 1.0, cnt_z)
+            r["term_selected_static"] = np.where(cnt_z > 0, acc_z / np.maximum(cnt_z, 1.0), np.nan)
         return r
 
     def _prior_weights(self) -> Dict[str, float]:
@@ -3338,6 +4448,8 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
             "term_seglearn_kinematic": float(self.w_seglearn_kinematic),
             "term_cusum_prsa": float(self.w_cusum_prsa),
             "term_sleep_fragmentation": float(self.w_sleep_fragmentation),
+            "term_lag_lead_coupling": float(self.w_lag_lead_coupling),
+            "term_selected_static": float(self.w_selected_static),
         }
 
     def _evaluate_handcrafted_scores(self, z_mat: np.ndarray) -> np.ndarray:
@@ -3363,6 +4475,23 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
             dtype=np.int64,
         ).ravel()
 
+        # Track internal train/validation sequence IDs for leak-free permutation importance
+        ids_all = X[ID_COL].astype(str).to_numpy() if ID_COL in X.columns else np.arange(len(X)).astype(str)
+        v_split = float(self.validation_split or 0.0)
+        if 0.0 < v_split < 0.9 and len(X) >= 10:
+            try:
+                sss = StratifiedShuffleSplit(n_splits=1, test_size=v_split, random_state=int(self.random_state))
+                tr_i, va_i = next(sss.split(X, y_arr))
+                self.train_sequence_ids_ = ids_all[tr_i]
+                self.validation_sequence_ids_ = ids_all[va_i]
+            except Exception:
+                cut = max(1, int(round(len(X) * (1.0 - v_split))))
+                self.train_sequence_ids_ = ids_all[:cut]
+                self.validation_sequence_ids_ = ids_all[cut:]
+        else:
+            self.train_sequence_ids_ = ids_all
+            self.validation_sequence_ids_ = np.asarray([], dtype=str)
+
         ext = self._get_extractor()
         ext.validate()
         self.extractor_ = ext
@@ -3377,6 +4506,36 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
                 self.augmented_chunk_count_ = int(aug_chunks.shape[0])
         feat_df = ext.fit_transform(strip_leaky_columns(X), y_arr)
         self.feature_names_in_ = list(feat_df.columns)
+        support_mask = np.asarray(getattr(ext, "support_mask_", np.ones(len(X), dtype=bool)), dtype=bool)
+        if len(support_mask) != len(X) or not support_mask.any():
+            support_mask = np.ones(len(X), dtype=bool)
+        self.support_mask_ = support_mask
+        self.n_samples_removed_ = int(getattr(ext, "n_samples_removed_", int((~support_mask).sum())))
+        self.n_samples_retained_ = int(getattr(ext, "n_samples_retained_", int(support_mask.sum())))
+
+        # Record univariate selected static sequence features and their training moments/direction (on retained support)
+        self.selected_static_cols_ = list(getattr(ext, "selected_static_cols_", []))
+        self.selected_static_means_: Dict[str, float] = {}
+        self.selected_static_stds_: Dict[str, float] = {}
+        self.selected_static_signs_: Dict[str, float] = {}
+        for sc in self.selected_static_cols_:
+            if sc not in feat_df.columns:
+                continue
+            sv = pd.to_numeric(feat_df[sc], errors="coerce").to_numpy(dtype=np.float64)
+            fin = np.isfinite(sv) & support_mask
+            if not fin.any():
+                fin = np.isfinite(sv)
+            mu = float(np.mean(sv[fin])) if fin.any() else 0.0
+            sd = float(np.std(sv[fin])) if fin.sum() > 1 else 1.0
+            if sd <= 1e-9:
+                sd = 1.0
+            self.selected_static_means_[sc] = mu
+            self.selected_static_stds_[sc] = sd
+            if fin.sum() > 3 and np.std(y_arr[fin]) > 1e-9:
+                cov = float(np.mean((sv[fin] - mu) * (y_arr[fin] - np.mean(y_arr[fin]))))
+                self.selected_static_signs_[sc] = 1.0 if cov >= 0.0 else -1.0
+            else:
+                self.selected_static_signs_[sc] = 1.0
 
         terms = self._build_domain_terms(feat_df)
         self.term_names_ = list(terms.columns)
@@ -3386,38 +4545,52 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
         z_mat = np.full((len(terms), len(self.term_names_)), np.nan, dtype=np.float64)
         for j, col in enumerate(self.term_names_):
             v = terms[col].to_numpy(dtype=np.float64)
-            fin = np.isfinite(v)
-            mu = float(np.mean(v[fin])) if fin.any() else 0.0
-            sd = float(np.std(v[fin])) if fin.sum() > 1 else 1.0
+            fin_all = np.isfinite(v)
+            fin_fit = fin_all & support_mask
+            if not fin_fit.any():
+                fin_fit = fin_all
+            mu = float(np.mean(v[fin_fit])) if fin_fit.any() else 0.0
+            sd = float(np.std(v[fin_fit])) if fin_fit.sum() > 1 else 1.0
             if sd <= 1e-9:
                 sd = 1.0
             self.term_means_[col] = mu
             self.term_stds_[col] = sd
-            z_mat[:, j] = np.where(fin, np.clip((v - mu) / sd, -4.0, 4.0), np.nan)
+            z_mat[:, j] = np.where(fin_all, np.clip((v - mu) / sd, -4.0, 4.0), np.nan)
 
         pw = self._prior_weights()
         self.weight_vec_ = np.array([pw.get(c, 0.0) for c in self.term_names_], dtype=np.float64)
         scores = self._evaluate_handcrafted_scores(z_mat)
-        self.train_score_mean_ = float(np.mean(scores))
-        self.train_score_std_ = max(float(np.std(scores)), 1e-6)
+        scores_fit = scores[support_mask]
+        y_fit = y_arr[support_mask]
+        self.train_score_mean_ = float(np.mean(scores_fit))
+        self.train_score_std_ = max(float(np.std(scores_fit)), 1e-6)
 
         if self.threshold_calibration == "optimize_qwk":
-            self.thresholds_ = optimize_thresholds_qwk(y_arr, scores)
+            self.thresholds_ = optimize_thresholds_qwk(y_fit, scores_fit)
         elif self.threshold_calibration == "quantile":
-            p0, p1, p2 = float(np.mean(y_arr <= 0)), float(np.mean(y_arr <= 1)), float(np.mean(y_arr <= 2))
-            self.thresholds_ = np.sort(np.quantile(scores, [p0, p1, p2]))
+            p0, p1, p2 = float(np.mean(y_fit <= 0)), float(np.mean(y_fit <= 1)), float(np.mean(y_fit <= 2))
+            self.thresholds_ = np.sort(np.quantile(scores_fit, [p0, p1, p2]))
         elif self.threshold_calibration == "fixed_midpoint":
-            self.thresholds_ = self.train_score_mean_ + (np.array([0.5, 1.5, 2.5]) - y_arr.mean()) * (
-                self.train_score_std_ / max(y_arr.std(), 1e-3)
+            self.thresholds_ = self.train_score_mean_ + (np.array([0.5, 1.5, 2.5]) - y_fit.mean()) * (
+                self.train_score_std_ / max(y_fit.std(), 1e-3)
             )
         elif self.threshold_calibration in ("none", None):
             self.thresholds_ = np.array([0.0, 0.75, 1.5], dtype=np.float64)
         else:
             raise InvalidParams(f"Unsupported threshold_calibration: {self.threshold_calibration!r}")
 
-        self.train_qwk_ = quadratic_weighted_kappa(y_arr, apply_thresholds(scores, self.thresholds_))
+        preds = apply_thresholds(scores, self.thresholds_)
+        self.train_qwk_ = quadratic_weighted_kappa(y_arr, preds)
+        self.history_: Dict[str, List[float]] = {
+            "loss": [float(1.0 - self.train_qwk_)],
+            "val_loss": [float(1.0 - self.train_qwk_)],
+            "qwk": [float(self.train_qwk_)],
+        }
         self.classes_ = np.array([0, 1, 2, 3], dtype=np.int64)
         return self
+
+    def get_history_dict(self) -> Dict[str, List[float]]:
+        return dict(getattr(self, "history_", {}))
 
     def predict_continuous(self, X: pd.DataFrame) -> np.ndarray:
         feat_df = self.extractor_.transform(strip_leaky_columns(X))
@@ -3447,7 +4620,7 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
 
 
 # ---------------------------------------------------------------------------
-# Search Space, Grid Deduplication & HierarchicalBayesSearchCV (Grid & Bayes only)
+# Search Space, Grid Deduplication, Bayesian & Evolutionary Search (Grid / Bayes / Evo)
 # ---------------------------------------------------------------------------
 
 class ParamSpec:
@@ -3461,6 +4634,99 @@ class ParamSpec:
         if self.bayes_dim is not None:
             return self.bayes_dim
         return SkCategorical([_encode_skopt_item(v) for v in self.grid_values])
+
+
+class ECat:
+    """Evolutionary categorical gene dimension (ported from ``utils_v3.py``)."""
+
+    def __init__(self, categories: Sequence[Any]):
+        self.categories = list(categories)
+        if not self.categories:
+            raise ValueError("ECat requires at least one category.")
+
+    def sample(self, rng: np.random.Generator) -> Any:
+        return self.categories[int(rng.integers(0, len(self.categories)))]
+
+    def mutate(self, current: Any, rng: np.random.Generator) -> Any:
+        if len(self.categories) <= 1:
+            return self.categories[0]
+        others = [c for c in self.categories if c != current]
+        if not others:
+            return self.sample(rng)
+        return others[int(rng.integers(0, len(others)))]
+
+
+class EInt:
+    """Evolutionary integer gene dimension."""
+
+    def __init__(self, low: int, high: int, step: int = 1):
+        self.low = int(low)
+        self.high = int(high)
+        self.step = max(1, int(step))
+        self.values = list(range(self.low, self.high + 1, self.step)) or [self.low]
+
+    def sample(self, rng: np.random.Generator) -> int:
+        return int(self.values[int(rng.integers(0, len(self.values)))])
+
+    def mutate(self, current: Any, rng: np.random.Generator) -> int:
+        if len(self.values) <= 1:
+            return int(self.values[0])
+        try:
+            idx = self.values.index(int(current))
+        except Exception:
+            return self.sample(rng)
+        delta = int(rng.choice([-2, -1, 1, 2]))
+        new_idx = int(np.clip(idx + delta, 0, len(self.values) - 1))
+        if new_idx == idx:
+            new_idx = (idx + 1) % len(self.values)
+        return int(self.values[new_idx])
+
+
+class EFloat:
+    """Evolutionary continuous gene dimension (uniform or log-uniform)."""
+
+    def __init__(self, low: float, high: float, log: bool = False):
+        self.low = float(low)
+        self.high = float(high)
+        self.log = bool(log) and self.low > 0.0 and self.high > 0.0
+
+    def sample(self, rng: np.random.Generator) -> float:
+        if self.high <= self.low:
+            return float(self.low)
+        if self.log:
+            return float(np.exp(rng.uniform(np.log(self.low), np.log(self.high))))
+        return float(rng.uniform(self.low, self.high))
+
+    def mutate(self, current: Any, rng: np.random.Generator) -> float:
+        if self.high <= self.low:
+            return float(self.low)
+        try:
+            cur = float(current)
+        except Exception:
+            return self.sample(rng)
+        if self.log and cur > 0:
+            log_lo, log_hi = np.log(self.low), np.log(self.high)
+            sigma = 0.20 * (log_hi - log_lo)
+            val = float(np.exp(np.clip(np.log(cur) + rng.normal(0.0, sigma), log_lo, log_hi)))
+        else:
+            sigma = 0.20 * (self.high - self.low)
+            val = float(np.clip(cur + rng.normal(0.0, sigma), self.low, self.high))
+        return val
+
+
+def prepare_evolutionary_space(space: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize an evolutionary parameter dictionary into ``ECat`` / ``EInt`` / ``EFloat`` dimensions."""
+    out: Dict[str, Any] = {}
+    for k, v in space.items():
+        if isinstance(v, (ECat, EInt, EFloat)):
+            out[k] = v
+        elif isinstance(v, ParamSpec):
+            out[k] = ECat(v.grid_values)
+        elif isinstance(v, (list, tuple)):
+            out[k] = ECat(list(v))
+        else:
+            out[k] = ECat([v])
+    return out
 
 
 def _encode_skopt_item(val: Any) -> Any:
@@ -3501,17 +4767,26 @@ def inactive_parameters_for_candidate(params: Mapping[str, Any]) -> set:
     if rule == "weighted_z_index":
         for name in (
             "w_stft_flux", "w_cwt_ultradian", "w_seglearn_kinematic",
-            "w_cusum_prsa", "w_sleep_fragmentation", "coupling_alpha",
+            "w_cusum_prsa", "w_sleep_fragmentation", "w_lag_lead_coupling", "coupling_alpha",
         ):
             inactive.add(f"{prefix}{name}")
     elif rule == "autocorr_spectral_rule":
         inactive.add(f"{prefix}coupling_alpha")
+    fams = str(p.get("extractor__feature_families", "autocorr|lag_lead|circadian|sleep_arch|motion|spectral|stft|wavelet|seglearn|catch22|tsfel|tsfresh|tsflex|prsa_cusum|branches|compliance") or "")
+    if "lag_lead" not in fams or p.get("extractor__lag_lead_channels", "log_enmo|light|anglez") in ("none", None, ""):
+        inactive.add(f"{prefix}w_lag_lead_coupling")
+    fs_m = p.get("feature_selection_method", p.get("extractor__feature_selection_method", "f_classif"))
+    top_k = p.get("static_top_k", p.get("extractor__static_top_k"))
+    pct = p.get("feature_selection_percentile", p.get("extractor__feature_selection_percentile"))
+    if fs_m in ("none", None, "", False) or (top_k in (None, "none", "", 0) and pct in (None, "none", "", 0, 100, 100.0)):
+        inactive.add(f"{prefix}w_selected_static")
     if float(p.get("augmentor__prob", 0.0)) <= 0.0:
         for name in (
             "per_aug_prob", "augmentations", "n_copies", "jitter_sigma", "noise_std",
             "scaling_sigma", "warp_sigma", "warp_num_knots", "time_warp_max_speed_ratio",
             "time_warp_n_speed_change", "time_shift_frac", "crop_frac_range",
-            "temporal_num_masks", "temporal_mask_frac", "temporal_mask_fill", "channel_drop_prob",
+            "temporal_num_masks", "temporal_mask_frac", "temporal_mask_fill",
+            "channel_drop_prob", "sensor_drop_prob", "sensor_drop_joint_prob",
         ):
             inactive.add(f"{prefix}augmentor__{name}")
     return inactive
@@ -3642,14 +4917,18 @@ class HierarchicalBayesSearchCV(BaseEstimator):
                 if cats is None or val in cats:
                     point.append(val)
                     continue
+            # Ensure Iteration 0 deterministically starts with augmentations off
+            if "augmentor__prob" in k:
+                bv = 0.0
+            else:
+                bv = base_params.get(k)
             if hasattr(dim, "categories"):
                 cats = list(dim.categories)
-                bv = _encode_skopt_item(base_params.get(k)) if k in base_params else None
-                point.append(bv if bv in cats else cats[0])
+                enc_bv = _encode_skopt_item(bv) if bv is not None else None
+                point.append(enc_bv if enc_bv in cats else cats[0])
             else:
                 low, high = getattr(dim, "low", 0.0), getattr(dim, "high", 1.0)
                 is_int = isinstance(low, (int, np.integer)) and isinstance(high, (int, np.integer))
-                bv = base_params.get(k)
                 if isinstance(bv, (int, float, np.number)) and low <= float(bv) <= high:
                     point.append(int(round(float(bv))) if is_int else float(bv))
                 else:
@@ -3742,6 +5021,7 @@ class HierarchicalBayesSearchCV(BaseEstimator):
             self.cv_results_[f"split{i}_test_score"] = np.array([s[i] for s in all_fold_qwk], dtype=float)
             self.cv_results_[f"split{i}_test_qwk"] = np.array([s[i] for s in all_fold_qwk], dtype=float)
             self.cv_results_[f"split{i}_test_accuracy_pct"] = np.array([s[i] for s in all_fold_acc_pct], dtype=float)
+        _populate_param_columns(self.cv_results_, all_params)
 
         self.best_index_ = int(refit_valid_candidate(self.cv_results_)) if callable(self.refit) else int(np.argmax(means))
         self.best_params_ = dict(all_params[self.best_index_])
@@ -3753,6 +5033,197 @@ class HierarchicalBayesSearchCV(BaseEstimator):
 
     def predict(self, X: pd.DataFrame):
         return self.best_estimator_.predict(X)
+
+
+class GASearchCV(BaseEstimator):
+    """Genetic Algorithm (Evolutionary) Search with tournament selection, elitism, uniform crossover & inactive-parameter caching."""
+
+    def __init__(
+        self,
+        estimator: Any,
+        param_distributions: Mapping[str, Any],
+        population_size: int = 8,
+        generations: int = 4,
+        tournament_size: int = 3,
+        elitism: int = 2,
+        crossover_probability: float = 0.7,
+        mutation_probability: float = 0.25,
+        cv: Any = None,
+        scoring: Any = None,
+        refit: Any = True,
+        random_state: int = 42,
+        verbose: int = 1,
+        error_score: Any = -1.0,
+        n_jobs: int = 1,
+    ):
+        self.estimator = estimator
+        self.param_distributions = param_distributions
+        self.population_size = population_size
+        self.generations = generations
+        self.tournament_size = tournament_size
+        self.elitism = elitism
+        self.crossover_probability = crossover_probability
+        self.mutation_probability = mutation_probability
+        self.cv = cv
+        self.scoring = scoring
+        self.refit = refit
+        self.random_state = random_state
+        self.verbose = verbose
+        self.error_score = error_score
+        self.n_jobs = n_jobs
+
+    @staticmethod
+    def _default_seed_candidate(space_dict: Mapping[str, Any], base_params: Mapping[str, Any], rng: np.random.Generator) -> Dict[str, Any]:
+        cand: Dict[str, Any] = {}
+        for k, dim in space_dict.items():
+            if "augmentor__prob" in k:
+                bv = 0.0
+            else:
+                bv = base_params.get(k)
+            if isinstance(dim, ECat):
+                cand[k] = bv if bv in dim.categories else dim.categories[0]
+            elif isinstance(dim, EInt):
+                if isinstance(bv, (int, float, np.number)) and dim.low <= int(round(float(bv))) <= dim.high:
+                    cand[k] = int(round(float(bv)))
+                else:
+                    cand[k] = dim.sample(rng)
+            elif isinstance(dim, EFloat):
+                if isinstance(bv, (int, float, np.number)) and dim.low <= float(bv) <= dim.high:
+                    cand[k] = float(bv)
+                else:
+                    cand[k] = dim.sample(rng)
+            else:
+                cand[k] = dim.sample(rng)
+        return cand
+
+    def fit(self, X: pd.DataFrame, y: Any, groups: Optional[Any] = None):
+        rng = np.random.default_rng(int(self.random_state))
+        cv = self.cv or StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=int(self.random_state))
+        space_dict = prepare_evolutionary_space(self.param_distributions)
+        keys = list(space_dict.keys())
+        base_params = self.estimator.get_params(deep=True)
+        scorer = self.scoring or candidate_score
+
+        pop_size = max(2, int(self.population_size))
+        n_gen = max(1, int(self.generations))
+        t_size = max(1, min(int(self.tournament_size), pop_size))
+        n_elite = max(0, min(int(self.elitism), pop_size - 1))
+
+        cache: Dict[str, Tuple[List[float], List[float], float]] = {}
+        all_params: List[Dict[str, Any]] = []
+        all_fold_qwk: List[List[float]] = []
+        all_fold_acc_pct: List[List[float]] = []
+        all_times: List[float] = []
+        best_so_far = -np.inf
+
+        population: List[Dict[str, Any]] = [self._default_seed_candidate(space_dict, base_params, rng)]
+        while len(population) < pop_size:
+            population.append({k: space_dict[k].sample(rng) for k in keys})
+
+        for gen in range(n_gen):
+            gen_scores: List[float] = []
+            for c_idx, raw_cand in enumerate(population):
+                decoded = _decode_skopt_params(raw_cand)
+                sig = _canonical_candidate_key(decoded, base_params=base_params)
+                if sig in cache:
+                    fold_qwks, fold_accs, elapsed = cache[sig]
+                    cached_tag = " (cached)"
+                else:
+                    fold_qwks, fold_accs, elapsed = _evaluate_candidate_cv(
+                        self.estimator, decoded, X, y, groups, cv, scorer,
+                        error_score=-1.0 if self.error_score == "raise" else float(self.error_score),
+                    )
+                    cache[sig] = (fold_qwks, fold_accs, elapsed)
+                    cached_tag = ""
+                ok_idx = [i for i, (a, q) in enumerate(zip(fold_accs, fold_qwks)) if np.isfinite(a) and a >= 0.0 and np.isfinite(q)]
+                mean_acc = float(np.mean([fold_accs[i] for i in ok_idx])) if ok_idx else np.nan
+                mean_qwk = float(np.mean([fold_qwks[i] for i in ok_idx])) if ok_idx else float(np.mean(fold_qwks))
+                best_so_far = max(best_so_far, mean_qwk)
+                gen_scores.append(mean_qwk)
+                all_params.append(decoded)
+                all_fold_qwk.append(fold_qwks)
+                all_fold_acc_pct.append(fold_accs)
+                all_times.append(elapsed)
+
+                if self.verbose and int(self.verbose) > 0:
+                    sr = decoded.get("estimator__scoring_rule", decoded.get("scoring_rule", "?"))
+                    bm = decoded.get("estimator__extractor__bin_minutes", decoded.get("extractor__bin_minutes", "?"))
+                    acc_lbl = f"{mean_acc:.2f}%" if np.isfinite(mean_acc) else "nan%"
+                    print(
+                        f"[GA gen {gen + 1}/{n_gen} | cand {c_idx + 1}/{pop_size}] rule={sr} bin={bm}m | "
+                        f"Normal={acc_lbl} -> Comp QWK={mean_qwk:.5f} | best={best_so_far:.5f} ({elapsed:.2f}s){cached_tag}",
+                        flush=True,
+                    )
+
+            if gen + 1 >= n_gen:
+                break
+
+            order = np.argsort(-np.asarray(gen_scores, dtype=float), kind="stable")
+            next_pop: List[Dict[str, Any]] = [dict(population[int(i)]) for i in order[:n_elite]]
+
+            def _tournament_pick() -> Dict[str, Any]:
+                competitors = rng.choice(pop_size, size=t_size, replace=False)
+                winner = int(competitors[int(np.argmax([gen_scores[int(i)] for i in competitors]))])
+                return dict(population[winner])
+
+            while len(next_pop) < pop_size:
+                p1 = _tournament_pick()
+                p2 = _tournament_pick()
+                child = dict(p1)
+                if rng.random() < float(self.crossover_probability):
+                    for k in keys:
+                        if rng.random() < 0.5:
+                            child[k] = p2[k]
+                for k in keys:
+                    if rng.random() < float(self.mutation_probability):
+                        child[k] = space_dict[k].mutate(child[k], rng)
+                next_pop.append(child)
+            population = next_pop
+
+        means = np.array([float(np.mean(s)) for s in all_fold_qwk], dtype=float)
+        stds = np.array([float(np.std(s)) for s in all_fold_qwk], dtype=float)
+        acc_means = np.array(
+            [float(np.mean([a for a in s if np.isfinite(a) and a >= 0.0])) if any(np.isfinite(a) and a >= 0.0 for a in s) else np.nan for s in all_fold_acc_pct],
+            dtype=float,
+        )
+        acc_stds = np.array(
+            [float(np.std([a for a in s if np.isfinite(a) and a >= 0.0])) if any(np.isfinite(a) and a >= 0.0 for a in s) else np.nan for s in all_fold_acc_pct],
+            dtype=float,
+        )
+        ranks = (len(means) - np.argsort(np.argsort(means))).astype(int)
+        n_splits = len(all_fold_qwk[0]) if all_fold_qwk else 1
+
+        self.cv_results_ = {
+            "params": all_params,
+            "mean_test_score": means,
+            "std_test_score": stds,
+            "rank_test_score": ranks,
+            "mean_test_qwk": means.copy(),
+            "std_test_qwk": stds.copy(),
+            "rank_test_qwk": ranks.copy(),
+            "mean_test_accuracy_pct": acc_means,
+            "std_test_accuracy_pct": acc_stds,
+            "mean_fit_time": np.array(all_times, dtype=float),
+        }
+        for i in range(n_splits):
+            self.cv_results_[f"split{i}_test_score"] = np.array([s[i] for s in all_fold_qwk], dtype=float)
+            self.cv_results_[f"split{i}_test_qwk"] = np.array([s[i] for s in all_fold_qwk], dtype=float)
+            self.cv_results_[f"split{i}_test_accuracy_pct"] = np.array([s[i] for s in all_fold_acc_pct], dtype=float)
+        _populate_param_columns(self.cv_results_, all_params)
+
+        self.best_index_ = int(refit_valid_candidate(self.cv_results_)) if callable(self.refit) else int(np.argmax(means))
+        self.best_params_ = dict(all_params[self.best_index_])
+        self.best_score_ = float(means[self.best_index_])
+        if self.refit:
+            self.best_estimator_ = clone(self.estimator).set_params(**self.best_params_)
+            self.best_estimator_.fit(X, y)
+        return self
+
+    def predict(self, X: pd.DataFrame):
+        return self.best_estimator_.predict(X)
+
+
+HierarchicalGASearchCV = GASearchCV
 
 
 def extract_successful_fold_scores(search_or_results: Any, *, cand_index: Optional[int] = None) -> pd.DataFrame:
@@ -3796,14 +5267,49 @@ def extract_successful_fold_scores(search_or_results: Any, *, cand_index: Option
     return pd.DataFrame(rows, columns=["fold", "normal_score_pct", "competition_qwk"])
 
 
+def _populate_param_columns(cv_results: Dict[str, Any], all_params: Sequence[Mapping[str, Any]]) -> None:
+    """Populate individual 1D ``param_<name>`` columns on ``cv_results_`` (matching sklearn ``GridSearchCV``)."""
+    all_keys: List[str] = []
+    seen_k: set = set()
+    for p in all_params:
+        for k in p.keys():
+            if k not in seen_k:
+                seen_k.add(k)
+                all_keys.append(k)
+    n_rows = len(all_params)
+    for k in all_keys:
+        col_arr = np.empty(n_rows, dtype=object)
+        for idx, p in enumerate(all_params):
+            val = p.get(k, None)
+            col_arr[idx] = tuple(val) if isinstance(val, list) else val
+        cv_results[f"param_{k}"] = col_arr
+
+
 def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
+    """Build a flat candidate results table where every hyperparameter is its own column (no JSON ``params`` blob)."""
     cv_res = getattr(search_or_results, "cv_results_", search_or_results)
     if not cv_res:
         return pd.DataFrame()
     df = pd.DataFrame(cv_res)
+
+    # Drop any sklearn 'param_*' duplicate columns when 'params' is present, then expand 'params' into clean columns
+    param_prefixed = [c for c in df.columns if c.startswith("param_")]
     if "params" in df.columns:
-        p_df = pd.json_normalize(df["params"]).rename(columns=lambda c: c.replace("estimator__", ""))
-        df = pd.concat([df.drop(columns=["params"]), p_df], axis=1)
+        p_df = pd.DataFrame(list(df["params"])).rename(
+            columns=lambda c: c[len("estimator__"):] if str(c).startswith("estimator__") else str(c)
+        )
+        drop_cols = ["params"] + [c for c in param_prefixed if c[len("param_"):].replace("estimator__", "") in p_df.columns or c in p_df.columns]
+        df = pd.concat([df.drop(columns=drop_cols), p_df], axis=1)
+    elif param_prefixed:
+        df = df.rename(columns={
+            c: (c[len("param_estimator__"):] if c.startswith("param_estimator__") else c[len("param_"):])
+            for c in param_prefixed
+        })
+
+    # Remove duplicate columns if both param_* and normalized keys existed
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+    df.insert(0, "candidate_id", np.arange(len(df), dtype=int))
+
     if "rank_test_qwk" in df.columns:
         df = df.sort_values("rank_test_qwk", kind="stable").reset_index(drop=True)
     elif "rank_test_score" in df.columns:
@@ -3812,7 +5318,22 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
         df = df.sort_values("mean_test_qwk", ascending=False, kind="stable").reset_index(drop=True)
     elif "mean_test_score" in df.columns:
         df = df.sort_values("mean_test_score", ascending=False, kind="stable").reset_index(drop=True)
-    return df
+
+    # Order metric columns first, followed by all individual hyperparameter columns
+    metric_priority = [
+        "candidate_id", "rank_test_qwk", "rank_test_score",
+        "mean_test_qwk", "std_test_qwk", "mean_test_accuracy_pct", "std_test_accuracy_pct",
+        "mean_test_score", "std_test_score", "mean_fit_time", "std_fit_time",
+    ]
+    split_cols = sorted(
+        [c for c in df.columns if c.startswith("split") and ("_test_" in c or "_train_" in c)],
+        key=lambda s: (int(s[len("split"):].split("_", 1)[0]) if s[len("split"):].split("_", 1)[0].isdigit() else 999, s),
+    )
+    meta_cols = [c for c in ("validation_mode", "search_mode", "best_cv_qwk", "holdout_qwk", "holdout_normal_score_pct") if c in df.columns]
+    front = [c for c in metric_priority if c in df.columns] + split_cols + meta_cols
+    seen_front = set(front)
+    param_cols = [c for c in df.columns if c not in seen_front]
+    return df[front + param_cols]
 
 
 def split_stratified_protocol(
@@ -3962,9 +5483,15 @@ def run_validation_searches(
 
         exp_path_str: Optional[str] = None
         summary_path_str: Optional[str] = None
+        cv_df = build_quick_results_df(run_search)
+        if len(cv_df) > 0:
+            cv_df["validation_mode"] = v_mode
+            cv_df["search_mode"] = search_mode
+            cv_df["best_cv_qwk"] = best_score
+            cv_df["holdout_qwk"] = eval_res.get("competition_score", np.nan)
+            cv_df["holdout_normal_score_pct"] = eval_res.get("accuracy_pct", np.nan)
         if out_dir is not None:
             out_dir.mkdir(parents=True, exist_ok=True)
-            cv_df = build_quick_results_df(run_search)
             exp_csv = out_dir / f"{prefix}{experiment_name}_{v_mode}_{search_mode}_cv.csv"
             cv_df.to_csv(exp_csv, index=False)
 
@@ -3992,6 +5519,7 @@ def run_validation_searches(
             "best_cv_accuracy_pct": best_acc_pct,
             "best_cv_qwk": best_score,
             "fold_scores_df": fold_df,
+            "candidates_df": cv_df,
             "X_train": X_train,
             "y_train": y_train,
             "X_test": X_test,
@@ -4004,6 +5532,201 @@ def run_validation_searches(
     return {
         "last_run": last_run,
         "protocol_results": protocol_results,
+        "candidates_df": last_run.get("candidates_df", pd.DataFrame()),
+        "experiments_df": last_run.get("candidates_df", pd.DataFrame()),
         "experiments_path": last_run.get("experiments_path"),
         "summary_path": last_run.get("summary_path"),
     }
+
+
+def compute_permutation_importance(
+    estimator: Any,
+    X: pd.DataFrame,
+    y: Any,
+    *,
+    repeats: int = 3,
+    random_state: int = 42,
+    include_noop_individual: bool = True,
+    require_internal_validation: bool = True,
+    output_dir: Optional[Any] = None,
+    prefix: str = "permutation_importance",
+) -> pd.DataFrame:
+    """Compute trained-model permutation importance across feature families, handcrafted domain terms & NOOP features.
+
+    Mirrors ``multi-branch_version_3.ipynb`` / ``utils_v3.py``:
+    - Evaluates on internal ``validation_sequence_ids_`` when ``require_internal_validation=True`` and present,
+      otherwise on the provided ``(X, y)`` table.
+    - Permutes coherent feature families (`clinical_tabular`, `autocorr_circadian`, `sleep_architecture`,
+      `stft_wavelet_spectral`, `seglearn_kinematic`, `static_open_source`, `noop_all`), individual handcrafted
+      terms (`term_*`), and individual `noop_*` / top ANOVA-selected static features.
+    - Populates ``importance_df.attrs`` (`scope`, `baseline_macro_f1`, `baseline_qwk`, `permutable_fraction`, `paths`)
+      and optionally exports CSV, JSON, and PNG plot to ``output_dir``.
+    """
+    est = estimator.named_steps["estimator"] if hasattr(estimator, "named_steps") and "estimator" in estimator.named_steps else estimator
+    ext = getattr(est, "extractor_", None) or est._get_extractor()
+
+    y_ser = y[TARGET_COL] if isinstance(y, pd.DataFrame) and TARGET_COL in y.columns else pd.Series(np.asarray(y).ravel(), index=X.index)
+    val_ids = getattr(est, "validation_sequence_ids_", np.asarray([]))
+    scope_name = "provided_split"
+    if bool(require_internal_validation) and len(val_ids) > 0 and ID_COL in X.columns:
+        val_mask = X[ID_COL].astype(str).isin(set(map(str, val_ids))).to_numpy()
+        if int(val_mask.sum()) >= 5:
+            X_eval = X.loc[val_mask].reset_index(drop=True)
+            y_eval = np.asarray(y_ser.loc[val_mask], dtype=np.int64).ravel()
+            scope_name = f"internal_validation (n={len(X_eval)})"
+        else:
+            X_eval = X.reset_index(drop=True)
+            y_eval = np.asarray(y_ser, dtype=np.int64).ravel()
+    else:
+        X_eval = X.reset_index(drop=True)
+        y_eval = np.asarray(y_ser, dtype=np.int64).ravel()
+
+    feat_df = ext.transform(strip_leaky_columns(X_eval))
+
+    def _predict_from_feat_df(F_in: pd.DataFrame) -> np.ndarray:
+        terms = est._build_domain_terms(F_in)
+        z_mat = np.full((len(terms), len(est.term_names_)), np.nan, dtype=np.float64)
+        for j, col in enumerate(est.term_names_):
+            v = terms[col].to_numpy(dtype=np.float64)
+            fin = np.isfinite(v)
+            z_mat[:, j] = np.where(fin, np.clip((v - est.term_means_[col]) / est.term_stds_[col], -4.0, 4.0), np.nan)
+        scores = est._evaluate_handcrafted_scores(z_mat)
+        return apply_thresholds(scores, est.thresholds_)
+
+    base_preds = _predict_from_feat_df(feat_df)
+    base_qwk = float(competition_score(y_eval, base_preds))
+    base_f1 = float(f1_score(y_eval, base_preds, average="macro", zero_division=0))
+
+    all_cols = list(feat_df.columns)
+    groups: List[Tuple[str, str, List[str]]] = []
+
+    tab_cols = [c for c in all_cols if not str(c).startswith(("seq_", "noop_", "miss_"))]
+    acf_circ_cols = [c for c in all_cols if str(c).startswith(("seq_acf_", "seq_pacf_", "seq_m10_", "seq_sri", "seq_circ_", "seq_cosinor_", "seq_circadian_", "seq_stl_", "seq_lomb_"))]
+    lag_lead_cols = [c for c in all_cols if str(c).startswith(("seq_lag_", "seq_lead_", "seq_presleep_", "seq_day_lag1_", "seq_roll_"))]
+    sleep_cols = [c for c in all_cols if str(c).startswith(("seq_sadeh_", "seq_ck_", "seq_webster_", "seq_nat_", "seq_fod_", "seq_sib_", "seq_night_", "seq_upright_"))]
+    spec_wav_cols = [c for c in all_cols if str(c).startswith(("seq_stft_", "seq_welch_", "seq_spec_", "seq_cwt_", "seq_dwt_", "seq_rp_"))]
+    seg_branch_cols = [c for c in all_cols if str(c).startswith(("seq_seg_", "seq_br_", "seq_cusum_", "seq_prsa_"))]
+    static_lib_cols = [c for c in all_cols if str(c).startswith(("seq_tsfel_", "seq_tsfresh_", "seq_tsflex_", "seq_c22_"))]
+    noop_cols = [c for c in all_cols if str(c).startswith("noop_") or c in {"seq_sedentary_frac", "seq_sedentary_max_bout_h"}]
+
+    for g_name, cols in (
+        ("clinical_tabular", tab_cols),
+        ("autocorr_circadian", acf_circ_cols),
+        ("lag_lead_dynamics", lag_lead_cols),
+        ("sleep_architecture", sleep_cols),
+        ("stft_wavelet_spectral", spec_wav_cols),
+        ("seglearn_kinematic", seg_branch_cols),
+        ("static_open_source", static_lib_cols),
+        ("noop_all", noop_cols),
+    ):
+        if cols:
+            groups.append(("family", g_name, cols))
+
+    # Individual handcrafted domain terms (permuted directly in term space)
+    base_terms = est._build_domain_terms(feat_df)
+    for t_col in est.term_names_:
+        if t_col in base_terms.columns and base_terms[t_col].notna().any():
+            groups.append(("handcrafted_term", t_col, [t_col]))
+
+    if bool(include_noop_individual):
+        for nc in noop_cols:
+            if feat_df[nc].notna().sum() >= 2:
+                groups.append(("noop_feature", nc, [nc]))
+        for sc in getattr(est, "selected_static_cols_", [])[:15]:
+            if sc in feat_df.columns and feat_df[sc].notna().sum() >= 2:
+                groups.append(("selected_static", sc, [sc]))
+
+    rng = np.random.default_rng(int(random_state))
+    n_rep = max(1, int(repeats))
+    rows: List[Dict[str, Any]] = []
+    permuted_col_union: set = set()
+
+    for kind, label, cols in groups:
+        qwk_drops: List[float] = []
+        f1_drops: List[float] = []
+        perm_qwks: List[float] = []
+        if kind != "handcrafted_term":
+            permuted_col_union.update(cols)
+
+        for _ in range(n_rep):
+            perm_idx = rng.permutation(len(X_eval))
+            if kind == "handcrafted_term":
+                t_mod = base_terms.copy()
+                t_mod[label] = t_mod[label].to_numpy()[perm_idx]
+                z_mat = np.full((len(t_mod), len(est.term_names_)), np.nan, dtype=np.float64)
+                for j, col in enumerate(est.term_names_):
+                    v = t_mod[col].to_numpy(dtype=np.float64)
+                    fin = np.isfinite(v)
+                    z_mat[:, j] = np.where(fin, np.clip((v - est.term_means_[col]) / est.term_stds_[col], -4.0, 4.0), np.nan)
+                p_preds = apply_thresholds(est._evaluate_handcrafted_scores(z_mat), est.thresholds_)
+            else:
+                f_mod = feat_df.copy()
+                for c in cols:
+                    f_mod[c] = f_mod[c].to_numpy()[perm_idx]
+                p_preds = _predict_from_feat_df(f_mod)
+
+            p_qwk = float(competition_score(y_eval, p_preds))
+            p_f1 = float(f1_score(y_eval, p_preds, average="macro", zero_division=0))
+            perm_qwks.append(p_qwk)
+            qwk_drops.append(base_qwk - p_qwk)
+            f1_drops.append(base_f1 - p_f1)
+
+        rows.append({
+            "kind": kind,
+            "feature_or_group": label,
+            "n_columns": len(cols),
+            "importance_mean": float(np.mean(qwk_drops)),
+            "importance_std": float(np.std(qwk_drops)),
+            "qwk_drop_mean": float(np.mean(qwk_drops)),
+            "qwk_drop_std": float(np.std(qwk_drops)),
+            "macro_f1_drop_mean": float(np.mean(f1_drops)),
+            "permuted_qwk_mean": float(np.mean(perm_qwks)),
+            "baseline_qwk": base_qwk,
+        })
+
+    imp_df = pd.DataFrame(rows).sort_values("importance_mean", ascending=False, kind="stable").reset_index(drop=True)
+    saved_paths: Dict[str, str] = {}
+    if output_dir is not None:
+        out_p = Path(output_dir)
+        out_p.mkdir(parents=True, exist_ok=True)
+        csv_p = out_p / f"{prefix}.csv"
+        json_p = out_p / f"{prefix}.json"
+        png_p = out_p / f"{prefix}.png"
+        imp_df.to_csv(csv_p, index=False)
+        json_p.write_text(
+            json.dumps(
+                {
+                    "scope": scope_name,
+                    "baseline_qwk": base_qwk,
+                    "baseline_macro_f1": base_f1,
+                    "repeats": n_rep,
+                    "top_importances": imp_df.head(25).to_dict(orient="records"),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        saved_paths["csv"] = str(csv_p)
+        saved_paths["json"] = str(json_p)
+        try:
+            import matplotlib.pyplot as plt
+
+            top_plot = imp_df.head(18).iloc[::-1]
+            fig, ax = plt.subplots(figsize=(8.5, max(4.0, 0.32 * len(top_plot))))
+            ax.barh(top_plot["feature_or_group"], top_plot["importance_mean"], xerr=top_plot["importance_std"], color="#3b82f6", alpha=0.85)
+            ax.axvline(0.0, color="#64748b", linestyle="--", linewidth=1.0)
+            ax.set_xlabel("Permutation Importance (Competition QWK drop)")
+            ax.set_title(f"Trained-Model Permutation Importance ({scope_name})")
+            fig.tight_layout()
+            fig.savefig(png_p, dpi=140)
+            plt.close(fig)
+            saved_paths["png"] = str(png_p)
+        except Exception:
+            pass
+
+    imp_df.attrs["scope"] = scope_name
+    imp_df.attrs["baseline_qwk"] = base_qwk
+    imp_df.attrs["baseline_macro_f1"] = base_f1
+    imp_df.attrs["permutable_fraction"] = float(len(permuted_col_union) / max(len(all_cols), 1))
+    imp_df.attrs["paths"] = saved_paths
+    return imp_df
