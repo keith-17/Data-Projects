@@ -301,6 +301,7 @@ def find_data_root(local_dir: str = "Data", kaggle_root: str = "/kaggle/input") 
         cwd / "data",
         cwd.parent / "data",
         Path(kaggle_root) / "child-mind-institute-problematic-internet-use",
+        Path(kaggle_root) / "competitions" / "child-mind-institute-problematic-internet-use",
         Path(kaggle_root),
     ]
     for p in candidates:
