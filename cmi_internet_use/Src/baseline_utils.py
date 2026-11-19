@@ -28,10 +28,18 @@ Architectural & DSP lineage:
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import hashlib
+import json
 import os
+import pickle
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+try:
+    import joblib
+except ImportError:  # pragma: no cover
+    joblib = None
 
 import numpy as np
 import pandas as pd
@@ -48,9 +56,245 @@ SECONDS_PER_DAY: float = 86_400.0
 LEAKY_TARGET_COLS = ("sii", "PCIAT-Season", "PCIAT-PCIAT_Total")
 LEAKY_PREFIX = "PCIAT-"
 
-# Module-level deterministic caches keyed strictly by input + preprocessing signature.
-_GRID_CACHE: Dict[Tuple[Any, ...], Optional[Dict[str, Any]]] = {}
+# ---------------------------------------------------------------------------
+# Leakage-Safe Bounded In-Memory LRU + Optional Disk-Backed Cache Primitives
+# ---------------------------------------------------------------------------
+
+_CACHE_MISS = object()
+_NONE_SENTINEL: Dict[str, bool] = {"__cmi_none_sentinel__": True}
+
+
+def _is_none_sentinel(val: Any) -> bool:
+    return isinstance(val, dict) and val.get("__cmi_none_sentinel__") is True
+
+
+def _estimate_entry_nbytes(obj: Any) -> int:
+    """Estimate memory footprint (bytes) of cached array dicts, feature dicts, or sentinels."""
+    if obj is None or _is_none_sentinel(obj):
+        return 64
+    if isinstance(obj, np.ndarray):
+        return int(obj.nbytes) + 96
+    if isinstance(obj, dict):
+        total = 128
+        for k, v in obj.items():
+            total += len(str(k)) + 48
+            if isinstance(v, np.ndarray):
+                total += int(v.nbytes) + 96
+            else:
+                total += 32
+        return total
+    return 128
+
+
+def _freeze_cached_value(obj: Any) -> Any:
+    """Mark cached numpy arrays read-only so downstream callers never mutate shared buffers."""
+    if isinstance(obj, np.ndarray):
+        obj.setflags(write=False)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            if isinstance(v, np.ndarray):
+                v.setflags(write=False)
+            elif isinstance(v, (dict, list, tuple)):
+                _freeze_cached_value(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _freeze_cached_value(v)
+    return obj
+
+
+def _canonicalize_cache_obj(val: Any) -> Any:
+    """Convert nested key elements into deterministic JSON-serializable structures."""
+    if val is None or isinstance(val, (bool, str, int)):
+        return val
+    if isinstance(val, (np.bool_,)):
+        return bool(val)
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    if isinstance(val, (float, np.floating)):
+        fv = float(val)
+        return None if not np.isfinite(fv) else round(fv, 12)
+    if isinstance(val, Path):
+        return str(val)
+    if isinstance(val, (list, tuple)):
+        return [_canonicalize_cache_obj(v) for v in val]
+    if isinstance(val, set):
+        return sorted(_canonicalize_cache_obj(v) for v in val)
+    if isinstance(val, dict):
+        return [[str(k), _canonicalize_cache_obj(val[k])] for k in sorted(val.keys(), key=str)]
+    return repr(val)
+
+
+def _stable_cache_hash(key_tuple: Any) -> str:
+    """Compute a deterministic 32-char SHA-256 hex digest for cache keys."""
+    payload = json.dumps(_canonicalize_cache_obj(key_tuple), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _normalize_cache_dir(cache_dir: Optional[Any]) -> Optional[str]:
+    if cache_dir is None:
+        return None
+    txt = str(cache_dir).strip()
+    if not txt or txt.lower() in {"none", "null"}:
+        return None
+    return os.path.abspath(txt)
+
+
+def _normalize_series_path(parquet_path_or_df: Any) -> Optional[str]:
+    if parquet_path_or_df is None:
+        return None
+    if isinstance(parquet_path_or_df, (float, np.floating)) and not np.isfinite(parquet_path_or_df):
+        return None
+    if isinstance(parquet_path_or_df, pd.DataFrame):
+        return None
+    txt = str(parquet_path_or_df).strip()
+    if not txt or txt.lower() in {"none", "nan", "null"}:
+        return None
+    return os.path.abspath(txt)
+
+
+class BoundedDiskLRUCache:
+    """Bounded in-memory OrderedDict LRU cache with optional atomic disk-backed storage."""
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = 4000,
+        max_cache_mb: float = 512.0,
+        cache_dir: Optional[str] = None,
+        namespace: str = "cache",
+    ):
+        self.max_entries = max(1, int(max_entries))
+        self.max_bytes = max(1024 * 1024, int(round(float(max_cache_mb) * 1024.0 * 1024.0)))
+        self.cache_dir = _normalize_cache_dir(cache_dir)
+        self.namespace = str(namespace)
+        self._lru: "OrderedDict[Tuple[Any, ...], Tuple[Any, int]]" = OrderedDict()
+        self.current_bytes: int = 0
+        self.hits: int = 0
+        self.misses: int = 0
+        self.disk_hits: int = 0
+        self.evictions: int = 0
+
+    def _disk_path(self, key: Tuple[Any, ...]) -> Optional[Path]:
+        if self.cache_dir is None:
+            return None
+        digest = _stable_cache_hash(key)
+        ext = "joblib" if joblib is not None else "pkl"
+        return Path(self.cache_dir) / self.namespace / digest[:2] / f"{digest}.{ext}"
+
+    def _insert_memory(self, key: Tuple[Any, ...], stored_val: Any) -> None:
+        nbytes = _estimate_entry_nbytes(stored_val)
+        if key in self._lru:
+            _, old_bytes = self._lru.pop(key)
+            self.current_bytes = max(0, self.current_bytes - old_bytes)
+        while self._lru and (
+            len(self._lru) >= self.max_entries or (self.current_bytes + nbytes > self.max_bytes)
+        ):
+            _, (_, ev_bytes) = self._lru.popitem(last=False)
+            self.current_bytes = max(0, self.current_bytes - ev_bytes)
+            self.evictions += 1
+        self._lru[key] = (stored_val, nbytes)
+        self.current_bytes += nbytes
+
+    def get(self, key: Tuple[Any, ...]) -> Any:
+        entry = self._lru.get(key)
+        if entry is not None:
+            self._lru.move_to_end(key)
+            self.hits += 1
+            val = entry[0]
+            return None if _is_none_sentinel(val) else val
+
+        disk_p = self._disk_path(key)
+        if disk_p is not None and disk_p.exists():
+            try:
+                if joblib is not None:
+                    payload = joblib.load(disk_p)
+                else:
+                    with disk_p.open("rb") as fh:
+                        payload = pickle.load(fh)
+                if isinstance(payload, dict) and payload.get("key") == key:
+                    val = _freeze_cached_value(payload["value"])
+                    self._insert_memory(key, val)
+                    self.hits += 1
+                    self.disk_hits += 1
+                    return None if _is_none_sentinel(val) else val
+            except Exception:
+                pass
+
+        self.misses += 1
+        return _CACHE_MISS
+
+    def put(self, key: Tuple[Any, ...], value: Any) -> None:
+        stored_val = _NONE_SENTINEL if value is None else _freeze_cached_value(value)
+        disk_p = self._disk_path(key)
+        if disk_p is not None:
+            try:
+                disk_p.parent.mkdir(parents=True, exist_ok=True)
+                if not disk_p.exists():
+                    tmp_p = disk_p.with_name(f"{disk_p.name}.{os.getpid()}.tmp")
+                    payload = {"key": key, "value": stored_val}
+                    if joblib is not None:
+                        joblib.dump(payload, tmp_p, compress=0)
+                    else:
+                        with tmp_p.open("wb") as fh:
+                            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+                    os.replace(tmp_p, disk_p)
+            except Exception:
+                pass
+        self._insert_memory(key, stored_val)
+
+    def clear(self, *, clear_disk: bool = False) -> None:
+        self._lru.clear()
+        self.current_bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.disk_hits = 0
+        self.evictions = 0
+        if clear_disk and self.cache_dir is not None:
+            ns_dir = Path(self.cache_dir) / self.namespace
+            if ns_dir.exists():
+                import shutil
+                shutil.rmtree(ns_dir, ignore_errors=True)
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "entries": int(len(self._lru)),
+            "mb": round(float(self.current_bytes) / (1024.0 * 1024.0), 3),
+            "hits": int(self.hits),
+            "misses": int(self.misses),
+            "disk_hits": int(self.disk_hits),
+            "evictions": int(self.evictions),
+        }
+
+
+# Module-level bounded cache registries keyed by normalized cache config (never pickled on estimators).
+_RAW_GRID_CACHE_REGISTRY: Dict[Tuple[Optional[str], float], BoundedDiskLRUCache] = {}
 _HC_FEAT_CACHE: Dict[Tuple[Any, ...], pd.DataFrame] = {}
+
+
+def _get_raw_grid_cache(cache_dir: Optional[str] = None, max_cache_mb: float = 512.0) -> BoundedDiskLRUCache:
+    norm_dir = _normalize_cache_dir(cache_dir)
+    budget_mb = max(32.0, round(float(max_cache_mb), 2))
+    reg_key = (norm_dir, budget_mb)
+    cache = _RAW_GRID_CACHE_REGISTRY.get(reg_key)
+    if cache is None:
+        cache = BoundedDiskLRUCache(
+            max_entries=4000,
+            max_cache_mb=budget_mb,
+            cache_dir=norm_dir,
+            namespace="raw_grid",
+        )
+        _RAW_GRID_CACHE_REGISTRY[reg_key] = cache
+    return cache
+
+
+def clear_grid_cache(cache_dir: Optional[str] = None, *, clear_disk: bool = False) -> None:
+    """Clear bounded raw actigraphy grid caches (and handcrafted feature cache)."""
+    norm_dir = _normalize_cache_dir(cache_dir) if cache_dir is not None else None
+    for (c_dir, _), cache in list(_RAW_GRID_CACHE_REGISTRY.items()):
+        if cache_dir is None or c_dir == norm_dir:
+            cache.clear(clear_disk=clear_disk)
+    if cache_dir is None:
+        _HC_FEAT_CACHE.clear()
 
 DEFAULT_HANDCRAFTED_PARAMS: Dict[str, Any] = {
     "bin_minutes": 15,
@@ -1006,7 +1250,11 @@ def bin_actigraphy_series(
     non_wear_policy: str = "mask",
     min_bin_wear_frac: float = 0.25,
     clip_enmo: float = 4.0,
-) -> Optional[Dict[str, Any]]:
+    use_cache: bool = True,
+    cache_dir: Optional[str] = None,
+    max_cache_mb: float = 1024.0,
+    return_cache_hit: bool = False,
+) -> Any:
     """Aggregate 5-second actigraphy parquet onto a uniform multi-day grid.
 
     * Never collapses missing non-wear days onto adjacent worn timestamps (mirrors ``SleepDebt.swift``).
@@ -1017,30 +1265,41 @@ def bin_actigraphy_series(
     nw_pol = "keep_all" if (non_wear_policy is None or str(non_wear_policy).strip().lower() == "none") else str(non_wear_policy)
     clip_val = None if (clip_enmo is None or float(clip_enmo) <= 0.0) else float(clip_enmo)
 
+    def _ret(val: Optional[Dict[str, Any]], hit: bool) -> Any:
+        out_val = dict(val) if isinstance(val, dict) else val
+        return (out_val, hit) if return_cache_hit else out_val
+
+    raw_cache: Optional[BoundedDiskLRUCache] = None
     cache_key: Optional[Tuple[Any, ...]] = None
-    if isinstance(parquet_path_or_df, (str, Path)):
+    if bool(use_cache) and not isinstance(parquet_path_or_df, pd.DataFrame):
+        path_norm = _normalize_series_path(parquet_path_or_df)
         cache_key = (
-            str(parquet_path_or_df),
+            path_norm if path_norm is not None else "__MISSING__",
             int(bin_minutes),
             res_meth,
             nw_pol,
             round(float(min_bin_wear_frac), 4),
             round(clip_val, 4) if clip_val is not None else None,
         )
-        if cache_key in _GRID_CACHE:
-            return _GRID_CACHE[cache_key]
+        raw_cache = _get_raw_grid_cache(cache_dir=cache_dir, max_cache_mb=max(64.0, float(max_cache_mb) * 0.5))
+        cached = raw_cache.get(cache_key)
+        if cached is not _CACHE_MISS:
+            return _ret(cached, True)
+        if path_norm is None:
+            raw_cache.put(cache_key, None)
+            return _ret(None, False)
 
     arrs = _load_parquet_arrays(parquet_path_or_df)
     if arrs is None:
-        if cache_key is not None:
-            _GRID_CACHE[cache_key] = None
-        return None
+        if raw_cache is not None and cache_key is not None:
+            raw_cache.put(cache_key, None)
+        return _ret(None, False)
 
     n_raw = len(arrs["enmo"])
     if n_raw < 12:
-        if cache_key is not None:
-            _GRID_CACHE[cache_key] = None
-        return None
+        if raw_cache is not None and cache_key is not None:
+            raw_cache.put(cache_key, None)
+        return _ret(None, False)
 
     rel_day = arrs.get("relative_date_PCIAT")
     tod = arrs.get("time_of_day")
@@ -1051,9 +1310,9 @@ def bin_actigraphy_series(
 
     finite_t = np.isfinite(t_raw_sec)
     if not finite_t.any():
-        if cache_key is not None:
-            _GRID_CACHE[cache_key] = None
-        return None
+        if raw_cache is not None and cache_key is not None:
+            raw_cache.put(cache_key, None)
+        return _ret(None, False)
     if not finite_t.all():
         t_raw_sec = np.interp(np.arange(n_raw), np.flatnonzero(finite_t), t_raw_sec[finite_t])
 
@@ -1275,11 +1534,9 @@ def bin_actigraphy_series(
         "t_hours": t_hours,
         "weekday": weekday_bin,
     }
-    if cache_key is not None:
-        if len(_GRID_CACHE) > 2500:
-            _GRID_CACHE.clear()
-        _GRID_CACHE[cache_key] = grid
-    return grid
+    if raw_cache is not None and cache_key is not None:
+        raw_cache.put(cache_key, grid)
+    return _ret(grid, False)
 
 
 # ---------------------------------------------------------------------------

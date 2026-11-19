@@ -153,9 +153,15 @@ try:
         LEAKY_PREFIX,
         LEAKY_TARGET_COLS,
         RAW_ACTIGRAPHY_FS_HZ,
+        BoundedDiskLRUCache,
+        _CACHE_MISS,
+        _normalize_cache_dir,
+        _normalize_series_path,
+        _stable_cache_hash,
         apply_thresholds,
         bin_actigraphy_series,
         bounded_gap_fill,
+        clear_grid_cache,
         compute_circular_sleep_regularity,
         compute_cusum_volatility,
         compute_phillips_sri,
@@ -173,9 +179,15 @@ except ImportError:
         LEAKY_PREFIX,
         LEAKY_TARGET_COLS,
         RAW_ACTIGRAPHY_FS_HZ,
+        BoundedDiskLRUCache,
+        _CACHE_MISS,
+        _normalize_cache_dir,
+        _normalize_series_path,
+        _stable_cache_hash,
         apply_thresholds,
         bin_actigraphy_series,
         bounded_gap_fill,
+        clear_grid_cache,
         compute_circular_sleep_regularity,
         compute_cusum_volatility,
         compute_phillips_sri,
@@ -194,7 +206,62 @@ ID_COL = "id"
 TARGET_COL = "sii"
 PATH_COL = "series_path"
 
-_SEQ_FEATURE_CACHE: Dict[Tuple[Any, ...], Dict[str, float]] = {}
+
+class TwoTierActigraphyCache:
+    """Shared leakage-safe two-tier cache (Tier 1: binned grids, Tier 2: stateless subject features)."""
+
+    def __init__(
+        self,
+        *,
+        cache_dir: Optional[str] = None,
+        max_cache_mb: float = 1024.0,
+        max_bin_entries: int = 6000,
+        max_feat_entries: int = 64000,
+    ):
+        budget_mb = max(32.0, float(max_cache_mb))
+        self.cache_dir = _normalize_cache_dir(cache_dir)
+        self.max_cache_mb = budget_mb
+        self.tier1_bin = BoundedDiskLRUCache(
+            max_entries=max_bin_entries,
+            max_cache_mb=max(16.0, 0.8 * budget_mb),
+            cache_dir=self.cache_dir,
+            namespace="tier1_bin",
+        )
+        self.tier2_feat = BoundedDiskLRUCache(
+            max_entries=max_feat_entries,
+            max_cache_mb=max(8.0, 0.2 * budget_mb),
+            cache_dir=self.cache_dir,
+            namespace="tier2_feat",
+        )
+
+    def clear(self, *, clear_disk: bool = False) -> None:
+        self.tier1_bin.clear(clear_disk=clear_disk)
+        self.tier2_feat.clear(clear_disk=clear_disk)
+
+
+# Module-level shared registry keyed by (normalized_cache_dir, max_cache_mb); never stored on estimators
+# so sklearn clone(), get_params(), set_params(), and pickle stay fast and lightweight.
+_ACTIGRAPHY_CACHE_REGISTRY: Dict[Tuple[Optional[str], float], TwoTierActigraphyCache] = {}
+
+
+def _get_two_tier_cache(cache_dir: Optional[str] = None, max_cache_mb: float = 1024.0) -> TwoTierActigraphyCache:
+    norm_dir = _normalize_cache_dir(cache_dir)
+    budget_mb = max(32.0, round(float(max_cache_mb), 2))
+    reg_key = (norm_dir, budget_mb)
+    cache = _ACTIGRAPHY_CACHE_REGISTRY.get(reg_key)
+    if cache is None:
+        cache = TwoTierActigraphyCache(cache_dir=norm_dir, max_cache_mb=budget_mb)
+        _ACTIGRAPHY_CACHE_REGISTRY[reg_key] = cache
+    return cache
+
+
+def clear_actigraphy_caches(cache_dir: Optional[str] = None, *, clear_disk: bool = False) -> None:
+    """Clear shared Tier 1 binned grid, Tier 2 feature-family, and raw grid caches."""
+    norm_dir = _normalize_cache_dir(cache_dir) if cache_dir is not None else None
+    for (c_dir, _), cache in list(_ACTIGRAPHY_CACHE_REGISTRY.items()):
+        if cache_dir is None or c_dir == norm_dir:
+            cache.clear(clear_disk=clear_disk)
+    clear_grid_cache(cache_dir=cache_dir, clear_disk=clear_disk)
 
 
 class InvalidParams(ValueError):
@@ -804,44 +871,121 @@ class SignalCleaner(HoneycombBase):
         out["n_bins"] = int(len(out["mask"]))
         return out
 
-    def clean_series(self, parquet_path_or_df: Any) -> Optional[Dict[str, Any]]:
-        grid = bin_actigraphy_series(
+    def preprocessing_key(self) -> Tuple[Any, ...]:
+        """Return canonical 11-parameter Tier 1 preprocessing tuple affecting binning, cropping & gap fill."""
+        res_meth = (
+            "mean"
+            if (self.resample_method is None or str(self.resample_method).strip().lower() == "none")
+            else str(self.resample_method)
+        )
+        nw_pol = (
+            "keep_all"
+            if (self.non_wear_policy is None or str(self.non_wear_policy).strip().lower() == "none")
+            else str(self.non_wear_policy)
+        )
+        clip_val = None if (self.clip_enmo is None or float(self.clip_enmo) <= 0.0) else round(float(self.clip_enmo), 6)
+        max_days: Optional[float] = None
+        crop_mode = "none" if self.sequence_crop_mode is None else str(self.sequence_crop_mode).strip().lower()
+        if crop_mode != "none" and self.maxlen_days is not None:
+            try:
+                md = float(self.maxlen_days)
+                if np.isfinite(md) and md > 0:
+                    max_days = round(md, 6)
+            except (TypeError, ValueError):
+                max_days = None
+        eff_crop = crop_mode if max_days is not None else "none"
+        eff_mode = "diurnal_median" if nw_pol == "impute_diurnal" else (
+            "none" if self.interp_mode is None else str(self.interp_mode)
+        )
+        eff_long = bool(self.impute_long_gaps) or (nw_pol == "impute_diurnal")
+        return (
+            int(self.bin_minutes),
+            res_meth,
+            clip_val,
+            nw_pol,
+            round(float(self.min_bin_wear_frac), 6),
+            round(float(self.min_valid_wear_days), 6),
+            max_days,
+            eff_crop,
+            eff_mode,
+            int(self.max_gap_bins),
+            eff_long,
+        )
+
+    def build_preprocessed_grid(
+        self,
+        parquet_path_or_df: Any,
+        *,
+        subject_id: Optional[str] = None,
+        enable_cache: bool = True,
+        cache_dir: Optional[str] = None,
+        max_cache_mb: float = 1024.0,
+        stats_accum: Optional[Dict[str, int]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Tier 1 cached binning, cropping & gap-imputation (strictly per-subject, zero leakage)."""
+        is_df = isinstance(parquet_path_or_df, pd.DataFrame)
+        cache_on = bool(enable_cache) and not is_df
+        tier1_cache = None
+        tier1_key: Optional[Tuple[Any, ...]] = None
+        path_norm: Optional[str] = None
+
+        if cache_on:
+            path_norm = _normalize_series_path(parquet_path_or_df)
+            sid_key = str(subject_id) if subject_id is not None else (path_norm if path_norm is not None else "__MISSING__")
+            tier1_key = (
+                sid_key,
+                path_norm if path_norm is not None else "__MISSING__",
+                self.preprocessing_key(),
+            )
+            tier1_cache = _get_two_tier_cache(cache_dir=cache_dir, max_cache_mb=max_cache_mb).tier1_bin
+            cached_val = tier1_cache.get(tier1_key)
+            if cached_val is not _CACHE_MISS:
+                if stats_accum is not None:
+                    stats_accum["bin_hits"] = stats_accum.get("bin_hits", 0) + 1
+                    if cached_val is None:
+                        stats_accum["none_sentinel_hits"] = stats_accum.get("none_sentinel_hits", 0) + 1
+                return None if cached_val is None else dict(cached_val)
+
+            if stats_accum is not None:
+                stats_accum["bin_misses"] = stats_accum.get("bin_misses", 0) + 1
+            if path_norm is None:
+                tier1_cache.put(tier1_key, None)
+                return None
+        elif stats_accum is not None:
+            stats_accum["bin_misses"] = stats_accum.get("bin_misses", 0) + 1
+
+        grid, raw_hit = bin_actigraphy_series(
             parquet_path_or_df,
             bin_minutes=int(self.bin_minutes),
             resample_method=("none" if self.resample_method is None else str(self.resample_method)),
             non_wear_policy=("none" if self.non_wear_policy is None else str(self.non_wear_policy)),
             min_bin_wear_frac=float(self.min_bin_wear_frac),
             clip_enmo=(None if self.clip_enmo is None else float(self.clip_enmo)),
+            use_cache=cache_on,
+            cache_dir=cache_dir,
+            max_cache_mb=max_cache_mb,
+            return_cache_hit=True,
         )
+        if stats_accum is not None:
+            key_r = "raw_bin_hits" if raw_hit else "raw_bin_misses"
+            stats_accum[key_r] = stats_accum.get(key_r, 0) + 1
+
         if grid is None or not grid["mask"].any():
+            if tier1_cache is not None and tier1_key is not None:
+                tier1_cache.put(tier1_key, None)
             return None
 
         grid = self._crop_grid(grid)
         if not grid["mask"].any():
-            return None
-
-        # ProblematicSequenceFilter skew diagnostic across actigraphy channels
-        raw_m = np.asarray(grid["mask"], dtype=bool)
-        skew_thresh = float(self.ideal_skew_threshold) if self.ideal_skew_threshold is not None else 3.5
-        prob_thresh = max(1, int(self.problematic_features_threshold or 3))
-        skew_cnt = 0
-        for ch_key in ("enmo", "log_enmo", "dyn_amp", "anglez", "light", "battery_voltage"):
-            if ch_key in grid and isinstance(grid[ch_key], np.ndarray):
-                vals = grid[ch_key][raw_m & np.isfinite(grid[ch_key])]
-                if len(vals) >= 16:
-                    sd = float(np.std(vals))
-                    if sd > 1e-9:
-                        sk = abs(float(np.mean(((vals - float(np.mean(vals))) / sd) ** 3)))
-                        if sk > skew_thresh:
-                            skew_cnt += 1
-        grid["problematic_skew_count"] = int(skew_cnt)
-        grid["is_problematic_sequence"] = bool(skew_cnt >= prob_thresh)
-        if bool(self.filter_problematic_sequences) and grid["is_problematic_sequence"]:
+            if tier1_cache is not None and tier1_key is not None:
+                tier1_cache.put(tier1_key, None)
             return None
 
         bin_h = float(grid["bin_minutes"]) / 60.0
         wear_days = float(grid["mask"].sum()) * bin_h / 24.0
         if wear_days < float(self.min_valid_wear_days):
+            if tier1_cache is not None and tier1_key is not None:
+                tier1_cache.put(tier1_key, None)
             return None
 
         eff_mode = "diurnal_median" if self.non_wear_policy == "impute_diurnal" else str(self.interp_mode)
@@ -879,7 +1023,61 @@ class SignalCleaner(HoneycombBase):
         out["anglez_filled"] = ang_f
         out["dyn_amp_filled"] = dyn_f
         out["battery_filled"] = bat_f
-        return self._add_linear_motion(out)
+
+        if tier1_cache is not None and tier1_key is not None:
+            tier1_cache.put(tier1_key, out)
+            return dict(out)
+        return out
+
+    def apply_problematic_filter(self, grid: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Run ProblematicSequenceFilter skew diagnostic live (never cached)."""
+        out = dict(grid)
+        raw_m = np.asarray(out["mask"], dtype=bool)
+        skew_thresh = float(self.ideal_skew_threshold) if self.ideal_skew_threshold is not None else 3.5
+        prob_thresh = max(1, int(self.problematic_features_threshold or 3))
+        skew_cnt = 0
+        for ch_key in ("enmo", "log_enmo", "dyn_amp", "anglez", "light", "battery_voltage"):
+            if ch_key in out and isinstance(out[ch_key], np.ndarray):
+                vals = out[ch_key][raw_m & np.isfinite(out[ch_key])]
+                if len(vals) >= 16:
+                    sd = float(np.std(vals))
+                    if sd > 1e-9:
+                        sk = abs(float(np.mean(((vals - float(np.mean(vals))) / sd) ** 3)))
+                        if sk > skew_thresh:
+                            skew_cnt += 1
+        out["problematic_skew_count"] = int(skew_cnt)
+        out["is_problematic_sequence"] = bool(skew_cnt >= prob_thresh)
+        if bool(self.filter_problematic_sequences) and out["is_problematic_sequence"]:
+            return None
+        return out
+
+    def clean_series(
+        self,
+        parquet_path_or_df: Any,
+        *,
+        subject_id: Optional[str] = None,
+        enable_cache: bool = True,
+        cache_dir: Optional[str] = None,
+        max_cache_mb: float = 1024.0,
+        stats_accum: Optional[Dict[str, int]] = None,
+        add_linear_motion: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        out = self.build_preprocessed_grid(
+            parquet_path_or_df,
+            subject_id=subject_id,
+            enable_cache=enable_cache,
+            cache_dir=cache_dir,
+            max_cache_mb=max_cache_mb,
+            stats_accum=stats_accum,
+        )
+        if out is None:
+            return None
+        out = self.apply_problematic_filter(out)
+        if out is None:
+            return None
+        if add_linear_motion:
+            return self._add_linear_motion(out)
+        return out
 
 
 class MotionFilter(HoneycombBase):
@@ -2992,6 +3190,10 @@ DEFAULT_SEQUENCE_EXTRACTOR_PARAMS: Dict[str, Any] = {
     "add_missing_indicators": True,
     "impute_knn_neighbors": 5,
     "impute_max_iter": 10,
+    "enable_cache": True,
+    "enable_feature_cache": True,
+    "cache_dir": None,
+    "max_cache_mb": 1024.0,
     "use_cache": True,
 }
 
@@ -3098,6 +3300,10 @@ class SequenceExtractor(HoneycombBase):
         add_missing_indicators: bool = True,
         impute_knn_neighbors: int = 5,
         impute_max_iter: int = 10,
+        enable_cache: bool = True,
+        enable_feature_cache: bool = True,
+        cache_dir: Optional[str] = None,
+        max_cache_mb: float = 1024.0,
         use_cache: bool = True,
         id_col: str = ID_COL,
         path_col: str = PATH_COL,
@@ -3187,6 +3393,10 @@ class SequenceExtractor(HoneycombBase):
         self.add_missing_indicators = add_missing_indicators
         self.impute_knn_neighbors = impute_knn_neighbors
         self.impute_max_iter = impute_max_iter
+        self.enable_cache = enable_cache
+        self.enable_feature_cache = enable_feature_cache
+        self.cache_dir = cache_dir
+        self.max_cache_mb = max_cache_mb
         self.use_cache = use_cache
         self.id_col = id_col
         self.path_col = path_col
@@ -3313,13 +3523,98 @@ class SequenceExtractor(HoneycombBase):
         validate_sequence_extractor_params(self.get_params(deep=False))
         return self
 
-    def _extract_single_actigraphy(self, parquet_path_or_df: Any, families: set) -> Dict[str, float]:
+    def _is_cache_enabled(self) -> bool:
+        return bool(self.enable_cache) and bool(self.use_cache)
+
+    def _empty_call_stats(self, n_subjects: int = 0) -> Dict[str, Any]:
+        return {
+            "subjects": int(n_subjects),
+            "bin_hits": 0,
+            "bin_misses": 0,
+            "raw_bin_hits": 0,
+            "raw_bin_misses": 0,
+            "none_sentinel_hits": 0,
+            "feat_hits": 0,
+            "feat_misses": 0,
+        }
+
+    def cache_stats(self) -> Dict[str, Any]:
+        """Return per-call and shared-registry Tier 1 / Tier 2 cache statistics."""
+        last = dict(getattr(self, "_last_cache_stats_", self._empty_call_stats(0)))
+        cache_on = self._is_cache_enabled()
+        feat_on = cache_on and bool(self.enable_feature_cache)
+        reg = _get_two_tier_cache(cache_dir=self.cache_dir, max_cache_mb=self.max_cache_mb)
+        raw_reg = None
+        try:
+            from baseline_utils import _get_raw_grid_cache as _get_rg
+        except ImportError:
+            from Src.baseline_utils import _get_raw_grid_cache as _get_rg
+        raw_reg = _get_rg(cache_dir=self.cache_dir, max_cache_mb=max(64.0, float(self.max_cache_mb) * 0.5))
+
+        t1 = reg.tier1_bin.stats()
+        t2 = reg.tier2_feat.stats()
+        tr = raw_reg.stats()
+        b_tot = last["bin_hits"] + last["bin_misses"]
+        f_tot = last["feat_hits"] + last["feat_misses"]
+        last.update({
+            "enable_cache": cache_on,
+            "enable_feature_cache": feat_on,
+            "cache_dir": reg.cache_dir,
+            "bin_hit_rate": round(float(last["bin_hits"]) / float(b_tot), 4) if b_tot > 0 else 0.0,
+            "feat_hit_rate": round(float(last["feat_hits"]) / float(f_tot), 4) if f_tot > 0 else 0.0,
+            "tier1_entries": t1["entries"],
+            "tier1_mb": t1["mb"],
+            "tier1_disk_hits": t1["disk_hits"],
+            "tier1_evictions": t1["evictions"],
+            "tier2_entries": t2["entries"],
+            "tier2_mb": t2["mb"],
+            "tier2_disk_hits": t2["disk_hits"],
+            "tier2_evictions": t2["evictions"],
+            "raw_grid_entries": tr["entries"],
+            "raw_grid_mb": tr["mb"],
+        })
+        return last
+
+    def format_cache_log(self, elapsed_s: Optional[float] = None) -> str:
+        """Return concise one-line cache hit/miss log suitable for candidate fit output."""
+        st = self.cache_stats()
+        b_tot = st["bin_hits"] + st["bin_misses"]
+        f_tot = st["feat_hits"] + st["feat_misses"]
+        b_pct = 100.0 * float(st["bin_hits"]) / float(b_tot) if b_tot > 0 else 0.0
+        f_pct = 100.0 * float(st["feat_hits"]) / float(f_tot) if f_tot > 0 else 0.0
+        prefix = "[Cache]" if st["enable_cache"] else "[Cache OFF]"
+        parts = [f"bin_hits={st['bin_hits']}/{b_tot} ({b_pct:.1f}%)"]
+        if f_tot > 0:
+            parts.append(f"feat_hits={st['feat_hits']}/{f_tot} ({f_pct:.1f}%)")
+        if st["cache_dir"]:
+            parts.append(f"disk_hits=T1:{st['tier1_disk_hits']}/T2:{st['tier2_disk_hits']}")
+        if elapsed_s is not None:
+            parts.append(f"ext={float(elapsed_s):.2f}s")
+        return f"{prefix} " + " | ".join(parts)
+
+    def _extract_single_actigraphy(
+        self,
+        parquet_path_or_df: Any,
+        families: set,
+        *,
+        subject_id: Optional[str] = None,
+        stats_accum: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, float]:
         row: Dict[str, float] = {
             "seq_has_actigraphy": 0.0,
             "seq_missing_bin_frac": 1.0,
             "seq_imputed_bin_frac": 0.0,
         }
-        clean_grid = self.cleaner.clean_series(parquet_path_or_df)
+        cache_on = self._is_cache_enabled()
+        clean_grid = self.cleaner.clean_series(
+            parquet_path_or_df,
+            subject_id=subject_id,
+            enable_cache=cache_on,
+            cache_dir=self.cache_dir,
+            max_cache_mb=float(self.max_cache_mb),
+            stats_accum=stats_accum,
+            add_linear_motion=False,
+        )
         if clean_grid is None or int(clean_grid["mask"].sum()) < 16:
             return row
 
@@ -3347,52 +3642,267 @@ class SequenceExtractor(HoneycombBase):
         if not families:
             return row
 
-        grid = self.motion_filter.transform_grid(clean_grid)
-        branches, br_feats = self.branch_extractor.build_and_summarize(grid)
+        is_df = isinstance(parquet_path_or_df, pd.DataFrame)
+        feat_cache_on = cache_on and bool(self.enable_feature_cache) and not is_df
+        tier2_cache = None
+        sid_key = None
+        path_norm = None
+        preproc_hash = None
+        if feat_cache_on:
+            tier2_cache = _get_two_tier_cache(cache_dir=self.cache_dir, max_cache_mb=float(self.max_cache_mb)).tier2_feat
+            path_norm = _normalize_series_path(parquet_path_or_df) or "__MISSING__"
+            sid_key = str(subject_id) if subject_id is not None else path_norm
+            preproc_hash = _stable_cache_hash(self.cleaner.preprocessing_key())
+
+        lin_key = (
+            "none" if self.linear_acc_mode is None else str(self.linear_acc_mode),
+            int(self.baseline_window_bins),
+            round(float(self.highpass_hz), 12),
+        )
+        kalman_key = (
+            "none" if self.motion_filter_mode is None else str(self.motion_filter_mode),
+            round(float(self.kalman_process_noise), 12),
+            round(float(self.kalman_measurement_noise), 12),
+        )
+        motion_key = kalman_key + (bool(self.use_dead_reckoning), bool(self.dead_reckoning_detrend))
+
+        lazy_state: Dict[str, Any] = {}
+
+        def _get_lin_grid() -> Dict[str, Any]:
+            if "lin_grid" not in lazy_state:
+                lazy_state["lin_grid"] = self.cleaner._add_linear_motion(dict(clean_grid))
+            return lazy_state["lin_grid"]
+
+        def _get_motion_grid() -> Dict[str, Any]:
+            if "motion_grid" not in lazy_state:
+                lazy_state["motion_grid"] = self.motion_filter.transform_grid(_get_lin_grid())
+            return lazy_state["motion_grid"]
+
+        def _get_branches() -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
+            if "branches" not in lazy_state:
+                lazy_state["branches"] = self.branch_extractor.build_and_summarize(_get_motion_grid())
+            return lazy_state["branches"]
+
+        def _run_family(family_name: str, family_params: Any, compute_fn) -> Dict[str, float]:
+            if tier2_cache is None:
+                return compute_fn()
+            fam_hash = _stable_cache_hash(family_params)
+            t2_key = (sid_key, path_norm, preproc_hash, family_name, fam_hash)
+            cached = tier2_cache.get(t2_key)
+            if cached is not _CACHE_MISS:
+                if stats_accum is not None:
+                    stats_accum["feat_hits"] = stats_accum.get("feat_hits", 0) + 1
+                return dict(cached)
+            if stats_accum is not None:
+                stats_accum["feat_misses"] = stats_accum.get("feat_misses", 0) + 1
+            res = compute_fn()
+            tier2_cache.put(t2_key, res)
+            return dict(res)
 
         if "compliance" in families:
-            row["seq_wear_days"] = float(n_valid * bin_h / 24.0)
-            row["seq_wear_frac"] = float(grid["raw_wear_frac"])
-            row["seq_bin_span_days"] = float(grid["n_bins"] * bin_h / 24.0)
-            wd_ok = raw_m & np.isfinite(grid["weekday"])
-            row["seq_weekend_wear_frac"] = float(np.mean(grid["weekday"][wd_ok] >= 6)) if wd_ok.any() else np.nan
-            hod = grid["hour_of_day"]
-            night_slots = (hod >= 22.0) | (hod < 6.0)
-            row["seq_night_wear_frac"] = float(np.mean(raw_m[night_slots])) if night_slots.any() else np.nan
+            def _comp() -> Dict[str, float]:
+                wd_ok = raw_m & np.isfinite(clean_grid["weekday"])
+                hod = clean_grid["hour_of_day"]
+                night_slots = (hod >= 22.0) | (hod < 6.0)
+                return {
+                    "seq_wear_days": float(n_valid * bin_h / 24.0),
+                    "seq_wear_frac": float(clean_grid["raw_wear_frac"]),
+                    "seq_bin_span_days": float(clean_grid["n_bins"] * bin_h / 24.0),
+                    "seq_weekend_wear_frac": float(np.mean(clean_grid["weekday"][wd_ok] >= 6)) if wd_ok.any() else np.nan,
+                    "seq_night_wear_frac": float(np.mean(raw_m[night_slots])) if night_slots.any() else np.nan,
+                }
+            row.update(_run_family("compliance", (), _comp))
 
         if "branches" in families:
-            row.update(br_feats)
+            br_params = (
+                "none" if self.acc_modes is None else str(self.acc_modes),
+                int(self.smooth_window_bins),
+                _structured(self.smooth_alpha),
+                str(self.branch_extractor.branch_stats),
+                int(self.dc_offset_bins),
+                lin_key,
+                motion_key,
+            )
+            row.update(_run_family("branches", br_params, lambda: _get_branches()[1]))
+
         if "autocorr" in families:
-            row.update(self.autocorr_sm_extractor.extract(grid))
+            ac_params = (
+                "none" if self.acf_detrend is None else str(self.acf_detrend),
+                str(self.acf_bias),
+                _structured(self.short_lags_h),
+                _structured(self.period_band_hours),
+                round(float(self.fundamental_ratio), 6),
+                round(float(self.min_acf_strength), 6),
+                round(float(self.sedentary_threshold_g), 6),
+            )
+            row.update(_run_family("autocorr", ac_params, lambda: self.autocorr_sm_extractor.extract(clean_grid)))
+
         if "lag_lead" in families:
-            row.update(self.lag_lead_extractor.extract(grid))
-        if "circadian" in families:
-            row.update(self.sleep_sri_extractor.extract(grid))
-        if "sleep_arch" in families:
-            row.update(self.sleep_arch_extractor.extract(grid))
-        if "motion" in families:
-            row.update(self.noop_extractor.extract(grid))
-        if "prsa_cusum" in families:
-            row.update(self.prsa_cusum_extractor.extract(grid))
-        if "spectral" in families or "stft" in families:
-            row.update(self.stft_welch_extractor.extract(grid))
-        if "wavelet" in families:
-            row.update(self.wavelet_rec_extractor.extract(grid))
-        if "seglearn" in families:
-            row.update(self.seglearn_extractor.extract(grid, branches))
-        if "catch22" in families:
-            row.update(self.catch22_extractor.extract(grid))
-        if "tsfel" in families or "tsfresh" in families:
+            ll_ch = "none" if self.lag_lead_channels is None else str(self.lag_lead_channels)
+            ll_params = (
+                self.include_lags,
+                self.include_leads,
+                self.include_rolling,
+                _structured(self.lag_lead_hours),
+                _structured(self.rolling_window_hours),
+                ll_ch,
+                round(float(self.sedentary_threshold_g), 6),
+                lin_key if "lin_enmo" in ll_ch else None,
+            )
             row.update(
-                self.tsfel_extractor.extract(
-                    grid,
-                    branches,
-                    run_tsfel=("tsfel" in families),
-                    run_tsfresh=("tsfresh" in families),
+                _run_family(
+                    "lag_lead",
+                    ll_params,
+                    lambda: self.lag_lead_extractor.extract(_get_lin_grid() if "lin_enmo" in ll_ch else clean_grid),
                 )
             )
+
+        if "circadian" in families:
+            row.update(_run_family("circadian", (), lambda: self.sleep_sri_extractor.extract(clean_grid)))
+
+        if "sleep_arch" in families:
+            sa_params = (
+                tuple(self.sleep_arch_extractor.fau_windows),
+                tuple(self.sleep_arch_extractor.nat_thresholds_g),
+            )
+            row.update(_run_family("sleep_arch", sa_params, lambda: self.sleep_arch_extractor.extract(clean_grid)))
+
+        if "motion" in families:
+            noop_obj = self.noop_extractor.noop
+            noop_sig = str(getattr(noop_obj, "signal", "") or "").strip().lower()
+            noop_items = tuple(sorted((k, _structured(v)) for k, v in noop_obj.get_params(deep=True).items())) if noop_obj is not None else ()
+            mo_params = (
+                round(float(self.sedentary_threshold_g), 6),
+                noop_items,
+                lin_key if noop_sig == "linear" else None,
+            )
+            row.update(
+                _run_family(
+                    "motion",
+                    mo_params,
+                    lambda: self.noop_extractor.extract(_get_lin_grid() if noop_sig == "linear" else clean_grid),
+                )
+            )
+
+        if "prsa_cusum" in families:
+            pc_params = (
+                int(self.prsa_cusum_extractor.prsa_l),
+                float(self.prsa_cusum_extractor.anchor_ratio_cap),
+                float(self.prsa_cusum_extractor.cusum_k),
+                float(self.prsa_cusum_extractor.cusum_h),
+            )
+            row.update(_run_family("prsa_cusum", pc_params, lambda: self.prsa_cusum_extractor.extract(clean_grid)))
+
+        if "spectral" in families or "stft" in families:
+            stft_params = (
+                float(self.stft_window_days),
+                float(self.stft_overlap_ratio),
+                "none" if self.stft_window_type is None else str(self.stft_window_type),
+                "psd" if self.stft_scaling is None else str(self.stft_scaling),
+                "none" if self.stft_detrend is None else str(self.stft_detrend),
+                int(self.spectral_moment_max_peaks),
+                int(self.max_gap_bins),
+            )
+            row.update(_run_family("stft_spectral", stft_params, lambda: self.stft_welch_extractor.extract(clean_grid)))
+
+        if "wavelet" in families:
+            wav_params = (
+                "none" if self.cwt_wavelet is None else str(self.cwt_wavelet),
+                int(self.cwt_n_scales),
+                float(self.cwt_min_period_h),
+                float(self.cwt_max_period_h),
+                "none" if self.dwt_wavelet is None else str(self.dwt_wavelet),
+                int(self.dwt_level),
+            )
+            row.update(_run_family("wavelet", wav_params, lambda: self.wavelet_rec_extractor.extract(clean_grid)))
+
+        if "seglearn" in families:
+            seg_params = (
+                float(self.seglearn_window_days),
+                float(self.seglearn_overlap),
+                "none" if self.seglearn_feature_set is None else str(self.seglearn_feature_set),
+                lin_key,
+            )
+            row.update(_run_family("seglearn", seg_params, lambda: self.seglearn_extractor.extract(_get_lin_grid(), {})))
+
+        if "catch22" in families:
+            c22_ch = "none" if self.catch22_channels is None else str(self.catch22_channels)
+            c22_params = (
+                bool(self.catch22_catch24),
+                c22_ch,
+                lin_key if "lin_enmo" in c22_ch else None,
+            )
+            row.update(
+                _run_family(
+                    "catch22",
+                    c22_params,
+                    lambda: self.catch22_extractor.extract(_get_lin_grid() if "lin_enmo" in c22_ch else clean_grid),
+                )
+            )
+
+        if "tsfel" in families or "tsfresh" in families:
+            st_ch = "none" if self.static_channels is None else str(self.static_channels)
+            st_bk = "none" if self.static_backend is None else str(self.static_backend)
+            need_lin = "lin_enmo" in st_ch
+            need_kal = "enmo_kalman" in st_ch
+
+            def _static_grid() -> Dict[str, Any]:
+                if need_kal:
+                    return _get_motion_grid()
+                if need_lin:
+                    return _get_lin_grid()
+                return clean_grid
+
+            if "tsfel" in families:
+                tsfel_params = (
+                    st_bk,
+                    "none" if self.tsfel_domains is None else str(self.tsfel_domains),
+                    _structured(self.tsfel_features),
+                    st_ch,
+                    lin_key if need_lin else None,
+                    kalman_key if need_kal else None,
+                )
+                row.update(
+                    _run_family(
+                        "tsfel",
+                        tsfel_params,
+                        lambda: self.tsfel_extractor.extract(_static_grid(), {}, run_tsfel=True, run_tsfresh=False),
+                    )
+                )
+
+            if "tsfresh" in families:
+                tsfresh_params = (
+                    st_bk,
+                    "none" if self.tsfresh_profile is None else str(self.tsfresh_profile),
+                    _structured(self.tsfresh_fft_bands),
+                    st_ch,
+                    lin_key if need_lin else None,
+                    kalman_key if need_kal else None,
+                )
+                row.update(
+                    _run_family(
+                        "tsfresh",
+                        tsfresh_params,
+                        lambda: self.tsfel_extractor.extract(_static_grid(), {}, run_tsfel=False, run_tsfresh=True),
+                    )
+                )
+
         if "tsflex" in families:
-            row.update(self.tsflex_extractor.extract(grid))
+            tf_ch = "none" if self.tsflex_channels is None else str(self.tsflex_channels)
+            tf_params = (
+                _structured(self.tsflex_windows),
+                str(self.tsflex_strides),
+                tf_ch,
+                lin_key if "lin_enmo" in tf_ch else None,
+            )
+            row.update(
+                _run_family(
+                    "tsflex",
+                    tf_params,
+                    lambda: self.tsflex_extractor.extract(_get_lin_grid() if "lin_enmo" in tf_ch else clean_grid),
+                )
+            )
+
         return row
 
     def select_finetuning_sequences(self, X: pd.DataFrame, y: Any = None) -> pd.DataFrame:
@@ -3552,7 +4062,6 @@ class SequenceExtractor(HoneycombBase):
     def _extract_raw_blocks(self, X: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         self.validate()
         self._rebuild_components()
-        cfg_sig = self._cfg_signature()
         families = _pipe_modes(
             self.feature_families,
             (
@@ -3564,18 +4073,12 @@ class SequenceExtractor(HoneycombBase):
         )
         ids = X[self.id_col].astype(str).tolist() if self.id_col in X.columns else list(map(str, range(len(X))))
         paths = X[self.path_col].tolist() if self.path_col in X.columns else [None] * len(X)
+        call_stats = self._empty_call_stats(len(ids))
         seq_rows: List[Dict[str, float]] = []
         for sid, p in zip(ids, paths):
-            row_key = (sid, str(p), cfg_sig)
-            if bool(self.use_cache) and isinstance(p, (str, Path)) and row_key in _SEQ_FEATURE_CACHE:
-                seq_rows.append(_SEQ_FEATURE_CACHE[row_key])
-                continue
-            r = self._extract_single_actigraphy(p, families)
-            if bool(self.use_cache) and isinstance(p, (str, Path)):
-                if len(_SEQ_FEATURE_CACHE) > 8000:
-                    _SEQ_FEATURE_CACHE.clear()
-                _SEQ_FEATURE_CACHE[row_key] = r
+            r = self._extract_single_actigraphy(p, families, subject_id=sid, stats_accum=call_stats)
             seq_rows.append(r)
+        self._last_cache_stats_ = call_stats
 
         seq_df = pd.DataFrame(seq_rows, index=X.index, dtype=np.float64)
         tab_df = self._build_tabular_block(
@@ -3590,7 +4093,8 @@ class SequenceExtractor(HoneycombBase):
             k: repr(_structured(v))
             for k, v in sorted(self.get_params(deep=True).items())
             if k not in {
-                "use_cache", "chunk_window_days", "chunk_overlap", "max_windows_per_sequence",
+                "use_cache", "enable_cache", "enable_feature_cache", "cache_dir", "max_cache_mb",
+                "chunk_window_days", "chunk_overlap", "max_windows_per_sequence",
                 "window_cap_policy", "final_window_mode",
                 "missing_feature_strategy", "add_missing_indicators", "impute_knn_neighbors", "impute_max_iter",
                 "feature_selection_method", "static_top_k", "feature_selection_percentile",
@@ -3682,15 +4186,19 @@ class SequenceExtractor(HoneycombBase):
             if c in keep_set or not str(c).startswith(("seq_tsfel_", "seq_tsfresh_", "seq_tsflex_", "seq_c22_"))
         ]
 
-    def fit(self, X: pd.DataFrame, y: Any = None):
+    def _fit_from_raw_blocks(
+        self,
+        X: pd.DataFrame,
+        tab_df: pd.DataFrame,
+        seq_df: pd.DataFrame,
+        y: Any = None,
+    ) -> "SequenceExtractor":
         """Fit training-fold outlier mask, feature selection, missing indicators, and imputation statistics."""
-        tab_df, seq_df = self._extract_raw_blocks(X)
         raw_pre = pd.concat([tab_df, seq_df], axis=1)
         support_mask = self._compute_outlier_support_mask(raw_pre.to_numpy(dtype=np.float64))
         self._fit_static_feature_selection(seq_df, y, support_mask=support_mask)
-        if getattr(self, "_kept_seq_cols_", None):
-            seq_df = seq_df.reindex(columns=self._kept_seq_cols_)
-        raw_df = pd.concat([tab_df, seq_df], axis=1)
+        seq_fit = seq_df.reindex(columns=self._kept_seq_cols_) if getattr(self, "_kept_seq_cols_", None) else seq_df
+        raw_df = pd.concat([tab_df, seq_fit], axis=1)
         self._base_feature_cols_ = list(raw_df.columns)
         self._tab_cols_ = list(tab_df.columns)
         self._miss_indicator_ = None
@@ -3774,9 +4282,12 @@ class SequenceExtractor(HoneycombBase):
         self._is_fitted_ = True
         return self
 
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Extract unified multi-library actigraphy + tabular features with optional leak-free imputation."""
-        tab_df, seq_df = self._extract_raw_blocks(X)
+    def _transform_from_raw_blocks(
+        self,
+        X: pd.DataFrame,
+        tab_df: pd.DataFrame,
+        seq_df: pd.DataFrame,
+    ) -> pd.DataFrame:
         if getattr(self, "_is_fitted_", False) and getattr(self, "_kept_seq_cols_", None):
             seq_df = seq_df.reindex(columns=self._kept_seq_cols_)
         raw_df = pd.concat([tab_df, seq_df], axis=1)
@@ -3850,6 +4361,22 @@ class SequenceExtractor(HoneycombBase):
                 blocks.append(ind_df)
         return pd.concat(blocks, axis=1)
 
+    def fit(self, X: pd.DataFrame, y: Any = None):
+        """Fit training-fold outlier mask, feature selection, missing indicators, and imputation statistics."""
+        tab_df, seq_df = self._extract_raw_blocks(X)
+        return self._fit_from_raw_blocks(X, tab_df, seq_df, y)
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Extract unified multi-library actigraphy + tabular features with optional leak-free imputation."""
+        tab_df, seq_df = self._extract_raw_blocks(X)
+        return self._transform_from_raw_blocks(X, tab_df, seq_df)
+
+    def fit_transform(self, X: pd.DataFrame, y: Any = None, **fit_params: Any) -> pd.DataFrame:
+        """Fit and transform in a single extraction pass (eliminating duplicate training extraction)."""
+        tab_df, seq_df = self._extract_raw_blocks(X)
+        self._fit_from_raw_blocks(X, tab_df, seq_df, y)
+        return self._transform_from_raw_blocks(X, tab_df, seq_df)
+
     def transform_chunks(self, X: pd.DataFrame) -> Dict[str, Any]:
         """Use ``seglearn.transform.Segment`` & ``PadTrunc`` to build sliding multi-day tensors ``(N, T, C)``."""
         self.validate()
@@ -3872,8 +4399,15 @@ class SequenceExtractor(HoneycombBase):
         ids = X[self.id_col].astype(str).tolist() if self.id_col in X.columns else list(map(str, range(len(X))))
         paths = X[self.path_col].tolist() if self.path_col in X.columns else [None] * len(X)
 
+        cache_on = self._is_cache_enabled()
         for sid, p in zip(ids, paths):
-            clean_g = self.cleaner.clean_series(p)
+            clean_g = self.cleaner.clean_series(
+                p,
+                subject_id=sid,
+                enable_cache=cache_on,
+                cache_dir=self.cache_dir,
+                max_cache_mb=float(self.max_cache_mb),
+            )
             if clean_g is None or not clean_g["mask_filled"].any():
                 continue
             g = self.motion_filter.transform_grid(clean_g)
@@ -4504,7 +5038,11 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
                 rng = np.random.default_rng(self.random_state)
                 aug_chunks = aug.augment_array(ch_res["chunks"], rng=rng)
                 self.augmented_chunk_count_ = int(aug_chunks.shape[0])
+        t_ext0 = time.perf_counter()
         feat_df = ext.fit_transform(strip_leaky_columns(X), y_arr)
+        t_ext = time.perf_counter() - t_ext0
+        if int(self.verbose or 0) >= 1:
+            print(f"  {ext.format_cache_log(elapsed_s=t_ext)}", flush=True)
         self.feature_names_in_ = list(feat_df.columns)
         support_mask = np.asarray(getattr(ext, "support_mask_", np.ones(len(X), dtype=bool)), dtype=bool)
         if len(support_mask) != len(X) or not support_mask.any():

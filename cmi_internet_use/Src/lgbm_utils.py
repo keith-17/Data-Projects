@@ -962,6 +962,8 @@ class LightGBMSequenceEstimator(BaseEstimator):
         X_clean = strip_leaky_columns(X)
         feat_df = ext.fit_transform(X_clean, y_arr)
         t_ext = time.perf_counter() - t_ext0
+        if v_lvl >= 1:
+            print(f"  {ext.format_cache_log(elapsed_s=t_ext)}", flush=True)
         self.feature_names_in_ = list(feat_df.columns)
         self.selected_static_cols_ = list(getattr(ext, "selected_static_cols_", []))
 
