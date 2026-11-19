@@ -1992,7 +1992,7 @@ class TsflexMultiScaleExtractor(HoneycombBase):
         )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            df_fl = fc.calculate(df_ts, return_df=True, show_progress=False)
+            df_fl = fc.calculate(df_ts, return_df=True, show_progress=False, n_jobs=1)
 
         out: Dict[str, float] = {}
         if isinstance(df_fl, pd.DataFrame) and len(df_fl) > 0:
