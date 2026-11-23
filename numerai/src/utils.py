@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -1385,6 +1386,173 @@ _ERROR_BIN_CONFIG: Dict[str, Any] = {
     "zero_tols": (0.01, 0.10),
     "abs_bins": (0.125, 0.375),
 }
+
+
+def infer_target_horizon_eras(target_col: str) -> int:
+    """Infer target settlement horizon in weekly eras from a Numerai target name (`_60` -> 12, `_4` -> 1, default/20d -> 4)."""
+    name = str(target_col or "target").strip().lower()
+    if name.endswith("_60"):
+        return 12
+    if name.endswith("_4"):
+        return 1
+    return 4
+
+
+def build_experiment_setup(
+    *,
+    target_col: str = "target",
+    feature_set: str = "small",
+    era_stride: int = 4,
+    model_tag: str = "baselines_ae",
+    baseline_mode: Optional[str] = None,
+    search_mode: str = "bayes",
+    eval_mode: str = "both",
+    n_splits: int = 1,
+    n_iter: int = 37,
+    n_jobs: int = -1,
+    save_results: bool = True,
+    workspace_root: Any = ".",
+    data_version: str = "v6.0",
+    era_tag: Optional[str] = None,
+    era_col: str = "era",
+    ticker_col: str = "numerai_ticker",
+    ticker_timeseries_features: Optional[str] = None,
+    ticker_rolling_windows: Tuple[int, ...] = (4, 12),
+    ticker_lag_steps: Optional[Tuple[int, ...]] = None,
+    data_folder: str = "data_folder",
+    kaggle_dataset: str = "svendaj/numerai-data-v6-0-unity",
+    cv_strategy: str = "timeseries",
+    train_size: float = 0.8,
+    target_horizon_eras: Optional[int] = None,
+    walk_forward_step_eras: int = 20,
+    walk_forward_window: str = "expanding",
+    era_weighting: Optional[str] = None,
+    recency_decay: float = 0.005,
+    random_state: int = 42,
+    verbose: int = 3,
+    error_score: float = -1.0,
+    export_diagnostics: bool = False,
+    error_bin_mode: str = "pct",
+    error_pct_bins: Tuple[float, float] = (5.0, 10.0),
+    error_zero_tols: Tuple[float, float] = (0.01, 0.10),
+    error_abs_bins: Tuple[float, float] = (0.125, 0.375),
+    extraction_cache_enabled: bool = True,
+    extraction_cache_max_entries: int = 16,
+    force_reload_data_cache: bool = False,
+    use_wandb: bool = False,
+    wandb_project: str = "numerai-baselines",
+    lgbm_n_jobs: int = -1,
+    lgbm_verbosity: int = -1,
+) -> Dict[str, Any]:
+    """Validate experiment knobs, auto-infer horizon/embargo, configure binning & caches, and return full Setup namespace."""
+    clean_search = str(search_mode).strip().lower()
+    clean_cv = str(cv_strategy).strip().lower()
+    clean_eval = str(eval_mode).strip().lower()
+    clean_wf_win = str(walk_forward_window).strip().lower()
+    clean_weight = str(era_weighting).strip().lower() if era_weighting is not None else None
+    clean_baseline = str(baseline_mode).strip().lower() if baseline_mode is not None else None
+
+    if clean_baseline is not None and clean_baseline not in ("baseline_a", "baseline_e", "persistence", "both", "all"):
+        raise ValueError("baseline_mode must be 'baseline_a', 'baseline_e', 'persistence', 'both', or 'all'")
+    if clean_search not in ("grid", "bayes"):
+        raise ValueError("search_mode must be 'grid' or 'bayes'")
+    if clean_cv != "timeseries":
+        raise ValueError("cv_strategy must be 'timeseries' (non-chronological CV strategies removed to prevent regime leakage)")
+    if clean_eval not in ("static", "walk_forward", "both"):
+        raise ValueError("eval_mode must be 'static', 'walk_forward', or 'both'")
+    if clean_wf_win not in ("expanding", "sliding"):
+        raise ValueError("walk_forward_window must be 'expanding' or 'sliding'")
+    if clean_weight not in (None, "equal_era", "recency_linear", "recency_exp"):
+        raise ValueError("era_weighting must be None, 'equal_era', 'recency_linear', or 'recency_exp'")
+
+    horizon = int(target_horizon_eras) if target_horizon_eras is not None else infer_target_horizon_eras(target_col)
+    embargo = int(np.ceil(horizon / max(1, int(era_stride))))
+    resolved_era_tag = era_tag if era_tag is not None else f"all_eras_stride{int(era_stride)}"
+    experiment_name = f"numerai_{data_version}_{resolved_era_tag}_{model_tag}"
+    results_dir = Path(workspace_root) / f"results_{experiment_name}_{target_col}_{clean_search}"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    configure_error_binning(
+        mode=error_bin_mode,
+        pct_bins=error_pct_bins,
+        zero_tols=error_zero_tols,
+        abs_bins=error_abs_bins,
+    )
+    try:
+        from baseline_utils import configure_extraction_cache
+
+        configure_extraction_cache(enabled=extraction_cache_enabled, max_entries=extraction_cache_max_entries)
+    except ImportError:
+        pass
+
+    validation_param_space = {
+        "validation_mode": [clean_cv],
+        "eval_mode": [clean_eval],
+        "group_column": [era_col],
+        "target_column": [target_col],
+        "target_horizon_eras": [horizon],
+        "era_stride": [int(era_stride)],
+        "embargo_eras": [embargo],
+    }
+
+    mode_str = f"baseline_mode={clean_baseline}" if clean_baseline is not None else f"model={model_tag}"
+    print(
+        f"Experiment: {experiment_name} | {mode_str} | search_mode={clean_search} | "
+        f"cv_strategy={clean_cv} | ERA_COL={era_col} | TARGET_COL={target_col} | "
+        f"horizon={horizon} | embargo={embargo}"
+    )
+
+    cfg: Dict[str, Any] = {
+        "data_version": data_version,
+        "era_tag": resolved_era_tag,
+        "model_tag": model_tag,
+        "experiment_name": experiment_name,
+        "ERA_COL": era_col,
+        "TICKER_COL": ticker_col,
+        "TARGET_COL": target_col,
+        "feature_set": feature_set,
+        "era_stride": int(era_stride),
+        "ticker_timeseries_features": ticker_timeseries_features,
+        "ticker_rolling_windows": ticker_rolling_windows,
+        "ticker_lag_steps": ticker_lag_steps,
+        "data_folder": data_folder,
+        "kaggle_dataset": kaggle_dataset,
+        "search_mode": clean_search,
+        "cv_strategy": clean_cv,
+        "n_splits": int(n_splits),
+        "train_size": float(train_size),
+        "target_horizon_eras": horizon,
+        "embargo_eras": embargo,
+        "eval_mode": clean_eval,
+        "walk_forward_step_eras": int(walk_forward_step_eras),
+        "walk_forward_window": clean_wf_win,
+        "era_weighting": clean_weight,
+        "recency_decay": float(recency_decay),
+        "random_state": int(random_state),
+        "n_iter": int(n_iter),
+        "verbose": int(verbose),
+        "error_score": float(error_score),
+        "n_jobs": int(n_jobs),
+        "save_results": bool(save_results),
+        "export_diagnostics": bool(export_diagnostics),
+        "error_bin_mode": str(error_bin_mode).strip().lower(),
+        "error_pct_bins": error_pct_bins,
+        "error_zero_tols": error_zero_tols,
+        "error_abs_bins": error_abs_bins,
+        "extraction_cache_enabled": bool(extraction_cache_enabled),
+        "extraction_cache_max_entries": int(extraction_cache_max_entries),
+        "force_reload_data_cache": bool(force_reload_data_cache),
+        "use_wandb": bool(use_wandb),
+        "wandb_project": wandb_project,
+        "lgbm_n_jobs": int(lgbm_n_jobs),
+        "lgbm_verbosity": int(lgbm_verbosity),
+        "results_dir": results_dir,
+        "timestamp": timestamp,
+        "VALIDATION_PARAM_SPACE": validation_param_space,
+    }
+    if clean_baseline is not None:
+        cfg["baseline_mode"] = clean_baseline
+    return cfg
 
 
 def configure_error_binning(
