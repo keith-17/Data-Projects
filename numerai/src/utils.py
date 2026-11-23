@@ -1499,6 +1499,9 @@ def infer_target_horizon_eras(target_col: str) -> int:
     return 4
 
 
+VALID_DOWNSAMPLE_MODES = (None, "within_era", "recent", "earliest", "uniform", "random_eras")
+
+
 def build_experiment_setup(
     *,
     target_col: str = "target",
@@ -1509,6 +1512,9 @@ def build_experiment_setup(
     search_mode: str = "bayes",
     eval_mode: str = "both",
     n_splits: int = 1,
+    cv_split: float = 0.8,
+    downsample_mode: Optional[str] = None,
+    downsample_frac: float = 1.0,
     n_iter: int = 37,
     n_jobs: int = -1,
     save_results: bool = True,
@@ -1523,7 +1529,6 @@ def build_experiment_setup(
     data_folder: str = "data_folder",
     kaggle_dataset: str = "svendaj/numerai-data-v6-0-unity",
     cv_strategy: str = "timeseries",
-    train_size: float = 0.8,
     target_horizon_eras: Optional[int] = None,
     walk_forward_step_eras: int = 20,
     walk_forward_window: str = "expanding",
@@ -1552,6 +1557,13 @@ def build_experiment_setup(
     clean_wf_win = str(walk_forward_window).strip().lower()
     clean_weight = str(era_weighting).strip().lower() if era_weighting is not None else None
     clean_baseline = str(baseline_mode).strip().lower() if baseline_mode is not None else None
+    clean_downsample_mode = (
+        None
+        if downsample_mode in (None, False, "None", "none", "null", "")
+        else str(downsample_mode).strip().lower()
+    )
+    cv_split_val = float(cv_split)
+    downsample_frac_val = float(downsample_frac)
 
     if clean_baseline is not None and clean_baseline not in ("baseline_a", "baseline_e", "persistence", "both", "all"):
         raise ValueError("baseline_mode must be 'baseline_a', 'baseline_e', 'persistence', 'both', or 'all'")
@@ -1559,6 +1571,14 @@ def build_experiment_setup(
         raise ValueError("search_mode must be 'grid' or 'bayes'")
     if clean_cv != "timeseries":
         raise ValueError("cv_strategy must be 'timeseries' (non-chronological CV strategies removed to prevent regime leakage)")
+    if not (0.0 < cv_split_val < 1.0):
+        raise ValueError(f"cv_split must be strictly in (0.0, 1.0), got {cv_split!r}")
+    if clean_downsample_mode not in VALID_DOWNSAMPLE_MODES:
+        raise ValueError(
+            f"downsample_mode must be one of {VALID_DOWNSAMPLE_MODES}, got {downsample_mode!r}"
+        )
+    if not (0.0 < downsample_frac_val <= 1.0):
+        raise ValueError(f"downsample_frac must be in (0.0, 1.0], got {downsample_frac!r}")
     if clean_eval not in ("static", "walk_forward", "both"):
         raise ValueError("eval_mode must be 'static', 'walk_forward', or 'both'")
     if clean_wf_win not in ("expanding", "sliding"):
@@ -1594,13 +1614,21 @@ def build_experiment_setup(
         "target_horizon_eras": [horizon],
         "era_stride": [int(era_stride)],
         "embargo_eras": [embargo],
+        "cv_split": [cv_split_val],
+        "downsample_mode": [clean_downsample_mode],
+        "downsample_frac": [downsample_frac_val],
     }
 
     mode_str = f"baseline_mode={clean_baseline}" if clean_baseline is not None else f"model={model_tag}"
+    ds_str = (
+        f" | downsample={clean_downsample_mode}@{downsample_frac_val:.2f}"
+        if clean_downsample_mode is not None and downsample_frac_val < 1.0
+        else ""
+    )
     print(
         f"Experiment: {experiment_name} | {mode_str} | search_mode={clean_search} | "
-        f"cv_strategy={clean_cv} | ERA_COL={era_col} | TARGET_COL={target_col} | "
-        f"horizon={horizon} | embargo={embargo}"
+        f"cv_strategy={clean_cv} (cv_split={cv_split_val}) | ERA_COL={era_col} | TARGET_COL={target_col} | "
+        f"horizon={horizon} | embargo={embargo}{ds_str}"
     )
 
     cfg: Dict[str, Any] = {
@@ -1621,7 +1649,9 @@ def build_experiment_setup(
         "search_mode": clean_search,
         "cv_strategy": clean_cv,
         "n_splits": int(n_splits),
-        "train_size": float(train_size),
+        "cv_split": cv_split_val,
+        "downsample_mode": clean_downsample_mode,
+        "downsample_frac": downsample_frac_val,
         "target_horizon_eras": horizon,
         "embargo_eras": embargo,
         "eval_mode": clean_eval,

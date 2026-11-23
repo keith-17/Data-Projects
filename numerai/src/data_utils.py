@@ -313,6 +313,89 @@ def compute_per_ticker_timeseries_features(
     return out_df, list(new_cols_dict.keys())
 
 
+VALID_DOWNSAMPLE_MODES: Tuple[str, ...] = (
+    "within_era",
+    "recent",
+    "earliest",
+    "uniform",
+    "random_eras",
+)
+
+
+def downsample_training_data(
+    train_df: pd.DataFrame,
+    *,
+    downsample_mode: Optional[str] = None,
+    downsample_frac: float = 1.0,
+    era_col: str = "era",
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Deterministically downsample `train_df` (never `validation_df`) while preserving chronological era order.
+
+    Supported modes:
+      - `None`: keep 100% of rows.
+      - `'within_era'`: keep every era, randomly sampling `downsample_frac` of rows within each era.
+      - `'recent'`: keep the most recent `downsample_frac` fraction of unique eras.
+      - `'earliest'`: keep the earliest `downsample_frac` fraction of unique eras.
+      - `'uniform'`: keep evenly spaced eras spanning the full training range.
+      - `'random_eras'`: randomly sample `downsample_frac` of unique eras without replacement.
+    """
+    mode = (
+        None
+        if downsample_mode in (None, False, "None", "none", "null", "")
+        else str(downsample_mode).strip().lower()
+    )
+    if mode is not None and mode not in VALID_DOWNSAMPLE_MODES:
+        raise ValueError(
+            f"downsample_mode must be None or one of {VALID_DOWNSAMPLE_MODES}, got {downsample_mode!r}"
+        )
+    frac = float(downsample_frac)
+    if not (0.0 < frac <= 1.0):
+        raise ValueError(f"downsample_frac must be in (0.0, 1.0], got {downsample_frac!r}")
+    if mode is None or frac >= 1.0 or len(train_df) == 0:
+        return train_df
+    if era_col not in train_df.columns:
+        raise KeyError(f"Column '{era_col}' not found in train_df.")
+
+    rng = np.random.default_rng(int(random_state))
+    era_vals = train_df[era_col].to_numpy()
+
+    if mode == "within_era":
+        order = np.argsort(era_vals, kind="stable")
+        sorted_eras = era_vals[order]
+        _, start_indices, counts = np.unique(sorted_eras, return_index=True, return_counts=True)
+        keep_mask = np.zeros(len(train_df), dtype=bool)
+        for start, count in zip(start_indices, counts):
+            positions = order[start : start + count]
+            n_keep = max(1, int(round(int(count) * frac)))
+            if n_keep >= int(count):
+                keep_mask[positions] = True
+            else:
+                chosen = rng.choice(positions, size=n_keep, replace=False)
+                keep_mask[chosen] = True
+        return train_df.loc[keep_mask].copy()
+
+    unique_eras = np.sort(pd.unique(era_vals))
+    n_eras = len(unique_eras)
+    n_keep_eras = max(1, int(round(n_eras * frac)))
+    if n_keep_eras >= n_eras:
+        return train_df
+
+    if mode == "recent":
+        kept_eras = unique_eras[-n_keep_eras:]
+    elif mode == "earliest":
+        kept_eras = unique_eras[:n_keep_eras]
+    elif mode == "uniform":
+        idx = np.round(np.linspace(0, n_eras - 1, n_keep_eras)).astype(np.int64)
+        kept_eras = unique_eras[idx]
+    elif mode == "random_eras":
+        kept_eras = np.sort(rng.choice(unique_eras, size=n_keep_eras, replace=False))
+    else:  # pragma: no cover - already validated above
+        raise ValueError(f"Unsupported downsample_mode '{mode}'.")
+
+    return train_df.loc[train_df[era_col].isin(kept_eras)].copy()
+
+
 def load_unity_numerai_data(
     data_version: str = "v6.0",
     data_folder: str = "data_folder",
@@ -320,6 +403,9 @@ def load_unity_numerai_data(
     feature_set: str = "small",
     target_col: str = "target",
     era_stride: int = 4,
+    downsample_mode: Optional[str] = None,
+    downsample_frac: float = 1.0,
+    random_state: int = 42,
     ticker_timeseries_features: Optional[str] = None,
     ticker_rolling_windows: Sequence[int] = (4, 12),
     ticker_lag_steps: Optional[Sequence[int]] = None,
@@ -569,6 +655,15 @@ def load_unity_numerai_data(
         kept_train_eras = sorted(train_df["era"].unique())[:: int(era_stride)]
         train_df = train_df.loc[train_df["era"].isin(kept_train_eras)]
 
+    # 7. Optional training-only downsampling (validation_df is never downsampled)
+    train_df = downsample_training_data(
+        train_df,
+        downsample_mode=downsample_mode,
+        downsample_frac=downsample_frac,
+        era_col="era",
+        random_state=random_state,
+    )
+
     assert not any(
         column in FORBIDDEN_FEATURE_COLS or column == target_col or column.startswith("target")
         for column in feature_columns
@@ -612,6 +707,9 @@ def load_unity_numerai_data_cached(
     feature_set: str = "small",
     target_col: str = "target",
     era_stride: int = 4,
+    downsample_mode: Optional[str] = None,
+    downsample_frac: float = 1.0,
+    random_state: int = 42,
     ticker_timeseries_features: Optional[str] = None,
     ticker_rolling_windows: Sequence[int] = (4, 12),
     ticker_lag_steps: Optional[Sequence[int]] = None,
@@ -621,7 +719,11 @@ def load_unity_numerai_data_cached(
     use_numerapi_fallback: bool = True,
     force_reload: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], Dict[str, Any]]:
-    """Cached wrapper around `load_unity_numerai_data` persisting processed Parquets & metadata in `<workspace>/<data_folder>/processed_cache/`."""
+    """Cached wrapper around `load_unity_numerai_data` persisting processed Parquets & metadata in `<workspace>/<data_folder>/processed_cache/`.
+
+    Caches the full strided `(train_df, validation_df)` and applies `downsample_training_data(...)`
+    in-memory to `train_df` only so changing `downsample_mode` / `downsample_frac` reuses the cache.
+    """
     workspace_dir = Path(workspace_root).resolve() if workspace_root is not None else Path.cwd().resolve()
     if workspace_dir.name.lower() == "notebooks":
         workspace_dir = workspace_dir.parent
@@ -666,6 +768,13 @@ def load_unity_numerai_data_cached(
                     and validation_df[target_col].dtype == np.float32
                 )
                 if valid_hit:
+                    train_df = downsample_training_data(
+                        train_df,
+                        downsample_mode=downsample_mode,
+                        downsample_frac=downsample_frac,
+                        era_col="era",
+                        random_state=random_state,
+                    )
                     return train_df, validation_df, feature_columns, feature_metadata
         except Exception:
             pass
@@ -677,6 +786,9 @@ def load_unity_numerai_data_cached(
         feature_set=feature_set,
         target_col=target_col,
         era_stride=era_stride,
+        downsample_mode=None,
+        downsample_frac=1.0,
+        random_state=random_state,
         ticker_timeseries_features=ticker_timeseries_features,
         ticker_rolling_windows=ticker_rolling_windows,
         ticker_lag_steps=ticker_lag_steps,
@@ -712,4 +824,11 @@ def load_unity_numerai_data_cached(
     except OSError as cache_err:
         warnings.warn(f"Could not write processed data cache ({cache_err}); continuing without cache.")
 
+    train_df = downsample_training_data(
+        train_df,
+        downsample_mode=downsample_mode,
+        downsample_frac=downsample_frac,
+        era_col="era",
+        random_state=random_state,
+    )
     return train_df, validation_df, feature_columns, feature_metadata
