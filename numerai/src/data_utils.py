@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import warnings
 from pathlib import Path
@@ -572,4 +573,143 @@ def load_unity_numerai_data(
         column in FORBIDDEN_FEATURE_COLS or column == target_col or column.startswith("target")
         for column in feature_columns
     )
+    return train_df, validation_df, feature_columns, feature_metadata
+
+
+def _source_files_fingerprint(
+    data_version: str,
+    data_folder: str,
+    kaggle_dataset: str,
+    workspace_dir: Path,
+) -> Optional[List[Tuple[str, int, int]]]:
+    dataset_slug_name = kaggle_dataset.split("/")[-1]
+    candidate_dirs = (
+        Path("/kaggle/input/datasets") / kaggle_dataset,
+        Path("/kaggle/input/datasets") / kaggle_dataset / data_version,
+        Path("/kaggle/input") / dataset_slug_name,
+        Path("/kaggle/input") / f"numerai-data-{data_version.replace('.', '-')}",
+        workspace_dir / data_folder / data_version,
+        workspace_dir / data_folder / dataset_slug_name,
+        workspace_dir / data_folder,
+    )
+    data_root = next((found for cand in candidate_dirs if (found := _find_dataset_root(cand)) is not None), None)
+    if data_root is None and Path("/kaggle/input").is_dir():
+        data_root = _find_dataset_root(Path("/kaggle/input"))
+    if data_root is None:
+        return None
+    train_p, val_p, feat_p = _resolve_numerai_paths(data_root)
+    fp: List[Tuple[str, int, int]] = []
+    for p in (train_p, val_p, feat_p):
+        st = p.stat()
+        fp.append((p.name, int(st.st_mtime_ns), int(st.st_size)))
+    return fp
+
+
+def load_unity_numerai_data_cached(
+    data_version: str = "v6.0",
+    data_folder: str = "data_folder",
+    kaggle_dataset: str = KAGGLE_DATASET_SLUG,
+    feature_set: str = "small",
+    target_col: str = "target",
+    era_stride: int = 4,
+    ticker_timeseries_features: Optional[str] = None,
+    ticker_rolling_windows: Sequence[int] = (4, 12),
+    ticker_lag_steps: Optional[Sequence[int]] = None,
+    ticker_top_n_features: int = 4,
+    workspace_root: Optional[Any] = None,
+    auto_download: bool = True,
+    use_numerapi_fallback: bool = True,
+    force_reload: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], Dict[str, Any]]:
+    """Cached wrapper around `load_unity_numerai_data` persisting processed Parquets & metadata in `<workspace>/<data_folder>/processed_cache/`."""
+    workspace_dir = Path(workspace_root).resolve() if workspace_root is not None else Path.cwd().resolve()
+    if workspace_dir.name.lower() == "notebooks":
+        workspace_dir = workspace_dir.parent
+
+    cache_dir = workspace_dir / data_folder / "processed_cache"
+    source_fp = _source_files_fingerprint(data_version, data_folder, kaggle_dataset, workspace_dir)
+    key_payload = {
+        "data_version": str(data_version),
+        "feature_set": str(feature_set),
+        "era_stride": int(era_stride),
+        "target_col": str(target_col),
+        "ticker_timeseries_features": ticker_timeseries_features,
+        "ticker_rolling_windows": list(ticker_rolling_windows) if ticker_rolling_windows is not None else None,
+        "ticker_lag_steps": list(ticker_lag_steps) if ticker_lag_steps is not None else None,
+        "ticker_top_n_features": int(ticker_top_n_features),
+        "kaggle_dataset": str(kaggle_dataset),
+        "source_fp": source_fp,
+    }
+    cache_hash = hashlib.blake2b(json.dumps(key_payload, sort_keys=True).encode("utf-8"), digest_size=12).hexdigest()
+    train_cache = cache_dir / f"train_{cache_hash}.parquet"
+    val_cache = cache_dir / f"validation_{cache_hash}.parquet"
+    meta_cache = cache_dir / f"meta_{cache_hash}.json"
+
+    if not force_reload and source_fp is not None and train_cache.is_file() and val_cache.is_file() and meta_cache.is_file():
+        try:
+            with meta_cache.open("r", encoding="utf-8") as mf:
+                meta = json.load(mf)
+            if meta.get("key_payload") == key_payload:
+                train_df = pd.read_parquet(train_cache)
+                validation_df = pd.read_parquet(val_cache)
+                feature_columns = list(meta["feature_columns"])
+                feature_metadata = dict(meta["feature_metadata"])
+                valid_hit = (
+                    len(train_df) == int(meta["n_train_rows"])
+                    and len(validation_df) == int(meta["n_val_rows"])
+                    and list(train_df.columns) == list(meta["train_columns"])
+                    and list(validation_df.columns) == list(meta["val_columns"])
+                    and all(train_df[c].dtype == np.int8 and validation_df[c].dtype == np.int8 for c in feature_columns)
+                    and train_df["era"].dtype == np.int32
+                    and validation_df["era"].dtype == np.int32
+                    and train_df[target_col].dtype == np.float32
+                    and validation_df[target_col].dtype == np.float32
+                )
+                if valid_hit:
+                    return train_df, validation_df, feature_columns, feature_metadata
+        except Exception:
+            pass
+
+    train_df, validation_df, feature_columns, feature_metadata = load_unity_numerai_data(
+        data_version=data_version,
+        data_folder=data_folder,
+        kaggle_dataset=kaggle_dataset,
+        feature_set=feature_set,
+        target_col=target_col,
+        era_stride=era_stride,
+        ticker_timeseries_features=ticker_timeseries_features,
+        ticker_rolling_windows=ticker_rolling_windows,
+        ticker_lag_steps=ticker_lag_steps,
+        ticker_top_n_features=ticker_top_n_features,
+        workspace_root=workspace_root,
+        auto_download=auto_download,
+        use_numerapi_fallback=use_numerapi_fallback,
+    )
+
+    try:
+        source_fp_after = _source_files_fingerprint(data_version, data_folder, kaggle_dataset, workspace_dir)
+        key_payload["source_fp"] = source_fp_after
+        cache_hash = hashlib.blake2b(json.dumps(key_payload, sort_keys=True).encode("utf-8"), digest_size=12).hexdigest()
+        train_cache = cache_dir / f"train_{cache_hash}.parquet"
+        val_cache = cache_dir / f"validation_{cache_hash}.parquet"
+        meta_cache = cache_dir / f"meta_{cache_hash}.json"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        train_df.to_parquet(train_cache, index=False)
+        validation_df.to_parquet(val_cache, index=False)
+        with meta_cache.open("w", encoding="utf-8") as mf:
+            json.dump(
+                {
+                    "key_payload": key_payload,
+                    "feature_columns": feature_columns,
+                    "feature_metadata": feature_metadata,
+                    "n_train_rows": int(len(train_df)),
+                    "n_val_rows": int(len(validation_df)),
+                    "train_columns": [str(c) for c in train_df.columns],
+                    "val_columns": [str(c) for c in validation_df.columns],
+                },
+                mf,
+            )
+    except OSError as cache_err:
+        warnings.warn(f"Could not write processed data cache ({cache_err}); continuing without cache.")
+
     return train_df, validation_df, feature_columns, feature_metadata

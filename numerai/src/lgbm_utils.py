@@ -8,14 +8,108 @@ lives in `baseline_utils.py`.
 from __future__ import annotations
 
 import gc
-from typing import Any, Dict, Optional
+import hashlib
+import json
+from collections import OrderedDict
+from typing import Any, Dict, Optional, Tuple
 
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
 
 from baseline_utils import BaseNumeraiEstimator
 from utils import NumeraiExtractions, _decode_structured
+
+_LGB_DATASET_CACHE: "OrderedDict[str, lgb.Dataset]" = OrderedDict()
+_LGB_DATASET_CACHE_MAX = 8
+
+
+def clear_lgb_dataset_cache() -> None:
+    """Clear the cached binned LightGBM training datasets."""
+    _LGB_DATASET_CACHE.clear()
+
+
+def make_shared_lgb_datasets(
+    X_train: Any,
+    y_train: Any,
+    X_valid: Optional[Any] = None,
+    y_valid: Optional[Any] = None,
+    *,
+    sample_weight: Optional[Any] = None,
+    valid_sample_weight: Optional[Any] = None,
+    **bin_params: Any,
+) -> Tuple[lgb.Dataset, Optional[lgb.Dataset]]:
+    """Construct pre-binned `lgb.Dataset` objects with `free_raw_data=False` and `reference=train_ds` for validation."""
+    params_dict = dict(bin_params) if bin_params else None
+    train_ds = lgb.Dataset(
+        X_train,
+        label=y_train,
+        weight=sample_weight,
+        params=params_dict,
+        free_raw_data=False,
+    )
+    train_ds.construct()
+    valid_ds: Optional[lgb.Dataset] = None
+    if X_valid is not None:
+        valid_ds = lgb.Dataset(
+            X_valid,
+            label=y_valid,
+            weight=valid_sample_weight,
+            reference=train_ds,
+            params=params_dict,
+            free_raw_data=False,
+        )
+        valid_ds.construct()
+    return train_ds, valid_ds
+
+
+class _BoosterModelAdapter:
+    """Lightweight adapter exposing `LGBMRegressor`-compatible `.booster_`, `.predict()`, and `.feature_importances_`."""
+
+    def __init__(self, booster: lgb.Booster, importance_type: str = "gain"):
+        self.booster_ = booster
+        self.importance_type = str(importance_type or "gain").strip().lower()
+
+    @property
+    def feature_importances_(self) -> np.ndarray:
+        return np.asarray(self.booster_.feature_importance(importance_type=self.importance_type), dtype=np.float64)
+
+    def predict(self, X: Any) -> np.ndarray:
+        return np.asarray(self.booster_.predict(X), dtype=np.float64)
+
+
+def _lgb_dataset_fingerprint(
+    X_df: pd.DataFrame,
+    y_arr: np.ndarray,
+    sample_weights: Optional[np.ndarray],
+    bin_params: Dict[str, Any],
+) -> str:
+    n_rows, n_cols = X_df.shape
+    y_bytes = np.ascontiguousarray(y_arr, dtype=np.float32).tobytes()
+    y_hash = hashlib.blake2b(y_bytes, digest_size=16).hexdigest()
+    w_hash = (
+        hashlib.blake2b(np.ascontiguousarray(sample_weights, dtype=np.float64).tobytes(), digest_size=16).hexdigest()
+        if sample_weights is not None
+        else "none"
+    )
+    # Sample first, middle, and last rows + column names/dtypes for fast collision-resistant fingerprinting
+    sample_idx = np.unique(np.linspace(0, max(0, n_rows - 1), num=min(n_rows, 32), dtype=np.int64))
+    sample_bytes = np.ascontiguousarray(X_df.to_numpy(copy=False)[sample_idx]).tobytes()
+    x_hash = hashlib.blake2b(sample_bytes, digest_size=16).hexdigest()
+    payload = json.dumps(
+        {
+            "shape": [int(n_rows), int(n_cols)],
+            "cols": [str(c) for c in X_df.columns],
+            "dtypes": [str(dt) for dt in X_df.dtypes],
+            "bin_params": {k: repr(v) for k, v in sorted(bin_params.items())},
+            "x_hash": x_hash,
+            "y_hash": y_hash,
+            "w_hash": w_hash,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.blake2b(payload, digest_size=24).hexdigest()
 
 
 class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
@@ -77,6 +171,7 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
         force_col_wise: bool = False,
         force_row_wise: bool = False,
         lgbm_verbosity: int = -1,
+        reuse_binned_dataset: bool = False,
     ):
         super().__init__(
             extractor=extractor,
@@ -132,6 +227,7 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
         self.force_col_wise = force_col_wise
         self.force_row_wise = force_row_wise
         self.lgbm_verbosity = lgbm_verbosity
+        self.reuse_binned_dataset = reuse_binned_dataset
 
     def _build_lgbm_model(self) -> LGBMRegressor:
         boosting = str(_decode_structured(self.boosting_type) or "gbdt").strip().lower()
@@ -226,17 +322,56 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
         selected_df = features_df if len(selected_cols) == len(features_df.columns) and list(features_df.columns) == selected_cols else features_df[selected_cols]
 
         model = self._build_lgbm_model()
-        fit_kwargs: Dict[str, Any] = {}
-        if sample_weights is not None:
-            fit_kwargs["sample_weight"] = sample_weights
+        if bool(self.reuse_binned_dataset):
+            raw_params = model.get_params()
+            num_boost_round = int(raw_params.pop("n_estimators", 200))
+            importance_type = str(raw_params.pop("importance_type", "gain") or "gain").strip().lower()
+            raw_params.pop("class_weight", None)
+            seed_val = raw_params.pop("random_state", None)
+            if seed_val is not None:
+                raw_params["seed"] = int(seed_val)
+            n_jobs_val = raw_params.pop("n_jobs", -1)
+            if n_jobs_val is not None:
+                raw_params["n_jobs"] = int(n_jobs_val)
+            bin_params = {
+                "max_bin": int(raw_params.get("max_bin", 255)),
+                "min_data_in_bin": int(raw_params.get("min_data_in_bin", 3)),
+                "subsample_for_bin": int(raw_params.get("subsample_for_bin", 200000)),
+                "feature_pre_filter": bool(raw_params.get("feature_pre_filter", True)),
+            }
+            ds_key = _lgb_dataset_fingerprint(selected_df, target_values, sample_weights, bin_params)
+            if ds_key in _LGB_DATASET_CACHE:
+                _LGB_DATASET_CACHE.move_to_end(ds_key)
+                train_ds = _LGB_DATASET_CACHE[ds_key]
+            else:
+                train_ds, _ = make_shared_lgb_datasets(
+                    selected_df,
+                    target_values,
+                    sample_weight=sample_weights,
+                    **bin_params,
+                )
+                _LGB_DATASET_CACHE[ds_key] = train_ds
+                _LGB_DATASET_CACHE.move_to_end(ds_key)
+                while len(_LGB_DATASET_CACHE) > _LGB_DATASET_CACHE_MAX:
+                    _LGB_DATASET_CACHE.popitem(last=False)
+            booster = lgb.train(
+                params=raw_params,
+                train_set=train_ds,
+                num_boost_round=num_boost_round,
+            )
+            self.model_ = _BoosterModelAdapter(booster, importance_type=importance_type)
+        else:
+            fit_kwargs: Dict[str, Any] = {}
+            if sample_weights is not None:
+                fit_kwargs["sample_weight"] = sample_weights
 
-        model.fit(selected_df, target_values, **fit_kwargs)
-        self.model_ = model
+            model.fit(selected_df, target_values, **fit_kwargs)
+            self.model_ = model
 
-        booster = model.booster_
+        booster = self.model_.booster_
         gain_imp = np.asarray(booster.feature_importance(importance_type="gain"), dtype=np.float64)
         split_imp = np.asarray(booster.feature_importance(importance_type="split"), dtype=np.float64)
-        self.feature_importances_ = np.asarray(model.feature_importances_, dtype=np.float64)
+        self.feature_importances_ = np.asarray(self.model_.feature_importances_, dtype=np.float64)
         self.feature_importance_df_ = (
             pd.DataFrame({
                 "feature": selected_cols,
@@ -256,7 +391,6 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
             self.learned_bias_offset_ = 0.0
 
         del selected_df, features_df
-        gc.collect()
         return self
 
     def predict(self, X: Any) -> np.ndarray:

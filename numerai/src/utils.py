@@ -233,6 +233,22 @@ def _fill_missing_features(
     return numeric_df.astype(np.float32, copy=False).fillna(col_defaults).fillna(np.float32(2.0)), col_defaults
 
 
+def drop_constant_dims(space: Mapping[str, Any], pipeline: Any) -> Dict[str, Any]:
+    """Pin any single-category search dimension onto `pipeline` and remove it from the active Bayesian search space."""
+    active: Dict[str, Any] = {}
+    pinned: Dict[str, Any] = {}
+    for key, dim in space.items():
+        if hasattr(dim, "categories") and len(dim.categories) == 1:
+            pinned[key] = _decode_structured(dim.categories[0])
+        elif isinstance(dim, (list, tuple)) and len(dim) == 1:
+            pinned[key] = _decode_structured(dim[0])
+        else:
+            active[key] = dim
+    if pinned and pipeline is not None:
+        pipeline.set_params(**pinned)
+    return active
+
+
 def prepare_bayesian_space(space: Mapping[str, Any]) -> Dict[str, Any]:
     """Normalize a Bayesian search dictionary so lists/tuples/dicts are skopt-compatible."""
     if not SKOPT_AVAILABLE or SkCategorical is None:
@@ -393,6 +409,70 @@ def deduplicate_param_grid(
     return [{key: [val] for key, val in candidate.items()} for candidate in kept]
 
 
+def _pandas_mean_corr_vectorized(
+    X: Any,
+    y: Any,
+    era_values: Any,
+) -> Optional[np.ndarray]:
+    """Vectorized per-era Pearson correlation mean using stable argsort + `np.add.reduceat` in float64.
+
+    Replicates legacy `groupby(eras)` + `corrwith` semantics: skips eras with `< 3` rows or target
+    sample std (`ddof=1`) `<= 1e-12`, zeroes correlations where per-era denominator `<= 1e-12`, and
+    averages over valid eras only. Returns `None` when no valid eras exist.
+    """
+    era_arr = np.asarray(era_values).ravel()
+    y_arr = np.asarray(y, dtype=np.float64).ravel()
+    n_rows = len(y_arr)
+    if n_rows < 3 or len(era_arr) != n_rows:
+        return None
+
+    is_df = isinstance(X, pd.DataFrame)
+    n_cols = X.shape[1]
+    if n_cols == 0:
+        return np.empty(0, dtype=np.float64)
+
+    order = np.argsort(era_arr, kind="mergesort")
+    sorted_eras = era_arr[order]
+    y_sorted = y_arr[order]
+
+    era_change = np.empty(n_rows, dtype=bool)
+    era_change[0] = True
+    era_change[1:] = sorted_eras[1:] != sorted_eras[:-1]
+    starts = np.flatnonzero(era_change)
+    counts = np.diff(np.append(starts, n_rows))
+
+    y_sum = np.add.reduceat(y_sorted, starts)
+    y_mean = y_sum / counts
+    y_centered = y_sorted - np.repeat(y_mean, counts)
+    y_ss = np.add.reduceat(y_centered * y_centered, starts)
+    y_std = np.sqrt(np.where(counts > 1, y_ss / np.maximum(counts - 1, 1), 0.0))
+
+    valid_era_mask = (counts >= 3) & (y_std > 1e-12)
+    if not np.any(valid_era_mask):
+        return None
+
+    result = np.zeros(n_cols, dtype=np.float64)
+    col_names = list(X.columns) if is_df else None
+    chunk_size = 256
+    for c0 in range(0, n_cols, chunk_size):
+        c1 = min(n_cols, c0 + chunk_size)
+        if is_df and col_names is not None:
+            x_chunk = X[col_names[c0:c1]].to_numpy(dtype=np.float64, copy=False)
+        else:
+            x_chunk = np.asarray(X[:, c0:c1], dtype=np.float64)
+        x_sorted = x_chunk[order]
+        x_sum = np.add.reduceat(x_sorted, starts, axis=0)
+        x_mean = x_sum / counts[:, None]
+        x_centered = x_sorted - np.repeat(x_mean, counts, axis=0)
+        x_ss = np.add.reduceat(x_centered * x_centered, starts, axis=0)
+        xy_cov = np.add.reduceat(x_centered * y_centered[:, None], starts, axis=0)
+        denom = np.sqrt(x_ss * y_ss[:, None])
+        era_corrs = np.divide(xy_cov, denom, out=np.zeros_like(xy_cov), where=denom > 1e-12)
+        era_corrs = np.nan_to_num(era_corrs, nan=0.0, posinf=0.0, neginf=0.0)
+        result[c0:c1] = era_corrs[valid_era_mask].mean(axis=0)
+    return result
+
+
 def compute_feature_target_correlations(
     features_df: pd.DataFrame,
     target_series: pd.Series,
@@ -414,20 +494,9 @@ def compute_feature_target_correlations(
 
     if method == "pandas_mean":
         if era_series is not None and len(era_series) == len(clean_df):
-            eras = pd.Series(np.asarray(era_series).ravel(), index=clean_df.index)
-            corr_sum = np.zeros(n_features, dtype=np.float64)
-            n_valid_eras = 0
-            for _, era_features in clean_df.groupby(eras, sort=True):
-                era_target = clean_target.loc[era_features.index]
-                if len(era_features) < 3 or float(era_target.std()) <= 1e-12:
-                    continue
-                era_x = era_features.to_numpy(dtype=np.float32, copy=False)
-                era_y = era_target.to_numpy(dtype=np.float32, copy=False)
-                era_c = np.nan_to_num(r_regression(era_x, era_y), nan=0.0, posinf=0.0, neginf=0.0)
-                corr_sum += era_c
-                n_valid_eras += 1
-            if n_valid_eras > 0:
-                return pd.Series(corr_sum / float(n_valid_eras), index=feature_cols, dtype=np.float64)
+            vec_corrs = _pandas_mean_corr_vectorized(clean_df, clean_target.to_numpy(dtype=np.float64), era_series)
+            if vec_corrs is not None:
+                return pd.Series(vec_corrs, index=feature_cols, dtype=np.float64)
         feature_matrix = clean_df.to_numpy(dtype=np.float32, copy=False)
         target_values = clean_target.to_numpy(dtype=np.float32, copy=False)
         corrs = np.nan_to_num(r_regression(feature_matrix, target_values), nan=0.0, posinf=0.0, neginf=0.0)
@@ -675,7 +744,6 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
             if sparse_kept:
                 selected_cols = sparse_kept
             self.sparse_selector_ = sfm
-            gc.collect()
 
         self.pca_: Optional[PCA] = None
         if (
@@ -690,7 +758,6 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
                 n_comp = min(max(1, int(raw_pca)), len(selected_cols), len(fit_clean_df))
             self.pca_ = PCA(n_components=n_comp, random_state=42)
             self.pca_.fit(fit_clean_df[selected_cols].to_numpy(dtype=np.float32, copy=False))
-            gc.collect()
 
         self.feature_names_in_ = np.asarray(raw_cols, dtype=object)
         self.n_features_in_ = len(raw_cols)
@@ -1260,7 +1327,6 @@ def walk_forward_predict(
         wf_preds[val_chunk_mask] = step_model.predict(X_validation.loc[val_chunk_mask])
 
         del X_fit, y_fit, step_model
-        gc.collect()
     return wf_preds
 
 

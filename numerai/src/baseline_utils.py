@@ -7,6 +7,9 @@ search space helpers, and Numerai evaluation functions live in `utils.py`.
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -22,6 +25,66 @@ from utils import (
     _decode_structured,
     compute_feature_target_correlations,
 )
+
+_EXTRACTION_CACHE: "OrderedDict[str, Tuple[NumeraiExtractions, pd.DataFrame]]" = OrderedDict()
+_EXTRACTION_CACHE_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "max_entries": 16,
+}
+
+
+def configure_extraction_cache(enabled: bool = True, max_entries: int = 16) -> Dict[str, Any]:
+    """Configure the per-process fold-safe LRU extraction cache used by `BaseNumeraiEstimator`."""
+    _EXTRACTION_CACHE_CONFIG["enabled"] = bool(enabled)
+    _EXTRACTION_CACHE_CONFIG["max_entries"] = max(0, int(max_entries))
+    if not _EXTRACTION_CACHE_CONFIG["enabled"] or _EXTRACTION_CACHE_CONFIG["max_entries"] == 0:
+        _EXTRACTION_CACHE.clear()
+    else:
+        while len(_EXTRACTION_CACHE) > _EXTRACTION_CACHE_CONFIG["max_entries"]:
+            _EXTRACTION_CACHE.popitem(last=False)
+    return dict(_EXTRACTION_CACHE_CONFIG)
+
+
+def clear_extraction_cache() -> None:
+    """Clear all entries from the per-process extraction cache."""
+    _EXTRACTION_CACHE.clear()
+
+
+def _build_extraction_cache_key(
+    extractor: NumeraiExtractions,
+    X_df: pd.DataFrame,
+    era_values: Optional[np.ndarray],
+    target_values: np.ndarray,
+) -> str:
+    """Compute a fold-safe cache key from canonicalized extractor params, era bytes, and target bytes."""
+    canon_params = sorted(
+        (str(key), repr(_decode_structured(val)))
+        for key, val in extractor.get_params(deep=True).items()
+    )
+    if era_values is not None and len(era_values) > 0:
+        era_contig = np.ascontiguousarray(era_values)
+        era_min = int(np.min(era_contig))
+        era_max = int(np.max(era_contig))
+        era_hash = hashlib.blake2b(era_contig.tobytes(), digest_size=16).hexdigest()
+    else:
+        era_min = None
+        era_max = None
+        era_hash = "none"
+    target_contig = np.ascontiguousarray(target_values, dtype=np.float32)
+    target_hash = hashlib.blake2b(target_contig.tobytes(), digest_size=16).hexdigest()
+    payload = json.dumps(
+        {
+            "params": canon_params,
+            "n_rows": int(len(X_df)),
+            "cols": [str(c) for c in X_df.columns],
+            "era_min": era_min,
+            "era_max": era_max,
+            "era_hash": era_hash,
+            "target_hash": target_hash,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.blake2b(payload, digest_size=24).hexdigest()
 
 
 class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
@@ -139,9 +202,27 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
             era_values = None
 
         if self.extractor is not None:
-            self.extractor_ = clone(self.extractor)
-            self.extractor_.fit(X_df, target_values)
-            X_proc = self.extractor_.transform(X_df)
+            cache_enabled = bool(_EXTRACTION_CACHE_CONFIG["enabled"]) and int(_EXTRACTION_CACHE_CONFIG["max_entries"]) > 0
+            if cache_enabled:
+                cache_key = _build_extraction_cache_key(self.extractor, X_df, era_values, target_values)
+                if cache_key in _EXTRACTION_CACHE:
+                    _EXTRACTION_CACHE.move_to_end(cache_key)
+                    cached_ext, cached_X_proc = _EXTRACTION_CACHE[cache_key]
+                    self.extractor_ = cached_ext
+                    X_proc = cached_X_proc
+                else:
+                    fitted_ext = clone(self.extractor)
+                    fitted_ext.fit(X_df, target_values)
+                    X_proc = fitted_ext.transform(X_df)
+                    _EXTRACTION_CACHE[cache_key] = (fitted_ext, X_proc)
+                    _EXTRACTION_CACHE.move_to_end(cache_key)
+                    while len(_EXTRACTION_CACHE) > int(_EXTRACTION_CACHE_CONFIG["max_entries"]):
+                        _EXTRACTION_CACHE.popitem(last=False)
+                    self.extractor_ = fitted_ext
+            else:
+                self.extractor_ = clone(self.extractor)
+                self.extractor_.fit(X_df, target_values)
+                X_proc = self.extractor_.transform(X_df)
         else:
             self.extractor_ = None
             X_proc = X_df
@@ -180,12 +261,37 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
             self.feature_corrs_ = np.ones(len(feature_names), dtype=np.float64)
             ranking_scores = np.arange(len(feature_names), 0, -1, dtype=np.float64)
         else:
-            corr_series = compute_feature_target_correlations(
-                features_df,
-                pd.Series(target_values, index=features_df.index),
-                correlation_method=self.correlation_method,
-                era_series=pd.Series(era_values, index=features_df.index) if era_values is not None else None,
+            can_reuse_corrs = (
+                self.extractor_ is not None
+                and getattr(self.extractor_, "pca_", None) is None
+                and _decode_structured(getattr(self.extractor_, "year_horizon_filter", None))
+                in (None, False, "None", "none", "null", "")
+                and hasattr(self.extractor_, "feature_corrs_series_")
+                and str(self.correlation_method).strip().lower()
+                == str(getattr(self.extractor_, "correlation_method", None) or "").strip().lower()
             )
+            if can_reuse_corrs:
+                cached_series = self.extractor_.feature_corrs_series_
+                missing_cols = [col for col in feature_names if col not in cached_series.index]
+                if missing_cols:
+                    extra_series = compute_feature_target_correlations(
+                        features_df[missing_cols],
+                        pd.Series(target_values, index=features_df.index),
+                        correlation_method=self.correlation_method,
+                        era_series=pd.Series(era_values, index=features_df.index) if era_values is not None else None,
+                    )
+                    combined_series = pd.concat([cached_series, extra_series])
+                    combined_series = combined_series.loc[~combined_series.index.duplicated(keep="first")]
+                    corr_series = combined_series.reindex(feature_names).fillna(0.0)
+                else:
+                    corr_series = cached_series.reindex(feature_names).fillna(0.0)
+            else:
+                corr_series = compute_feature_target_correlations(
+                    features_df,
+                    pd.Series(target_values, index=features_df.index),
+                    correlation_method=self.correlation_method,
+                    era_series=pd.Series(era_values, index=features_df.index) if era_values is not None else None,
+                )
             self.feature_corrs_ = corr_series.to_numpy(dtype=np.float64)
             ranking_scores = np.abs(self.feature_corrs_) if bool(self.abs_corr) else self.feature_corrs_
 
@@ -388,7 +494,6 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
         raw_train_pred = self._compute_raw_snapped_pred(selected_bins)
         self._fit_bias_correction(target_values, raw_train_pred, era_values)
         del clean_features, selected_bins, feature_matrix
-        gc.collect()
         return self
 
     def predict(self, X: Any) -> np.ndarray:
@@ -571,7 +676,6 @@ class LagReversalEstimator(BaseNumeraiEstimator):
         raw_train_pred = adjusted_train @ self.weights_
         self._fit_bias_correction(target_values, raw_train_pred, era_values)
         del clean_features, raw_features, adjusted_train
-        gc.collect()
 
         self.rule_summary_ = (
             pd.DataFrame({
@@ -729,71 +833,79 @@ class PersistenceEstimator(BaseNumeraiEstimator):
         hist_df = hist_df.sort_values(["ticker", "era"], kind="stable")
         smoothing_weight = max(0.0, float(self.smoothing or 0.0))
 
-        summary_rows: List[Dict[str, Any]] = []
-        if mode == "last":
-            last_rows = hist_df.groupby("ticker", sort=False).last()
-            counts = hist_df.groupby("ticker", sort=False)["target"].size()
-            for ticker_key, row in last_rows.iterrows():
-                w_val = max(1e-12, float(row["weight"]))
-                y_val = float(row["target"])
-                persisted = (w_val * y_val + smoothing_weight * self.global_mean_) / (w_val + smoothing_weight)
-                self.ticker_lookup_[str(ticker_key)] = float(persisted)
-                summary_rows.append({
-                    "ticker": str(ticker_key),
-                    "persisted_target": float(persisted),
-                    "obs_count": int(counts.get(ticker_key, 1)),
-                    "last_era": int(row["era"]),
+        if len(hist_df) == 0:
+            self.persistence_table_ = pd.DataFrame(columns=["ticker", "persisted_target", "obs_count", "last_era"])
+        elif mode == "last":
+            grouped = hist_df.groupby("ticker", sort=False)
+            last_rows = grouped.last()
+            counts = grouped["target"].size()
+            w_arr = np.maximum(last_rows["weight"].to_numpy(dtype=np.float64), 1e-12)
+            y_arr = last_rows["target"].to_numpy(dtype=np.float64)
+            persisted_arr = (w_arr * y_arr + smoothing_weight * self.global_mean_) / (w_arr + smoothing_weight)
+            tickers_str = last_rows.index.astype(str)
+            self.ticker_lookup_ = dict(zip(tickers_str.tolist(), persisted_arr.tolist()))
+            self.persistence_table_ = (
+                pd.DataFrame({
+                    "ticker": tickers_str.to_numpy(),
+                    "persisted_target": persisted_arr,
+                    "obs_count": counts.reindex(last_rows.index).to_numpy(dtype=np.int64),
+                    "last_era": last_rows["era"].to_numpy(dtype=np.int64),
                 })
+                .sort_values("obs_count", ascending=False, kind="stable")
+                .reset_index(drop=True)
+            )
         elif mode == "rolling_mean":
             win_eras = max(1, int(self.persistence_window if self.persistence_window not in (None, "none", "None", "", 0) else 4))
             tail_df = hist_df.groupby("ticker", sort=False).tail(win_eras).copy()
             tail_df["weighted_target"] = tail_df["target"] * tail_df["weight"]
-            grouped = tail_df.groupby("ticker", sort=False)
-            w_sums = grouped["weight"].sum()
-            wt_sums = grouped["weighted_target"].sum()
-            counts = grouped["target"].size()
-            last_eras = grouped["era"].max()
-            for ticker_key in w_sums.index:
-                w_sum = max(1e-12, float(w_sums.loc[ticker_key]))
-                wt_sum = float(wt_sums.loc[ticker_key])
-                persisted = (wt_sum + smoothing_weight * self.global_mean_) / (w_sum + smoothing_weight)
-                self.ticker_lookup_[str(ticker_key)] = float(persisted)
-                summary_rows.append({
-                    "ticker": str(ticker_key),
-                    "persisted_target": float(persisted),
-                    "obs_count": int(counts.loc[ticker_key]),
-                    "last_era": int(last_eras.loc[ticker_key]),
+            agg_df = tail_df.groupby("ticker", sort=False).agg(
+                w_sum=("weight", "sum"),
+                wt_sum=("weighted_target", "sum"),
+                obs_count=("target", "size"),
+                last_era=("era", "max"),
+            )
+            w_arr = np.maximum(agg_df["w_sum"].to_numpy(dtype=np.float64), 1e-12)
+            wt_arr = agg_df["wt_sum"].to_numpy(dtype=np.float64)
+            persisted_arr = (wt_arr + smoothing_weight * self.global_mean_) / (w_arr + smoothing_weight)
+            tickers_str = agg_df.index.astype(str)
+            self.ticker_lookup_ = dict(zip(tickers_str.tolist(), persisted_arr.tolist()))
+            self.persistence_table_ = (
+                pd.DataFrame({
+                    "ticker": tickers_str.to_numpy(),
+                    "persisted_target": persisted_arr,
+                    "obs_count": agg_df["obs_count"].to_numpy(dtype=np.int64),
+                    "last_era": agg_df["last_era"].to_numpy(dtype=np.int64),
                 })
+                .sort_values("obs_count", ascending=False, kind="stable")
+                .reset_index(drop=True)
+            )
         elif mode == "expanding_mean":
             hist_df["weighted_target"] = hist_df["target"] * hist_df["weight"]
-            grouped = hist_df.groupby("ticker", sort=False)
-            w_sums = grouped["weight"].sum()
-            wt_sums = grouped["weighted_target"].sum()
-            counts = grouped["target"].size()
-            last_eras = grouped["era"].max()
-            for ticker_key in w_sums.index:
-                w_sum = max(1e-12, float(w_sums.loc[ticker_key]))
-                wt_sum = float(wt_sums.loc[ticker_key])
-                persisted = (wt_sum + smoothing_weight * self.global_mean_) / (w_sum + smoothing_weight)
-                self.ticker_lookup_[str(ticker_key)] = float(persisted)
-                summary_rows.append({
-                    "ticker": str(ticker_key),
-                    "persisted_target": float(persisted),
-                    "obs_count": int(counts.loc[ticker_key]),
-                    "last_era": int(last_eras.loc[ticker_key]),
+            agg_df = hist_df.groupby("ticker", sort=False).agg(
+                w_sum=("weight", "sum"),
+                wt_sum=("weighted_target", "sum"),
+                obs_count=("target", "size"),
+                last_era=("era", "max"),
+            )
+            w_arr = np.maximum(agg_df["w_sum"].to_numpy(dtype=np.float64), 1e-12)
+            wt_arr = agg_df["wt_sum"].to_numpy(dtype=np.float64)
+            persisted_arr = (wt_arr + smoothing_weight * self.global_mean_) / (w_arr + smoothing_weight)
+            tickers_str = agg_df.index.astype(str)
+            self.ticker_lookup_ = dict(zip(tickers_str.tolist(), persisted_arr.tolist()))
+            self.persistence_table_ = (
+                pd.DataFrame({
+                    "ticker": tickers_str.to_numpy(),
+                    "persisted_target": persisted_arr,
+                    "obs_count": agg_df["obs_count"].to_numpy(dtype=np.int64),
+                    "last_era": agg_df["last_era"].to_numpy(dtype=np.int64),
                 })
+                .sort_values("obs_count", ascending=False, kind="stable")
+                .reset_index(drop=True)
+            )
         else:
             raise ValueError(
                 f"Unsupported persistence_mode '{self.persistence_mode}'; use None, 'last', 'rolling_mean', or 'expanding_mean'."
             )
-
-        self.persistence_table_ = (
-            pd.DataFrame(summary_rows)
-            .sort_values("obs_count", ascending=False, kind="stable")
-            .reset_index(drop=True)
-            if summary_rows
-            else pd.DataFrame(columns=["ticker", "persisted_target", "obs_count", "last_era"])
-        )
         raw_train_pred = self._raw_persistence_lookup(X_df)
         self._fit_bias_correction(target_values, raw_train_pred, era_values)
         return self
@@ -815,3 +927,219 @@ BaseNumeraiBaseline = BaseNumeraiEstimator
 BinSnappingBaseline = BinSnappingEstimator
 LagReversalBaseline = LagReversalEstimator
 PersistenceBaseline = PersistenceEstimator
+
+
+def run_baseline(
+    baseline_name: str,
+    pipeline: Any,
+    param_space: Any,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    train_eras: pd.Series,
+    X_validation: pd.DataFrame,
+    y_validation: pd.Series,
+    validation_eras: pd.Series,
+    feature_columns: List[str],
+    *,
+    search_mode: str = "bayes",
+    eval_mode: str = "both",
+    cv_object: Any = None,
+    n_iter: int = 37,
+    random_state: int = 42,
+    verbose: int = 3,
+    error_score: Any = -1.0,
+    n_jobs: int = 1,
+    walk_forward_step_eras: int = 20,
+    walk_forward_window: str = "expanding",
+    target_horizon_eras: int = 4,
+    era_stride: int = 4,
+    error_bin_config: Optional[Dict[str, Any]] = None,
+    extraction_cache_config: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Dict[str, Any]], pd.DataFrame, Dict[str, Any], Any]:
+    """Execute one baseline's default holdout, optional walk-forward holdout, and CV search in a picklable worker.
+
+    Configures error binning and resets/collects the process-local `_CV_FOLD_METRIC_LOG` inside the worker so
+    parallel execution under `joblib` (`loky`) preserves all extended CV metrics without loss.
+    """
+    from sklearn.model_selection import GridSearchCV
+    from utils import (
+        build_conditional_bayesian_spaces,
+        build_quick_results_df,
+        candidate_score,
+        configure_error_binning,
+        deduplicate_param_grid,
+        evaluate_numerai_predictions,
+        reset_cv_metric_log,
+        walk_forward_predict,
+    )
+
+    try:
+        from skopt import BayesSearchCV
+    except ImportError:
+        BayesSearchCV = None
+
+    if error_bin_config is not None:
+        configure_error_binning(**error_bin_config)
+    if extraction_cache_config is not None:
+        configure_extraction_cache(**extraction_cache_config)
+
+    results_entries: Dict[str, Dict[str, Any]] = {}
+    default_model = clone(pipeline).fit(X_train, y_train)
+
+    train_preds = default_model.predict(X_train)
+    val_preds = default_model.predict(X_validation)
+
+    train_eval = evaluate_numerai_predictions(
+        y_train,
+        train_preds,
+        eras=train_eras,
+        features_df=X_train,
+        feature_columns=feature_columns,
+        label=f"{baseline_name} — Final Training Scores",
+        verbose=True,
+    )
+    val_eval = evaluate_numerai_predictions(
+        y_validation,
+        val_preds,
+        eras=validation_eras,
+        features_df=X_validation,
+        feature_columns=feature_columns,
+        label=f"{baseline_name} — Final Validation Scores",
+        verbose=True,
+    )
+
+    default_variant_name = f"{baseline_name} [Default]"
+    if eval_mode in ("static", "both"):
+        results_entries[default_variant_name] = {
+            "variant": default_variant_name,
+            "train_corr": train_eval["numerai_corr"],
+            "validation_corr": val_eval["numerai_corr"],
+            "validation_corr_pct": val_eval["numerai_corr_pct"],
+            "positive_era_pct": val_eval["positive_era_pct"],
+            "directional_accuracy_pct": val_eval["directional_accuracy_pct"],
+            "validation_spearman": val_eval["spearman"],
+            "validation_payout": val_eval["payout"],
+            "validation_sharpe": val_eval["numerai_sharpe"],
+            "validation_spearman_sharpe": val_eval["spearman_sharpe"],
+            "validation_mae": val_eval["mae"],
+            "forecast_bias": val_eval["forecast_bias"],
+            "directional_hit_rate": val_eval["directional_hit_rate"],
+            "era_corr_lag1_acf": val_eval["era_corr_lag1_acf"],
+            "ljung_box_pvalue": val_eval["ljung_box_pvalue"],
+            "arch_lm_pvalue": val_eval["arch_lm_pvalue"],
+            "adf_pvalue": val_eval["adf_pvalue"],
+            "era_corr_skew": val_eval["era_corr_skew"],
+            "era_corr_kurtosis": val_eval["era_corr_kurtosis"],
+            "jarque_bera_pvalue": val_eval["jarque_bera_pvalue"],
+            "feature_exposure": val_eval["feature_exposure"],
+            "max_drawdown": val_eval["max_drawdown"],
+            "corr_gap": train_eval["numerai_corr"] - val_eval["numerai_corr"],
+            "sanity_status": val_eval["sanity_status"],
+            "validation_preds": val_preds,
+            "validation_era_corrs": val_eval["numerai_era_corrs"],
+            "params": default_model.named_steps["estimator"].get_params(),
+        }
+
+    if eval_mode in ("walk_forward", "both"):
+        wf_preds = walk_forward_predict(
+            pipeline,
+            X_train,
+            y_train,
+            train_eras,
+            X_validation,
+            y_validation,
+            validation_eras,
+            step_eras=walk_forward_step_eras,
+            window_mode=walk_forward_window,
+            target_horizon_eras=target_horizon_eras,
+            era_stride=era_stride,
+        )
+        wf_eval = evaluate_numerai_predictions(
+            y_validation,
+            wf_preds,
+            eras=validation_eras,
+            features_df=X_validation,
+            feature_columns=feature_columns,
+            label=f"{baseline_name} — Walk-Forward Validation Scores",
+            verbose=True,
+        )
+        wf_variant_name = f"{baseline_name} [Walk-Forward]"
+        results_entries[wf_variant_name] = {
+            "variant": wf_variant_name,
+            "train_corr": train_eval["numerai_corr"],
+            "validation_corr": wf_eval["numerai_corr"],
+            "validation_corr_pct": wf_eval["numerai_corr_pct"],
+            "positive_era_pct": wf_eval["positive_era_pct"],
+            "directional_accuracy_pct": wf_eval["directional_accuracy_pct"],
+            "validation_spearman": wf_eval["spearman"],
+            "validation_payout": wf_eval["payout"],
+            "validation_sharpe": wf_eval["numerai_sharpe"],
+            "validation_spearman_sharpe": wf_eval["spearman_sharpe"],
+            "validation_mae": wf_eval["mae"],
+            "forecast_bias": wf_eval["forecast_bias"],
+            "directional_hit_rate": wf_eval["directional_hit_rate"],
+            "era_corr_lag1_acf": wf_eval["era_corr_lag1_acf"],
+            "ljung_box_pvalue": wf_eval["ljung_box_pvalue"],
+            "arch_lm_pvalue": wf_eval["arch_lm_pvalue"],
+            "adf_pvalue": wf_eval["adf_pvalue"],
+            "era_corr_skew": wf_eval["era_corr_skew"],
+            "era_corr_kurtosis": wf_eval["era_corr_kurtosis"],
+            "jarque_bera_pvalue": wf_eval["jarque_bera_pvalue"],
+            "feature_exposure": wf_eval["feature_exposure"],
+            "max_drawdown": wf_eval["max_drawdown"],
+            "corr_gap": train_eval["numerai_corr"] - wf_eval["numerai_corr"],
+            "sanity_status": wf_eval["sanity_status"],
+            "validation_preds": wf_preds,
+            "validation_era_corrs": wf_eval["numerai_era_corrs"],
+            "params": default_model.named_steps["estimator"].get_params(),
+        }
+
+    if search_mode == "bayes":
+        if BayesSearchCV is None:
+            raise ImportError("scikit-optimize is required for Bayesian search")
+        search_spaces = (
+            param_space
+            if isinstance(param_space, list)
+            else build_conditional_bayesian_spaces(param_space, total_n_iter=n_iter)
+        )
+        search = BayesSearchCV(
+            estimator=pipeline,
+            search_spaces=search_spaces,
+            n_iter=n_iter,
+            optimizer_kwargs={
+                "base_estimator": "ET",
+                "acq_func": "EI",
+                "n_initial_points": min(4, max(1, n_iter // 3)),
+            },
+            scoring=candidate_score,
+            cv=cv_object,
+            refit=False,
+            random_state=random_state,
+            verbose=verbose,
+            error_score=error_score,
+            n_jobs=n_jobs,
+        )
+    else:
+        deduped_grid = deduplicate_param_grid(param_space, base_params=pipeline.get_params(deep=True))
+        search = GridSearchCV(
+            estimator=pipeline,
+            param_grid=deduped_grid,
+            scoring=candidate_score,
+            cv=cv_object,
+            refit=False,
+            verbose=verbose,
+            error_score=error_score,
+            n_jobs=n_jobs,
+        )
+
+    reset_cv_metric_log()
+    search.fit(X_train, y_train, groups=train_eras)
+    cv_results_df = build_quick_results_df(search)
+    search_summary_row = {
+        "baseline": baseline_name,
+        "search_mode": search_mode,
+        "best_cv_corr": float(search.best_score_),
+        "best_cv_corr_pct": round(float(search.best_score_) * 100.0, 2),
+        "best_params": dict(search.best_params_),
+    }
+    return baseline_name, results_entries, cv_results_df, search_summary_row, default_model
