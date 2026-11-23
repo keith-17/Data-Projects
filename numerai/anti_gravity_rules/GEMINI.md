@@ -1,0 +1,2 @@
+- Do not put functions in the notebook.
+- Do not use iloc.
