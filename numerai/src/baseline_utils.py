@@ -103,6 +103,7 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
         walk_forward_step_eras: Optional[int] = None,
         walk_forward_window: str = "expanding",
         target_horizon_eras: int = 4,
+        era_stride: int = 1,
         era_col: str = "era",
         target_col: str = "target",
         verbose: int = 0,
@@ -119,6 +120,7 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
         self.walk_forward_step_eras = walk_forward_step_eras
         self.walk_forward_window = walk_forward_window
         self.target_horizon_eras = target_horizon_eras
+        self.era_stride = era_stride
         self.era_col = era_col
         self.target_col = target_col
         self.verbose = verbose
@@ -200,6 +202,19 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
             era_values = pd.to_numeric(X_df[self.era_col], errors="coerce").fillna(1).to_numpy(dtype=np.int32)
         else:
             era_values = None
+
+        # Optional in-fit training era subsampling (never applied during predict())
+        stride_val = int(self.era_stride) if self.era_stride not in (None, False, "None", "none", "null", "") else 1
+        if stride_val > 1 and era_values is not None and len(era_values) > 0:
+            kept_fit_eras = np.unique(era_values)[::stride_val]
+            if len(kept_fit_eras) < len(np.unique(era_values)):
+                stride_mask = np.isin(era_values, kept_fit_eras)
+                X_df = X_df.loc[stride_mask]
+                target_values = target_values[stride_mask]
+                era_values = era_values[stride_mask]
+                if sample_weight is not None:
+                    sample_weight = np.asarray(sample_weight, dtype=np.float64).ravel()[stride_mask]
+                n_samples = len(X_df)
 
         if self.extractor is not None:
             cache_enabled = bool(_EXTRACTION_CACHE_CONFIG["enabled"]) and int(_EXTRACTION_CACHE_CONFIG["max_entries"]) > 0
@@ -405,6 +420,7 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
         walk_forward_step_eras: Optional[int] = None,
         walk_forward_window: str = "expanding",
         target_horizon_eras: int = 4,
+        era_stride: int = 1,
         era_col: str = "era",
         target_col: str = "target",
         verbose: int = 0,
@@ -422,6 +438,7 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
             walk_forward_step_eras=walk_forward_step_eras,
             walk_forward_window=walk_forward_window,
             target_horizon_eras=target_horizon_eras,
+            era_stride=era_stride,
             era_col=era_col,
             target_col=target_col,
             verbose=verbose,
@@ -536,6 +553,7 @@ class LagReversalEstimator(BaseNumeraiEstimator):
         walk_forward_step_eras: Optional[int] = None,
         walk_forward_window: str = "expanding",
         target_horizon_eras: int = 4,
+        era_stride: int = 1,
         era_col: str = "era",
         target_col: str = "target",
         verbose: int = 0,
@@ -553,6 +571,7 @@ class LagReversalEstimator(BaseNumeraiEstimator):
             walk_forward_step_eras=walk_forward_step_eras,
             walk_forward_window=walk_forward_window,
             target_horizon_eras=target_horizon_eras,
+            era_stride=era_stride,
             era_col=era_col,
             target_col=target_col,
             verbose=verbose,
@@ -726,6 +745,7 @@ class PersistenceEstimator(BaseNumeraiEstimator):
         walk_forward_step_eras: Optional[int] = None,
         walk_forward_window: str = "expanding",
         target_horizon_eras: int = 4,
+        era_stride: int = 1,
         era_col: str = "era",
         target_col: str = "target",
         verbose: int = 0,
@@ -743,6 +763,7 @@ class PersistenceEstimator(BaseNumeraiEstimator):
             walk_forward_step_eras=walk_forward_step_eras,
             walk_forward_window=walk_forward_window,
             target_horizon_eras=target_horizon_eras,
+            era_stride=era_stride,
             era_col=era_col,
             target_col=target_col,
             verbose=verbose,
@@ -783,6 +804,19 @@ class PersistenceEstimator(BaseNumeraiEstimator):
             era_values = pd.to_numeric(X_df[self.era_col], errors="coerce").fillna(1).to_numpy(dtype=np.int32)
         else:
             era_values = None
+
+        # Optional in-fit training era subsampling (never applied during predict())
+        stride_val = int(self.era_stride) if self.era_stride not in (None, False, "None", "none", "null", "") else 1
+        if stride_val > 1 and era_values is not None and len(era_values) > 0:
+            kept_fit_eras = np.unique(era_values)[::stride_val]
+            if len(kept_fit_eras) < len(np.unique(era_values)):
+                stride_mask = np.isin(era_values, kept_fit_eras)
+                X_df = X_df.loc[stride_mask]
+                target_values = target_values[stride_mask]
+                era_values = era_values[stride_mask]
+                if sample_weight is not None:
+                    sample_weight = np.asarray(sample_weight, dtype=np.float64).ravel()[stride_mask]
+                n_samples = len(X_df)
 
         sample_weights = self._compute_era_weights(era_values, sample_weight, len(X_df))
         if self.walk_forward_step_eras not in (None, False, "None", "none", "null", "", 0):

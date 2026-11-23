@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import inspect
 import json
 from datetime import datetime
 from pathlib import Path
@@ -22,8 +23,31 @@ from sklearn.linear_model import ElasticNet, Lasso
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import ParameterGrid
 from sklearn.preprocessing import KBinsDiscretizer, StandardScaler
-from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
+from statsmodels.stats.diagnostic import acorr_ljungbox, acorr_lm
 from statsmodels.tsa.stattools import adfuller
+
+_ADFULLER_HAS_RESULT_OBJECT = "result_object" in inspect.signature(adfuller).parameters
+_ACORR_LM_HAS_RESULT_OBJECT = "result_object" in inspect.signature(acorr_lm).parameters
+
+
+def _run_adfuller(series_vals: np.ndarray, maxlag: int) -> Tuple[float, float]:
+    """Run `adfuller` using `result_object=True` when supported, falling back to tuple indexing on older statsmodels."""
+    if _ADFULLER_HAS_RESULT_OBJECT:
+        adf_res = adfuller(series_vals, maxlag=maxlag, autolag=None, result_object=True)
+        return float(adf_res.statistic), float(adf_res.pvalue)
+    adf_res = adfuller(series_vals, maxlag=maxlag, autolag=None)
+    return float(adf_res[0]), float(adf_res[1])
+
+
+def _run_arch_lm_pvalue(corrs_arr: np.ndarray, nlags: int) -> float:
+    """Compute Engle's ARCH-LM p-value via `acorr_lm(resid ** 2, ..., result_object=True)` with older-statsmodels fallback."""
+    resid = corrs_arr - float(np.mean(corrs_arr))
+    resid_sq = resid ** 2
+    if _ACORR_LM_HAS_RESULT_OBJECT:
+        lm_res = acorr_lm(resid_sq, nlags=nlags, result_object=True)
+        return float(lm_res.lm_pvalue)
+    lm_res = acorr_lm(resid_sq, nlags=nlags)
+    return float(lm_res[1])
 
 try:
     from skopt.space import Categorical as SkCategorical
@@ -474,6 +498,42 @@ def _pandas_mean_corr_vectorized(
     return result
 
 
+def _pooled_pearson_corr(
+    df: pd.DataFrame,
+    target_values: np.ndarray,
+    *,
+    rank_columns: bool = False,
+    chunk_size: int = 64,
+) -> np.ndarray:
+    """Cancellation-free, memory-bounded pooled Pearson/Spearman correlation in float64 chunks (never calls `sqrt` on negative variance)."""
+    cols = list(df.columns)
+    n_features = len(cols)
+    if n_features == 0:
+        return np.empty(0, dtype=np.float64)
+
+    y_f64 = np.asarray(target_values, dtype=np.float64).ravel()
+    if rank_columns:
+        y_f64 = stats.rankdata(y_f64).astype(np.float64, copy=False)
+    y_centered = y_f64 - float(np.mean(y_f64))
+    y_ss = float(np.dot(y_centered, y_centered))
+    if y_ss <= 1e-12:
+        return np.zeros(n_features, dtype=np.float64)
+
+    corrs = np.zeros(n_features, dtype=np.float64)
+    for start in range(0, n_features, chunk_size):
+        chunk_cols = cols[start : start + chunk_size]
+        x_chunk = df[chunk_cols].to_numpy(dtype=np.float64, copy=False)
+        if rank_columns:
+            x_chunk = np.apply_along_axis(stats.rankdata, 0, x_chunk).astype(np.float64, copy=False)
+        x_centered = x_chunk - np.mean(x_chunk, axis=0)
+        x_ss = np.sum(x_centered * x_centered, axis=0)
+        denom = np.sqrt(np.maximum(x_ss * y_ss, 0.0))
+        xy_cov = x_centered.T @ y_centered
+        chunk_corrs = np.divide(xy_cov, denom, out=np.zeros(len(chunk_cols), dtype=np.float64), where=denom > 1e-12)
+        corrs[start : start + len(chunk_cols)] = np.nan_to_num(chunk_corrs, nan=0.0, posinf=0.0, neginf=0.0)
+    return corrs
+
+
 def compute_feature_target_correlations(
     features_df: pd.DataFrame,
     target_series: pd.Series,
@@ -498,9 +558,7 @@ def compute_feature_target_correlations(
             vec_corrs = _pandas_mean_corr_vectorized(clean_df, clean_target.to_numpy(dtype=np.float64), era_series)
             if vec_corrs is not None:
                 return pd.Series(vec_corrs, index=feature_cols, dtype=np.float64)
-        feature_matrix = clean_df.to_numpy(dtype=np.float32, copy=False)
-        target_values = clean_target.to_numpy(dtype=np.float32, copy=False)
-        corrs = np.nan_to_num(r_regression(feature_matrix, target_values), nan=0.0, posinf=0.0, neginf=0.0)
+        corrs = _pooled_pearson_corr(clean_df, clean_target.to_numpy(dtype=np.float64), rank_columns=False)
         return pd.Series(corrs, index=feature_cols, dtype=np.float64)
 
     if method == "numerai_mean":
@@ -517,22 +575,12 @@ def compute_feature_target_correlations(
                 return pd.concat(per_era_num_corrs, axis=1).mean(axis=1).reindex(feature_cols).fillna(0.0)
         return numerai_corr(clean_df.astype(np.float32, copy=False), clean_target).reindex(feature_cols).fillna(0.0)
 
-    target_values = clean_target.to_numpy(dtype=np.float32, copy=False)
+    target_values = clean_target.to_numpy(dtype=np.float64, copy=False)
     if method == "spearman":
-        ranked_target = stats.rankdata(target_values).astype(np.float32, copy=False)
-        corrs = np.zeros(n_features, dtype=np.float64)
-        chunk_size = 128
-        for start in range(0, n_features, chunk_size):
-            chunk_cols = feature_cols[start : start + chunk_size]
-            chunk_mat = clean_df[chunk_cols].to_numpy(dtype=np.float32, copy=False)
-            ranked_chunk = np.apply_along_axis(stats.rankdata, 0, chunk_mat).astype(np.float32, copy=False)
-            corrs[start : start + len(chunk_cols)] = np.nan_to_num(
-                r_regression(ranked_chunk, ranked_target), nan=0.0, posinf=0.0, neginf=0.0
-            )
+        corrs = _pooled_pearson_corr(clean_df, target_values, rank_columns=True)
         return pd.Series(corrs, index=feature_cols, dtype=np.float64)
 
-    feature_matrix = clean_df.to_numpy(dtype=np.float32, copy=False)
-    corrs = np.nan_to_num(r_regression(feature_matrix, target_values), nan=0.0, posinf=0.0, neginf=0.0)
+    corrs = _pooled_pearson_corr(clean_df, target_values, rank_columns=False)
     return pd.Series(corrs, index=feature_cols, dtype=np.float64)
 
 
@@ -1080,8 +1128,8 @@ def evaluate_numerai_predictions(
     if len(corrs_arr) >= 6 and corrs_std > 1e-12:
         try:
             nlags_arch = min(4, max(1, (len(corrs_arr) - 2) // 3))
-            _, raw_arch_p, _, _ = het_arch(corrs_arr - float(np.mean(corrs_arr)), nlags=nlags_arch)
-            arch_lm_pvalue = float(np.round(float(raw_arch_p), 4)) if np.isfinite(raw_arch_p) else 1.0
+            raw_arch_p = _run_arch_lm_pvalue(corrs_arr, nlags=nlags_arch)
+            arch_lm_pvalue = float(np.round(raw_arch_p, 4)) if np.isfinite(raw_arch_p) else 1.0
         except Exception:
             arch_lm_pvalue = 1.0
     else:
@@ -1089,8 +1137,7 @@ def evaluate_numerai_predictions(
 
     if len(corrs_arr) >= 6 and corrs_std > 1e-12:
         try:
-            adf_stat_res = adfuller(corrs_arr, maxlag=min(4, max(0, len(corrs_arr) // 4 - 1)), autolag=None)
-            raw_adf_p = float(adf_stat_res[1])
+            _, raw_adf_p = _run_adfuller(corrs_arr, maxlag=min(4, max(0, len(corrs_arr) // 4 - 1)))
             adf_pvalue = float(np.round(raw_adf_p, 4)) if np.isfinite(raw_adf_p) else 1.0
         except Exception:
             adf_pvalue = 1.0
@@ -1231,9 +1278,11 @@ def compute_eda_era_stationarity(
         series_vals = era_means[col].dropna().to_numpy(dtype=np.float64)
         if len(series_vals) >= 6 and float(np.std(series_vals)) > 1e-12:
             try:
-                adf_res = adfuller(series_vals, maxlag=min(4, max(0, len(series_vals) // 4 - 1)), autolag=None)
-                stat_val = float(np.round(float(adf_res[0]), 4))
-                pval = float(np.round(float(adf_res[1]), 4)) if np.isfinite(adf_res[1]) else 1.0
+                raw_stat, raw_pval = _run_adfuller(
+                    series_vals, maxlag=min(4, max(0, len(series_vals) // 4 - 1))
+                )
+                stat_val = float(np.round(raw_stat, 4))
+                pval = float(np.round(raw_pval, 4)) if np.isfinite(raw_pval) else 1.0
             except Exception:
                 stat_val, pval = 0.0, 1.0
         else:
@@ -1725,6 +1774,7 @@ def candidate_score(estimator: Any, X: pd.DataFrame, y: Any) -> float:
                 step_eras=int(wf_step),
                 window_mode=str(getattr(inner_est, "walk_forward_window", "expanding") or "expanding"),
                 target_horizon_eras=int(getattr(inner_est, "target_horizon_eras", 4) or 4),
+                era_stride=int(getattr(inner_est, "era_stride", 1) or 1),
             ),
             dtype=np.float64,
         ).ravel()
