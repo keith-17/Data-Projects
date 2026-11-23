@@ -285,6 +285,9 @@ def _canonicalize_candidate_params(candidate: Mapping[str, Any]) -> Dict[str, An
     if _is_inactive(canon.get("estimator__correlation_method")):
         if "estimator__abs_corr" in canon:
             canon["estimator__abs_corr"] = "__INACTIVE__"
+    if _is_inactive(canon.get("estimator__walk_forward_step_eras")):
+        if "estimator__walk_forward_window" in canon:
+            canon["estimator__walk_forward_window"] = "__INACTIVE__"
     p_mode = canon.get("estimator__persistence_mode")
     if str(p_mode or "").strip().lower() != "rolling_mean":
         if "estimator__persistence_window" in canon:
@@ -1214,7 +1217,13 @@ def walk_forward_predict(
         if not np.any(fit_mask):
             fit_mask = ~is_val_row
 
-        chunk_model = clone(estimator).fit(all_X.loc[fit_mask], all_y.loc[fit_mask])
+        chunk_model = clone(estimator)
+        chunk_params = chunk_model.get_params(deep=True)
+        if "estimator__walk_forward_step_eras" in chunk_params:
+            chunk_model.set_params(estimator__walk_forward_step_eras=None)
+        elif "walk_forward_step_eras" in chunk_params:
+            chunk_model.set_params(walk_forward_step_eras=None)
+        chunk_model.fit(all_X.loc[fit_mask], all_y.loc[fit_mask])
         val_chunk_mask = np.isin(val_era_arr, chunk_eras)
         wf_preds[val_chunk_mask] = chunk_model.predict(X_validation.loc[val_chunk_mask])
     return wf_preds
@@ -1259,16 +1268,71 @@ def export_diagnostics_predictions(
     return target_path
 
 
+_CV_FOLD_METRIC_LOG: List[Dict[str, float]] = []
+
+
+def reset_cv_metric_log() -> None:
+    """Clear the per-fold CV metric buffer before starting a new `GridSearchCV` / `BayesSearchCV` run."""
+    _CV_FOLD_METRIC_LOG.clear()
+
+
 def candidate_score(estimator: Any, X: pd.DataFrame, y: Any) -> float:
-    """Official per-era `numerai_corr` scorer for `GridSearchCV` / `BayesSearchCV` with readable per-fold percentage printout."""
-    preds = np.asarray(estimator.predict(X), dtype=np.float64).ravel()
+    """Official per-era `numerai_corr` scorer for `GridSearchCV` / `BayesSearchCV`, logging extended fold metrics for `build_quick_results_df`.
+
+    When `estimator__walk_forward_step_eras` is set to a positive integer, evaluates the CV fold using
+    leak-free `walk_forward_predict` respecting `target_horizon_eras` settlement lag; otherwise scores statically.
+    """
     targets = np.asarray(y, dtype=np.float64).ravel()
     eras = X["era"].to_numpy() if isinstance(X, pd.DataFrame) and "era" in X.columns else None
+
+    inner_est = (
+        estimator.named_steps["estimator"]
+        if hasattr(estimator, "named_steps") and "estimator" in estimator.named_steps
+        else estimator
+    )
+    wf_step = getattr(inner_est, "walk_forward_step_eras", None)
+    wf_train_X = getattr(inner_est, "_wf_train_X_", None)
+    wf_train_y = getattr(inner_est, "_wf_train_y_", None)
+    wf_train_eras = getattr(inner_est, "_wf_train_eras_", None)
+
+    if (
+        wf_step not in (None, False, "None", "none", "null", "", 0)
+        and int(wf_step) > 0
+        and wf_train_X is not None
+        and wf_train_y is not None
+        and wf_train_eras is not None
+        and eras is not None
+    ):
+        preds = np.asarray(
+            walk_forward_predict(
+                estimator,
+                wf_train_X,
+                pd.Series(wf_train_y),
+                pd.Series(wf_train_eras),
+                X,
+                pd.Series(targets),
+                pd.Series(eras),
+                step_eras=int(wf_step),
+                window_mode=str(getattr(inner_est, "walk_forward_window", "expanding") or "expanding"),
+                target_horizon_eras=int(getattr(inner_est, "target_horizon_eras", 4) or 4),
+            ),
+            dtype=np.float64,
+        ).ravel()
+    else:
+        preds = np.asarray(estimator.predict(X), dtype=np.float64).ravel()
     era_corrs = compute_per_era_numerai_corr(targets, preds, eras=eras)
+    spearman_era_corrs = compute_per_era_spearman_corr(targets, preds, eras=eras)
+
     mean_corr = float(era_corrs.mean()) if len(era_corrs) else 0.0
     mean_corr = mean_corr if np.isfinite(mean_corr) else 0.0
+    spearman_mean = float(spearman_era_corrs.mean()) if len(spearman_era_corrs) else 0.0
+    spearman_mean = spearman_mean if np.isfinite(spearman_mean) else 0.0
+    sharpe_val = float(sharpe_ratio(era_corrs))
     pos_era_pct = float(np.mean(era_corrs.to_numpy(dtype=np.float64) > 0.0) * 100.0) if len(era_corrs) else 0.0
+
     if len(targets):
+        mae_val = float(mean_absolute_error(targets, preds))
+        bias_val = float(np.mean(targets - preds))
         pred_center = 0.5 if (0.15 <= float(np.mean(preds)) <= 0.85) else float(np.mean(preds))
         non_neutral = np.abs(targets - 0.5) > 1e-9
         dir_acc_pct = (
@@ -1277,22 +1341,87 @@ def candidate_score(estimator: Any, X: pd.DataFrame, y: Any) -> float:
             else 50.0
         )
     else:
+        mae_val = 0.0
+        bias_val = 0.0
         dir_acc_pct = 0.0
+
+    cumulative_corr = era_corrs.cumsum()
+    if len(cumulative_corr):
+        running_peak = pd.Series(
+            np.maximum.accumulate(np.insert(cumulative_corr.to_numpy(), 0, 0.0))[1:],
+            index=cumulative_corr.index,
+        )
+        max_dd = float((running_peak - cumulative_corr).max())
+    else:
+        max_dd = 0.0
+
+    _CV_FOLD_METRIC_LOG.append({
+        "numerai_corr": mean_corr,
+        "positive_era_pct": pos_era_pct,
+        "directional_accuracy_pct": dir_acc_pct,
+        "sharpe": sharpe_val,
+        "spearman": spearman_mean,
+        "mae": mae_val,
+        "forecast_bias": bias_val,
+        "max_drawdown": max_dd,
+    })
+
     print(
         f"  [Fold Score] Numerai CORR: {mean_corr * 100.0:+.2f}% ({mean_corr:.4f}) | "
-        f"Positive Eras: {pos_era_pct:.1f}% | Directional Accuracy: {dir_acc_pct:.1f}%"
+        f"Sharpe: {sharpe_val:.2f} | Positive Eras: {pos_era_pct:.1f}% | "
+        f"Directional Accuracy: {dir_acc_pct:.1f}% | MAE: {mae_val:.4f}"
     )
     return mean_corr
 
 
 def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
-    """Build a flat candidate results table with percentage score and every hyperparameter expanded into its own column."""
+    """Build a flat candidate results table with percentage score, extended CV metrics, and every hyperparameter expanded into its own column."""
     cv_res = getattr(search_or_results, "cv_results_", search_or_results)
     if not cv_res:
+        _CV_FOLD_METRIC_LOG.clear()
         return pd.DataFrame()
     df = pd.DataFrame(cv_res)
     if "mean_test_score" in df.columns:
         df["mean_test_corr_pct"] = (df["mean_test_score"].astype(float) * 100.0).round(2)
+
+    # Attach per-candidate extended metrics logged by `candidate_score` during CV folds
+    split_cols = sorted(
+        [col for col in df.columns if col.startswith("split") and col.endswith("_test_score")],
+        key=lambda c: int(c[len("split") : c.index("_test_score")]),
+    )
+    if _CV_FOLD_METRIC_LOG and split_cols:
+        metric_specs = (
+            ("mean_positive_era_pct", "positive_era_pct", 2),
+            ("mean_directional_accuracy_pct", "directional_accuracy_pct", 2),
+            ("mean_sharpe", "sharpe", 4),
+            ("mean_spearman", "spearman", 4),
+            ("mean_mae", "mae", 4),
+            ("mean_forecast_bias", "forecast_bias", 4),
+            ("mean_max_drawdown", "max_drawdown", 4),
+        )
+        used_mask = [False] * len(_CV_FOLD_METRIC_LOG)
+        agg_cols: Dict[str, List[float]] = {out_col: [] for out_col, _, _ in metric_specs}
+        for row_idx in range(len(df)):
+            matched_records: List[Dict[str, float]] = []
+            for s_col in split_cols:
+                score_val = float(df.loc[row_idx, s_col])
+                if not np.isfinite(score_val):
+                    continue
+                for log_idx, rec in enumerate(_CV_FOLD_METRIC_LOG):
+                    if not used_mask[log_idx] and abs(rec["numerai_corr"] - score_val) <= 1e-12:
+                        used_mask[log_idx] = True
+                        matched_records.append(rec)
+                        break
+            for out_col, src_key, decimals in metric_specs:
+                if matched_records:
+                    val = float(np.mean([rec[src_key] for rec in matched_records]))
+                    agg_cols[out_col].append(round(val, decimals))
+                else:
+                    agg_cols[out_col].append(np.nan)
+        for out_col, vals in agg_cols.items():
+            df[out_col] = vals
+    _CV_FOLD_METRIC_LOG.clear()
+
     param_prefixed = [col for col in df.columns if col.startswith("param_")]
     if "params" in df.columns:
         params_df = pd.DataFrame(list(df["params"])).rename(

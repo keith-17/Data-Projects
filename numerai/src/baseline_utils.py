@@ -37,6 +37,9 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
         recency_decay: Optional[float] = 0.005,
         prediction_transform: Optional[str] = None,
         bias_correction: Optional[str] = None,
+        walk_forward_step_eras: Optional[int] = None,
+        walk_forward_window: str = "expanding",
+        target_horizon_eras: int = 4,
         era_col: str = "era",
         target_col: str = "target",
         verbose: int = 0,
@@ -50,6 +53,9 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
         self.recency_decay = recency_decay
         self.prediction_transform = prediction_transform
         self.bias_correction = bias_correction
+        self.walk_forward_step_eras = walk_forward_step_eras
+        self.walk_forward_window = walk_forward_window
+        self.target_horizon_eras = target_horizon_eras
         self.era_col = era_col
         self.target_col = target_col
         self.verbose = verbose
@@ -193,6 +199,15 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
         self.selected_corrs_ = self.feature_corrs_[selected_indices]
         self.selected_feature_names_ = [feature_names[idx] for idx in selected_indices]
 
+        if self.walk_forward_step_eras not in (None, False, "None", "none", "null", "", 0):
+            self._wf_train_X_ = X_df
+            self._wf_train_y_ = target_values
+            self._wf_train_eras_ = era_values
+        else:
+            self._wf_train_X_ = None
+            self._wf_train_y_ = None
+            self._wf_train_eras_ = None
+
         weights = self._compute_era_weights(era_values, sample_weight, n_samples)
         return features_df, feature_matrix, target_values, feature_names, weights, era_values
 
@@ -281,6 +296,9 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
         recency_decay: Optional[float] = 0.005,
         prediction_transform: Optional[str] = None,
         bias_correction: Optional[str] = None,
+        walk_forward_step_eras: Optional[int] = None,
+        walk_forward_window: str = "expanding",
+        target_horizon_eras: int = 4,
         era_col: str = "era",
         target_col: str = "target",
         verbose: int = 0,
@@ -295,6 +313,9 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
             recency_decay=recency_decay,
             prediction_transform=prediction_transform,
             bias_correction=bias_correction,
+            walk_forward_step_eras=walk_forward_step_eras,
+            walk_forward_window=walk_forward_window,
+            target_horizon_eras=target_horizon_eras,
             era_col=era_col,
             target_col=target_col,
             verbose=verbose,
@@ -407,6 +428,9 @@ class LagReversalEstimator(BaseNumeraiEstimator):
         recency_decay: Optional[float] = 0.005,
         prediction_transform: Optional[str] = None,
         bias_correction: Optional[str] = None,
+        walk_forward_step_eras: Optional[int] = None,
+        walk_forward_window: str = "expanding",
+        target_horizon_eras: int = 4,
         era_col: str = "era",
         target_col: str = "target",
         verbose: int = 0,
@@ -421,6 +445,9 @@ class LagReversalEstimator(BaseNumeraiEstimator):
             recency_decay=recency_decay,
             prediction_transform=prediction_transform,
             bias_correction=bias_correction,
+            walk_forward_step_eras=walk_forward_step_eras,
+            walk_forward_window=walk_forward_window,
+            target_horizon_eras=target_horizon_eras,
             era_col=era_col,
             target_col=target_col,
             verbose=verbose,
@@ -592,6 +619,9 @@ class PersistenceEstimator(BaseNumeraiEstimator):
         recency_decay: Optional[float] = 0.005,
         prediction_transform: Optional[str] = None,
         bias_correction: Optional[str] = None,
+        walk_forward_step_eras: Optional[int] = None,
+        walk_forward_window: str = "expanding",
+        target_horizon_eras: int = 4,
         era_col: str = "era",
         target_col: str = "target",
         verbose: int = 0,
@@ -606,6 +636,9 @@ class PersistenceEstimator(BaseNumeraiEstimator):
             recency_decay=recency_decay,
             prediction_transform=prediction_transform,
             bias_correction=bias_correction,
+            walk_forward_step_eras=walk_forward_step_eras,
+            walk_forward_window=walk_forward_window,
+            target_horizon_eras=target_horizon_eras,
             era_col=era_col,
             target_col=target_col,
             verbose=verbose,
@@ -648,6 +681,14 @@ class PersistenceEstimator(BaseNumeraiEstimator):
             era_values = None
 
         sample_weights = self._compute_era_weights(era_values, sample_weight, len(X_df))
+        if self.walk_forward_step_eras not in (None, False, "None", "none", "null", "", 0):
+            self._wf_train_X_ = X_df
+            self._wf_train_y_ = target_values
+            self._wf_train_eras_ = era_values
+        else:
+            self._wf_train_X_ = None
+            self._wf_train_y_ = None
+            self._wf_train_eras_ = None
         if sample_weights is not None and float(sample_weights.sum()) > 0.0:
             self.global_mean_ = float(np.average(target_values, weights=sample_weights))
         else:
