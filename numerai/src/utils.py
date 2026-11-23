@@ -1305,3 +1305,205 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
     if "rank_test_score" in df.columns:
         df = df.sort_values("rank_test_score", kind="stable").reset_index(drop=True)
     return df
+
+
+def compute_era_error_envelope(
+    y_true: Any,
+    y_pred: Any,
+    eras: Any,
+) -> pd.DataFrame:
+    """Compute per-era data-point counts and directional forecast error shares (`over_share`, `under_share`) for envelope analysis."""
+    targets = np.asarray(y_true, dtype=np.float64).ravel()
+    preds = np.asarray(y_pred, dtype=np.float64).ravel()
+    era_arr = np.asarray(eras, dtype=np.int32).ravel()
+    if not (len(targets) == len(preds) == len(era_arr)):
+        raise ValueError(
+            f"Length mismatch: y_true={len(targets)}, y_pred={len(preds)}, eras={len(era_arr)}."
+        )
+
+    finite_mask = np.isfinite(targets) & np.isfinite(preds)
+    n_excluded = int((~finite_mask).sum())
+    if n_excluded > 0:
+        print(f"Excluded {n_excluded} non-finite predictions from envelope analysis.")
+    if not np.any(finite_mask):
+        raise ValueError("No finite predictions available for era error envelope analysis.")
+
+    residual = preds[finite_mask] - targets[finite_mask]
+    frame = pd.DataFrame({
+        "era": era_arr[finite_mask],
+        "under": residual < 0.0,
+        "over": residual > 0.0,
+        "abs_error": np.abs(residual),
+        "residual": residual,
+    })
+    measured = (
+        frame.groupby("era", sort=True)
+        .agg(
+            data_points=("residual", "size"),
+            under_share=("under", "mean"),
+            over_share=("over", "mean"),
+            mae=("abs_error", "mean"),
+            mean_residual=("residual", "mean"),
+        )
+        .sort_index()
+    )
+
+    min_era = int(measured.index.min())
+    max_era = int(measured.index.max())
+    full_eras = pd.Index(np.arange(min_era, max_era + 1, dtype=np.int32), name="era")
+    envelope_df = measured.reindex(full_eras)
+    envelope_df["is_interpolated"] = envelope_df["data_points"].isna()
+    for col in ("data_points", "under_share", "over_share", "mae", "mean_residual"):
+        envelope_df[col] = envelope_df[col].interpolate(method="index", limit_area="inside")
+    return envelope_df
+
+
+def plot_era_error_envelope(
+    y_true: Any,
+    y_pred: Any,
+    eras: Any,
+    *,
+    title: str = "Best Model",
+    band_size: float = 0.15,
+    save_path: Optional[Any] = None,
+) -> pd.DataFrame:
+    """Plot the flight-deck directional error envelope across Numerai eras (x = eras, y = data points per era, ribbon = over/under forecast share)."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    from matplotlib.ticker import FuncFormatter
+
+    PURPLE = "#7446A5"
+    BLUE = "#5C9ED6"
+    ORANGE = "#EEA04B"
+
+    envelope_df = compute_era_error_envelope(y_true, y_pred, eras)
+    era_index = envelope_df.index.to_numpy(dtype=np.int32)
+    centre = envelope_df["data_points"].to_numpy(dtype=np.float64)
+    under_share = envelope_df["under_share"].to_numpy(dtype=np.float64)
+    over_share = envelope_df["over_share"].to_numpy(dtype=np.float64)
+    is_interpolated = envelope_df["is_interpolated"].to_numpy(dtype=bool)
+    is_measured = ~is_interpolated
+
+    value_span = float(np.nanmax(centre) - np.nanmin(centre))
+    fallback_span = max(float(np.nanmax(centre)) * 0.25, 1.0)
+    scale = float(band_size) * (value_span if value_span > 1e-9 else fallback_span)
+    lower = centre - scale * under_share
+    upper = centre + scale * over_share
+
+    fig, ax = plt.subplots(figsize=(17, 6), facecolor="white")
+    ax.set_facecolor("white")
+    ax.fill_between(era_index, centre, upper, color=BLUE, alpha=0.45, linewidth=0)
+    ax.fill_between(era_index, lower, centre, color=ORANGE, alpha=0.45, linewidth=0)
+    ax.plot(era_index, upper, color=BLUE, linewidth=1.3)
+    ax.plot(era_index, lower, color=ORANGE, linewidth=1.3)
+    ax.plot(era_index, centre, color=PURPLE, linestyle=":", linewidth=2.3, zorder=3)
+
+    ax.scatter(era_index[is_measured], centre[is_measured], color=PURPLE, s=22, zorder=4)
+    if np.any(is_interpolated):
+        ax.scatter(
+            era_index[is_interpolated],
+            centre[is_interpolated],
+            facecolors="white",
+            edgecolors=PURPLE,
+            linewidths=1.5,
+            s=45,
+            zorder=5,
+        )
+
+    n_measured = int(is_measured.sum())
+    min_era, max_era = int(era_index[0]), int(era_index[-1])
+    fig.suptitle(
+        f"{title}  \u00b7  {n_measured} validation eras  \u00b7  Era {min_era}\u2013{max_era}",
+        x=0.06,
+        ha="left",
+        fontsize=19,
+        fontweight="bold",
+    )
+    ax.set_xlabel("Validation Era")
+    ax.set_ylabel("Data points per era")
+    ax.set_xlim(min_era, max_era)
+    if float(np.nanmax(upper)) >= 1000.0:
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value / 1000.0:g}k"))
+    else:
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{int(round(value)):,}"))
+    ax.grid(axis="y", color="#DDDDDD", linewidth=0.7)
+    ax.set_axisbelow(True)
+    ax.tick_params(length=0, labelsize=10)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    # Era-block / annual (52-era) section dividers matching flight-deck quarterly markers
+    era_span = max_era - min_era + 1
+    block_step = 52 if era_span >= 104 else max(1, era_span // 4)
+    block_starts = list(range(min_era, max_era + 1, block_step))
+    if len(block_starts) >= 2:
+        for block_idx, b_start in enumerate(block_starts, start=1):
+            b_end = block_starts[block_idx] if block_idx < len(block_starts) else max_era + 1
+            if b_end - b_start < max(2, block_step // 4):
+                continue
+            midpoint = 0.5 * (b_start + min(b_end - 1, max_era))
+            block_label = f"Y{block_idx}" if block_step == 52 else f"B{block_idx}"
+            ax.text(
+                midpoint,
+                1.015,
+                block_label,
+                transform=ax.get_xaxis_transform(),
+                ha="center",
+                va="bottom",
+                fontsize=10,
+                fontweight="bold",
+                color="#666666",
+                clip_on=False,
+            )
+            if block_idx > 1:
+                ax.axvline(b_start, color="#BBBBBB", linewidth=0.8, linestyle="--", zorder=0)
+
+    legend_handles = [
+        Line2D([], [], color=PURPLE, linestyle=":", linewidth=2.3, label="Data points per era"),
+        Patch(facecolor=BLUE, alpha=0.45, label="Overforecast share"),
+        Patch(facecolor=ORANGE, alpha=0.45, label="Underforecast share"),
+        Line2D([], [], color=PURPLE, marker="o", linestyle="None", markersize=5, label="Evaluated era"),
+    ]
+    if np.any(is_interpolated):
+        legend_handles.append(
+            Line2D(
+                [],
+                [],
+                color=PURPLE,
+                marker="o",
+                markerfacecolor="white",
+                linestyle="None",
+                markersize=6,
+                label="Interpolated era",
+            )
+        )
+    ax.legend(
+        handles=legend_handles,
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        frameon=False,
+        ncol=2,
+        columnspacing=1.6,
+        handletextpad=0.6,
+        labelspacing=1.1,
+        fontsize=10,
+    )
+
+    mean_over_pct = float(np.nanmean(over_share[is_measured]) * 100.0)
+    mean_under_pct = float(np.nanmean(under_share[is_measured]) * 100.0)
+    fig.text(
+        0.06,
+        0.035,
+        f"Bands show the share of held-out predictions above/below target (mean overforecast {mean_over_pct:.1f}%, "
+        f"underforecast {mean_under_pct:.1f}%), not error magnitude. Ribbon thickness scales to {int(round(band_size * 100))}% of era data-point range.",
+        fontsize=9,
+        color="#555555",
+    )
+    fig.subplots_adjust(left=0.06, right=0.70, top=0.84, bottom=0.17)
+    if save_path is not None:
+        target_path = Path(save_path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(target_path, dpi=140)
+    plt.show()
+    return envelope_df
