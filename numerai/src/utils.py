@@ -1191,41 +1191,76 @@ def walk_forward_predict(
     step_eras: int = 20,
     window_mode: str = "expanding",
     target_horizon_eras: int = 4,
+    era_stride: int = 1,
 ) -> np.ndarray:
-    """Chronological walk-forward holdout evaluation respecting `target_horizon_eras` settlement lag."""
+    """Chronological walk-forward holdout evaluation respecting `target_horizon_eras` settlement lag and `era_stride` subsampling of settled validation eras."""
+    train_era_arr = np.asarray(train_eras, dtype=np.int32).ravel()
     val_era_arr = np.asarray(validation_eras, dtype=np.int32).ravel()
     unique_val_eras = np.array(sorted(np.unique(val_era_arr)), dtype=np.int32)
     step = max(1, int(step_eras))
     horizon = max(1, int(target_horizon_eras))
+    stride = max(1, int(era_stride))
     mode = str(window_mode or "expanding").strip().lower()
-    train_era_span = int(np.max(train_eras) - np.min(train_eras)) if len(train_eras) else 52
+    train_era_span = int(np.max(train_era_arr) - np.min(train_era_arr)) if len(train_era_arr) else 52
 
-    all_X = pd.concat([X_train, X_validation], axis=0, ignore_index=True)
-    all_y = pd.concat([pd.Series(y_train).reset_index(drop=True), pd.Series(y_validation).reset_index(drop=True)], axis=0, ignore_index=True)
-    all_eras = np.concatenate([np.asarray(train_eras, dtype=np.int32).ravel(), val_era_arr])
-    is_val_row = np.concatenate([np.zeros(len(X_train), dtype=bool), np.ones(len(X_validation), dtype=bool)])
+    y_train_s = pd.Series(np.asarray(y_train, dtype=np.float32).ravel(), index=X_train.index)
+    y_val_s = pd.Series(np.asarray(y_validation, dtype=np.float32).ravel(), index=X_validation.index)
 
-    wf_preds = np.full(len(X_validation), float(np.mean(y_train)) if len(y_train) else 0.5, dtype=np.float64)
+    wf_preds = np.full(len(X_validation), float(np.mean(y_train_s)) if len(y_train_s) else 0.5, dtype=np.float64)
     for start_idx in range(0, len(unique_val_eras), step):
         chunk_eras = unique_val_eras[start_idx : start_idx + step]
         forecast_origin_era = int(chunk_eras[0])
         settled_cutoff_era = forecast_origin_era - horizon
-        fit_mask = all_eras <= settled_cutoff_era
-        if mode == "sliding":
-            min_sliding_era = settled_cutoff_era - max(1, train_era_span)
-            fit_mask = fit_mask & (all_eras >= min_sliding_era)
-        if not np.any(fit_mask):
-            fit_mask = ~is_val_row
+        min_sliding_era = (settled_cutoff_era - max(1, train_era_span)) if mode == "sliding" else None
 
-        chunk_model = clone(estimator)
-        chunk_params = chunk_model.get_params(deep=True)
+        train_mask = train_era_arr <= settled_cutoff_era
+        if min_sliding_era is not None:
+            train_mask = train_mask & (train_era_arr >= min_sliding_era)
+
+        settled_val_eras = unique_val_eras[unique_val_eras <= settled_cutoff_era]
+        if min_sliding_era is not None:
+            settled_val_eras = settled_val_eras[settled_val_eras >= min_sliding_era]
+        if stride > 1 and len(settled_val_eras) > 0:
+            settled_val_eras = settled_val_eras[::stride]
+
+        has_train = bool(np.any(train_mask))
+        has_val_settled = len(settled_val_eras) > 0
+
+        if not has_train and not has_val_settled:
+            X_fit = X_train
+            y_fit = y_train_s
+        elif has_train and not has_val_settled:
+            if bool(np.all(train_mask)):
+                X_fit = X_train
+                y_fit = y_train_s
+            else:
+                X_fit = X_train.loc[train_mask]
+                y_fit = y_train_s.loc[train_mask]
+        elif not has_train and has_val_settled:
+            val_fit_mask = np.isin(val_era_arr, settled_val_eras)
+            X_fit = X_validation.loc[val_fit_mask]
+            y_fit = y_val_s.loc[val_fit_mask]
+        else:
+            val_fit_mask = np.isin(val_era_arr, settled_val_eras)
+            X_tr_part = X_train if bool(np.all(train_mask)) else X_train.loc[train_mask]
+            y_tr_part = y_train_s if bool(np.all(train_mask)) else y_train_s.loc[train_mask]
+            X_fit = pd.concat([X_tr_part, X_validation.loc[val_fit_mask]], axis=0, ignore_index=True)
+            y_fit = pd.concat([y_tr_part.reset_index(drop=True), y_val_s.loc[val_fit_mask].reset_index(drop=True)], axis=0, ignore_index=True)
+            del X_tr_part, y_tr_part
+
+        step_model = clone(estimator)
+        chunk_params = step_model.get_params(deep=True)
         if "estimator__walk_forward_step_eras" in chunk_params:
-            chunk_model.set_params(estimator__walk_forward_step_eras=None)
+            step_model.set_params(estimator__walk_forward_step_eras=None)
         elif "walk_forward_step_eras" in chunk_params:
-            chunk_model.set_params(walk_forward_step_eras=None)
-        chunk_model.fit(all_X.loc[fit_mask], all_y.loc[fit_mask])
+            step_model.set_params(walk_forward_step_eras=None)
+        step_model.fit(X_fit, y_fit)
+
         val_chunk_mask = np.isin(val_era_arr, chunk_eras)
-        wf_preds[val_chunk_mask] = chunk_model.predict(X_validation.loc[val_chunk_mask])
+        wf_preds[val_chunk_mask] = step_model.predict(X_validation.loc[val_chunk_mask])
+
+        del X_fit, y_fit, step_model
+        gc.collect()
     return wf_preds
 
 
