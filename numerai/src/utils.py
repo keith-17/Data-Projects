@@ -1270,6 +1270,147 @@ def export_diagnostics_predictions(
 
 _CV_FOLD_METRIC_LOG: List[Dict[str, float]] = []
 
+ERROR_BIN_LABELS: Tuple[str, ...] = (
+    "Extreme Underforecast",
+    "Underforecast",
+    "Accurate",
+    "Overforecast",
+    "Extreme Overforecast",
+)
+
+_ERROR_BIN_CONFIG: Dict[str, Any] = {
+    "mode": "pct",
+    "pct_bins": (5.0, 10.0),
+    "zero_tols": (0.01, 0.10),
+    "abs_bins": (0.125, 0.375),
+}
+
+
+def configure_error_binning(
+    mode: str = "pct",
+    pct_bins: Tuple[float, float] = (5.0, 10.0),
+    zero_tols: Tuple[float, float] = (0.01, 0.10),
+    abs_bins: Tuple[float, float] = (0.125, 0.375),
+) -> Dict[str, Any]:
+    """Set module-wide error-binning parameters used by `candidate_score` and waterfall analysis."""
+    clean_mode = str(mode or "pct").strip().lower()
+    if clean_mode not in ("pct", "abs"):
+        raise ValueError("error_bin_mode must be 'pct' or 'abs'.")
+    p_acc, p_ext = sorted((abs(float(pct_bins[0])), abs(float(pct_bins[1]))))
+    z_acc, z_ext = sorted((abs(float(zero_tols[0])), abs(float(zero_tols[1]))))
+    a_acc, a_ext = sorted((abs(float(abs_bins[0])), abs(float(abs_bins[1]))))
+    _ERROR_BIN_CONFIG["mode"] = clean_mode
+    _ERROR_BIN_CONFIG["pct_bins"] = (p_acc, p_ext)
+    _ERROR_BIN_CONFIG["zero_tols"] = (z_acc, z_ext)
+    _ERROR_BIN_CONFIG["abs_bins"] = (a_acc, a_ext)
+    return dict(_ERROR_BIN_CONFIG)
+
+
+def classify_error_bins(
+    y_true: Any,
+    y_pred: Any,
+    *,
+    mode: Optional[str] = None,
+    pct_bins: Optional[Tuple[float, float]] = None,
+    zero_tols: Optional[Tuple[float, float]] = None,
+    abs_bins: Optional[Tuple[float, float]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized classification of every data point into 5 error bins (`0..4` `int8`).
+
+    Sign convention: `residual = y_pred - y_true` (negative = Underforecast, positive = Overforecast).
+    Returns `(bin_codes_int8, residual_float32, finite_mask_bool)` where invalid rows receive code `-1`.
+    """
+    targets = np.asarray(y_true, dtype=np.float32).ravel()
+    preds = np.asarray(y_pred, dtype=np.float32).ravel()
+    if len(targets) != len(preds):
+        raise ValueError(f"Length mismatch: y_true={len(targets)}, y_pred={len(preds)}.")
+
+    cfg_mode = str(mode if mode is not None else _ERROR_BIN_CONFIG["mode"]).strip().lower()
+    p_acc, p_ext = pct_bins if pct_bins is not None else _ERROR_BIN_CONFIG["pct_bins"]
+    z_acc, z_ext = zero_tols if zero_tols is not None else _ERROR_BIN_CONFIG["zero_tols"]
+    a_acc, a_ext = abs_bins if abs_bins is not None else _ERROR_BIN_CONFIG["abs_bins"]
+
+    finite_mask = np.isfinite(targets) & np.isfinite(preds)
+    residual = np.where(finite_mask, preds - targets, np.float32(0.0)).astype(np.float32, copy=False)
+    codes = np.full(len(targets), -1, dtype=np.int8)
+
+    if not np.any(finite_mask):
+        return codes, residual, finite_mask
+
+    if cfg_mode == "abs":
+        r = residual[finite_mask]
+        c = np.full(len(r), 2, dtype=np.int8)
+        c[r <= -a_ext] = 0
+        c[(r > -a_ext) & (r <= -a_acc)] = 1
+        c[(r >= a_acc) & (r < a_ext)] = 3
+        c[r >= a_ext] = 4
+        codes[finite_mask] = c
+        return codes, residual, finite_mask
+
+    # Default 'pct' mode (matching legacy/blind_attempt.ipynb with consistent `pred - target` sign)
+    t_f = targets[finite_mask]
+    p_f = preds[finite_mask]
+    r_f = residual[finite_mask]
+    c = np.full(len(r_f), 2, dtype=np.int8)
+
+    zero_mask = np.abs(t_f) <= 1e-12
+    nonzero_mask = ~zero_mask
+
+    if np.any(nonzero_mask):
+        pct_err = (r_f[nonzero_mask] / t_f[nonzero_mask]) * np.float32(100.0)
+        cnz = np.full(len(pct_err), 2, dtype=np.int8)
+        cnz[pct_err <= -p_ext] = 0
+        cnz[(pct_err > -p_ext) & (pct_err <= -p_acc)] = 1
+        cnz[(pct_err >= p_acc) & (pct_err < p_ext)] = 3
+        cnz[pct_err >= p_ext] = 4
+        c[nonzero_mask] = cnz
+
+    if np.any(zero_mask):
+        pz = p_f[zero_mask]
+        cz = np.full(len(pz), 2, dtype=np.int8)
+        cz[pz < -z_ext] = 0
+        cz[(pz >= -z_ext) & (pz < -z_acc)] = 1
+        cz[(pz > z_acc) & (pz <= z_ext)] = 3
+        cz[pz > z_ext] = 4
+        c[zero_mask] = cz
+
+    codes[finite_mask] = c
+    return codes, residual, finite_mask
+
+
+def compute_error_bin_shares(
+    y_true: Any,
+    y_pred: Any,
+    *,
+    mode: Optional[str] = None,
+    pct_bins: Optional[Tuple[float, float]] = None,
+    zero_tols: Optional[Tuple[float, float]] = None,
+    abs_bins: Optional[Tuple[float, float]] = None,
+) -> Dict[str, float]:
+    """Vectorized percentage share of each of the 5 error bins (`0..100` scale)."""
+    codes, _, finite_mask = classify_error_bins(
+        y_true, y_pred, mode=mode, pct_bins=pct_bins, zero_tols=zero_tols, abs_bins=abs_bins
+    )
+    valid_codes = codes[finite_mask]
+    n_valid = len(valid_codes)
+    if n_valid == 0:
+        return {
+            "extreme_underforecast_pct": 0.0,
+            "underforecast_pct": 0.0,
+            "accurate_pct": 0.0,
+            "overforecast_pct": 0.0,
+            "extreme_overforecast_pct": 0.0,
+        }
+    counts = np.bincount(valid_codes, minlength=5)
+    pcts = counts.astype(np.float64) * (100.0 / float(n_valid))
+    return {
+        "extreme_underforecast_pct": float(pcts[0]),
+        "underforecast_pct": float(pcts[1]),
+        "accurate_pct": float(pcts[2]),
+        "overforecast_pct": float(pcts[3]),
+        "extreme_overforecast_pct": float(pcts[4]),
+    }
+
 
 def reset_cv_metric_log() -> None:
     """Clear the per-fold CV metric buffer before starting a new `GridSearchCV` / `BayesSearchCV` run."""
@@ -1355,6 +1496,8 @@ def candidate_score(estimator: Any, X: pd.DataFrame, y: Any) -> float:
     else:
         max_dd = 0.0
 
+    bin_shares = compute_error_bin_shares(targets, preds)
+
     _CV_FOLD_METRIC_LOG.append({
         "numerai_corr": mean_corr,
         "positive_era_pct": pos_era_pct,
@@ -1364,12 +1507,13 @@ def candidate_score(estimator: Any, X: pd.DataFrame, y: Any) -> float:
         "mae": mae_val,
         "forecast_bias": bias_val,
         "max_drawdown": max_dd,
+        **bin_shares,
     })
 
     print(
         f"  [Fold Score] Numerai CORR: {mean_corr * 100.0:+.2f}% ({mean_corr:.4f}) | "
         f"Sharpe: {sharpe_val:.2f} | Positive Eras: {pos_era_pct:.1f}% | "
-        f"Directional Accuracy: {dir_acc_pct:.1f}% | MAE: {mae_val:.4f}"
+        f"Dir Acc: {dir_acc_pct:.1f}% | Accurate Bin: {bin_shares['accurate_pct']:.1f}% | MAE: {mae_val:.4f}"
     )
     return mean_corr
 
@@ -1393,6 +1537,11 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
         metric_specs = (
             ("mean_positive_era_pct", "positive_era_pct", 2),
             ("mean_directional_accuracy_pct", "directional_accuracy_pct", 2),
+            ("mean_accurate_pct", "accurate_pct", 2),
+            ("mean_underforecast_pct", "underforecast_pct", 2),
+            ("mean_extreme_underforecast_pct", "extreme_underforecast_pct", 2),
+            ("mean_overforecast_pct", "overforecast_pct", 2),
+            ("mean_extreme_overforecast_pct", "extreme_overforecast_pct", 2),
             ("mean_sharpe", "sharpe", 4),
             ("mean_spearman", "spearman", 4),
             ("mean_mae", "mae", 4),
@@ -1494,6 +1643,7 @@ def plot_era_error_envelope(
     *,
     title: str = "Best Model",
     band_size: float = 0.15,
+    is_best: bool = False,
     save_path: Optional[Any] = None,
 ) -> pd.DataFrame:
     """Plot the flight-deck directional error envelope across Numerai eras (x = eras, y = data points per era, ribbon = over/under forecast share)."""
@@ -1542,13 +1692,19 @@ def plot_era_error_envelope(
 
     n_measured = int(is_measured.sum())
     min_era, max_era = int(era_index[0]), int(era_index[-1])
+    title_prefix = "[BEST] " if is_best else ""
+    title_color = PURPLE if is_best else "#111111"
     fig.suptitle(
-        f"{title}  \u00b7  {n_measured} validation eras  \u00b7  Era {min_era}\u2013{max_era}",
+        f"{title_prefix}{title}  \u00b7  {n_measured} validation eras  \u00b7  Era {min_era}\u2013{max_era}",
         x=0.06,
         ha="left",
         fontsize=19,
         fontweight="bold",
+        color=title_color,
     )
+    if is_best:
+        fig.patch.set_edgecolor(PURPLE)
+        fig.patch.set_linewidth(2.5)
     ax.set_xlabel("Validation Era")
     ax.set_ylabel("Data points per era")
     ax.set_xlim(min_era, max_era)
@@ -1636,3 +1792,349 @@ def plot_era_error_envelope(
         fig.savefig(target_path, dpi=140)
     plt.show()
     return envelope_df
+
+
+def compute_error_bin_waterfall(
+    y_true: Any,
+    y_pred: Any,
+    eras: Any,
+    *,
+    dates: Optional[Any] = None,
+    mode: Optional[str] = None,
+    pct_bins: Optional[Tuple[float, float]] = None,
+    zero_tols: Optional[Tuple[float, float]] = None,
+    abs_bins: Optional[Tuple[float, float]] = None,
+) -> pd.DataFrame:
+    """Fully vectorized 5-bin error waterfall summary across Overall, Quarterly Avg, Seasonal Q1-Q4 Avg, and each Financial Quarter."""
+    codes, residual, finite_mask = classify_error_bins(
+        y_true, y_pred, mode=mode, pct_bins=pct_bins, zero_tols=zero_tols, abs_bins=abs_bins
+    )
+    era_arr = np.asarray(eras, dtype=np.int32).ravel()
+    if len(era_arr) != len(codes):
+        raise ValueError(f"Length mismatch: eras={len(era_arr)}, y_true={len(codes)}.")
+    if not np.any(finite_mask):
+        raise ValueError("No finite predictions available for error-bin waterfall analysis.")
+
+    valid_codes = codes[finite_mask]
+    valid_res = residual[finite_mask]
+    valid_abs = np.abs(valid_res)
+    valid_eras = era_arr[finite_mask]
+
+    # Derive financial quarter keys vectorially (from `date` when available, else 13-era quarters)
+    quarter_keys: Optional[np.ndarray] = None
+    season_nums: Optional[np.ndarray] = None
+    if dates is not None:
+        dt_series = pd.to_datetime(pd.Series(np.asarray(dates).ravel()), errors="coerce")
+        valid_dt = dt_series.loc[finite_mask]
+        if bool(valid_dt.notna().all()):
+            years = valid_dt.dt.year.to_numpy(dtype=np.int32)
+            q_num = valid_dt.dt.quarter.to_numpy(dtype=np.int32)
+            quarter_keys = years * 10 + q_num
+            season_nums = q_num
+            quarter_is_calendar = True
+        else:
+            quarter_is_calendar = False
+    else:
+        quarter_is_calendar = False
+
+    if quarter_keys is None or season_nums is None:
+        min_era = int(valid_eras.min())
+        rel_era = valid_eras - min_era
+        y_idx = (rel_era // 52) + 1
+        q_num = ((rel_era % 52) // 13) + 1
+        quarter_keys = y_idx * 10 + q_num
+        season_nums = q_num
+
+    unique_q_keys, q_inv = np.unique(quarter_keys, return_inverse=True)
+    n_quarters = len(unique_q_keys)
+    q_counts = np.bincount(q_inv, minlength=n_quarters).astype(np.int64)
+    q_bin_counts = np.bincount(q_inv * 5 + valid_codes.astype(np.int64), minlength=n_quarters * 5).reshape(n_quarters, 5)
+    q_abs_sums = np.bincount(q_inv, weights=valid_abs.astype(np.float64), minlength=n_quarters)
+
+    # Era count per quarter via vectorized unique pairs
+    era_q_pairs = np.unique(np.column_stack((q_inv, valid_eras)), axis=0)
+    q_era_counts = np.bincount(era_q_pairs[:, 0], minlength=n_quarters)
+
+    # Overall row (vectorized bincount)
+    overall_n = int(len(valid_codes))
+    overall_eras = int(len(np.unique(valid_eras)))
+    overall_bins = np.bincount(valid_codes, minlength=5).astype(np.float64) * (100.0 / float(overall_n))
+    overall_mae = float(np.mean(valid_abs))
+
+    def _make_row(section: str, period: str, n_pts: int, n_eras_val: int, pcts_5: np.ndarray, mae_val: float) -> Dict[str, Any]:
+        under_tot = float(pcts_5[0] + pcts_5[1])
+        over_tot = float(pcts_5[3] + pcts_5[4])
+        extreme_tot = float(pcts_5[0] + pcts_5[4])
+        return {
+            "section": section,
+            "period": period,
+            "eras": int(n_eras_val),
+            "data_points": int(n_pts),
+            "extreme_underforecast_pct": round(float(pcts_5[0]), 2),
+            "underforecast_pct": round(float(pcts_5[1]), 2),
+            "accurate_pct": round(float(pcts_5[2]), 2),
+            "overforecast_pct": round(float(pcts_5[3]), 2),
+            "extreme_overforecast_pct": round(float(pcts_5[4]), 2),
+            "net_bias_pct": round(over_tot - under_tot, 2),
+            "extreme_total_pct": round(extreme_tot, 2),
+            "mae": round(float(mae_val), 4),
+        }
+
+    q_pcts = (q_bin_counts.astype(np.float64) / np.maximum(q_counts[:, None], 1)) * 100.0
+    q_maes = q_abs_sums / np.maximum(q_counts, 1)
+
+    rows: List[Dict[str, Any]] = [
+        _make_row("Overall", "Overall (All Validation)", overall_n, overall_eras, overall_bins, overall_mae),
+        _make_row(
+            "Quarterly Avg",
+            f"Quarterly Avg ({n_quarters} Qtrs)",
+            int(round(float(np.mean(q_counts)))),
+            int(round(float(np.mean(q_era_counts)))),
+            np.mean(q_pcts, axis=0),
+            float(np.mean(q_maes)),
+        ),
+    ]
+
+    # Seasonal Q1..Q4 averages across years
+    q_season_ids = unique_q_keys % 10
+    for q_idx in (1, 2, 3, 4):
+        s_mask = q_season_ids == q_idx
+        if np.any(s_mask):
+            rows.append(
+                _make_row(
+                    "Seasonal Avg",
+                    f"Q{q_idx} Avg ({int(s_mask.sum())} yrs)",
+                    int(round(float(np.mean(q_counts[s_mask])))),
+                    int(round(float(np.mean(q_era_counts[s_mask])))),
+                    np.mean(q_pcts[s_mask], axis=0),
+                    float(np.mean(q_maes[s_mask])),
+                )
+            )
+
+    # Individual chronological financial quarters
+    for idx in range(n_quarters):
+        qk = int(unique_q_keys[idx])
+        yr, qt = qk // 10, qk % 10
+        label = f"{yr}-Q{qt}" if quarter_is_calendar else f"Y{yr}-Q{qt}"
+        rows.append(
+            _make_row(
+                "Financial Quarter",
+                label,
+                int(q_counts[idx]),
+                int(q_era_counts[idx]),
+                q_pcts[idx],
+                float(q_maes[idx]),
+            )
+        )
+
+    return pd.DataFrame(rows)
+
+
+def compute_model_error_bin_comparison(
+    results_dict: Mapping[str, Mapping[str, Any]],
+    y_true: Any,
+    *,
+    best_variant_name: Optional[str] = None,
+    mode: Optional[str] = None,
+    pct_bins: Optional[Tuple[float, float]] = None,
+    zero_tols: Optional[Tuple[float, float]] = None,
+    abs_bins: Optional[Tuple[float, float]] = None,
+) -> pd.DataFrame:
+    """Vectorized side-by-side 5-bin error summary across all evaluated models/variants."""
+    rows: List[Dict[str, Any]] = []
+    for variant_name, res in results_dict.items():
+        preds = res.get("validation_preds")
+        if preds is None:
+            continue
+        codes, residual, finite_mask = classify_error_bins(
+            y_true, preds, mode=mode, pct_bins=pct_bins, zero_tols=zero_tols, abs_bins=abs_bins
+        )
+        valid_codes = codes[finite_mask]
+        n_valid = max(1, len(valid_codes))
+        pcts = np.bincount(valid_codes, minlength=5).astype(np.float64) * (100.0 / float(n_valid))
+        mae_val = float(np.mean(np.abs(residual[finite_mask]))) if np.any(finite_mask) else 0.0
+        rows.append({
+            "variant": f"[BEST] {variant_name}" if variant_name == best_variant_name else str(variant_name),
+            "data_points": int(len(valid_codes)),
+            "extreme_underforecast_pct": round(float(pcts[0]), 2),
+            "underforecast_pct": round(float(pcts[1]), 2),
+            "accurate_pct": round(float(pcts[2]), 2),
+            "overforecast_pct": round(float(pcts[3]), 2),
+            "extreme_overforecast_pct": round(float(pcts[4]), 2),
+            "net_bias_pct": round(float((pcts[3] + pcts[4]) - (pcts[0] + pcts[1])), 2),
+            "extreme_total_pct": round(float(pcts[0] + pcts[4]), 2),
+            "mae": round(mae_val, 4),
+        })
+    return pd.DataFrame(rows)
+
+
+def plot_error_bin_waterfall(
+    waterfall_df: pd.DataFrame,
+    *,
+    title: str = "Best Model",
+    save_path: Optional[Any] = None,
+) -> None:
+    """Plot a 2-panel flight-deck Error-Bin Waterfall (Overall step-down + Financial Quarter diverging stacked bars)."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    PURPLE = "#7446A5"
+    GREEN = "#10b981"
+    BLUE = "#5C9ED6"
+    DEEP_BLUE = "#1d4ed8"
+    ORANGE = "#EEA04B"
+    DEEP_ORANGE = "#c2410c"
+    SLATE = "#64748b"
+
+    overall_rows = waterfall_df.loc[waterfall_df["section"] == "Overall"]
+    q_avg_rows = waterfall_df.loc[waterfall_df["section"] == "Quarterly Avg"]
+    quarter_rows = waterfall_df.loc[waterfall_df["section"] == "Financial Quarter"].reset_index(drop=True)
+    if overall_rows.empty:
+        raise ValueError("waterfall_df must contain an 'Overall' row.")
+
+    ov = overall_rows.reset_index(drop=True).loc[0]
+    total_pts = int(ov["data_points"])
+
+    fig, (ax_wf, ax_q) = plt.subplots(
+        1, 2, figsize=(19, 6.2), facecolor="white", gridspec_kw={"width_ratios": [1.0, 1.55]}
+    )
+    for ax in (ax_wf, ax_q):
+        ax.set_facecolor("white")
+        ax.grid(axis="y", color="#DDDDDD", linewidth=0.7)
+        ax.set_axisbelow(True)
+        ax.tick_params(length=0, labelsize=9.5)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    # --- Left Panel: Overall Error-Bin Waterfall (100% step-down decomposition) ---
+    wf_labels = [
+        "Total\n(100%)",
+        "Accurate",
+        "Under-\nforecast",
+        "Extreme\nUnder",
+        "Over-\nforecast",
+        "Extreme\nOver",
+    ]
+    wf_vals = [
+        100.0,
+        float(ov["accurate_pct"]),
+        float(ov["underforecast_pct"]),
+        float(ov["extreme_underforecast_pct"]),
+        float(ov["overforecast_pct"]),
+        float(ov["extreme_overforecast_pct"]),
+    ]
+    wf_colors = [SLATE, GREEN, ORANGE, DEEP_ORANGE, BLUE, DEEP_BLUE]
+    x_pos = np.arange(len(wf_labels))
+
+    bottoms = [0.0]
+    running = 100.0
+    for val in wf_vals[1:]:
+        running = max(0.0, running - val)
+        bottoms.append(running)
+
+    ax_wf.bar(x_pos, wf_vals, bottom=bottoms, color=wf_colors, width=0.58, alpha=0.88, edgecolor="white", linewidth=1.0)
+    for idx in range(len(wf_labels) - 1):
+        connector_y = bottoms[idx] if idx > 0 else 100.0
+        if idx == 0:
+            connector_y = 100.0
+        ax_wf.plot(
+            [x_pos[idx] + 0.29, x_pos[idx + 1] - 0.29],
+            [connector_y, connector_y],
+            color="#94a3b8",
+            linestyle="--",
+            linewidth=0.9,
+        )
+
+    for idx, (val, bot) in enumerate(zip(wf_vals, bottoms)):
+        cnt = int(round(total_pts * val / 100.0))
+        top_y = bot + val
+        cnt_str = f"{cnt / 1e6:.2f}M" if cnt >= 1_000_000 else (f"{cnt / 1e3:.1f}k" if cnt >= 1000 else f"{cnt:,}")
+        ax_wf.text(
+            x_pos[idx],
+            top_y + 1.5,
+            f"{val:.1f}%\n({cnt_str})",
+            ha="center",
+            va="bottom",
+            fontsize=8.5,
+            fontweight="bold",
+            color="#222222",
+        )
+
+    ax_wf.set_xticks(x_pos)
+    ax_wf.set_xticklabels(wf_labels, fontsize=9)
+    ax_wf.set_ylabel("Share of Validation Data Points (%)")
+    ax_wf.set_ylim(0, 118)
+    ax_wf.set_title("Overall Error-Bin Waterfall", fontsize=12.5, fontweight="bold", pad=10)
+
+    # --- Right Panel: Financial Quarter Diverging Stacked Bars + Accurate % Trend ---
+    if not quarter_rows.empty:
+        q_x = np.arange(len(quarter_rows))
+        q_labels = quarter_rows["period"].astype(str).tolist()
+        over_v = quarter_rows["overforecast_pct"].to_numpy(dtype=np.float64)
+        ext_over_v = quarter_rows["extreme_overforecast_pct"].to_numpy(dtype=np.float64)
+        under_v = quarter_rows["underforecast_pct"].to_numpy(dtype=np.float64)
+        ext_under_v = quarter_rows["extreme_underforecast_pct"].to_numpy(dtype=np.float64)
+        acc_v = quarter_rows["accurate_pct"].to_numpy(dtype=np.float64)
+
+        ax_q.bar(q_x, over_v, color=BLUE, alpha=0.82, width=0.68, label="Overforecast %")
+        ax_q.bar(q_x, ext_over_v, bottom=over_v, color=DEEP_BLUE, alpha=0.88, width=0.68, label="Extreme Over %")
+        ax_q.bar(q_x, -under_v, color=ORANGE, alpha=0.82, width=0.68, label="Underforecast %")
+        ax_q.bar(q_x, -ext_under_v, bottom=-under_v, color=DEEP_ORANGE, alpha=0.88, width=0.68, label="Extreme Under %")
+        ax_q.axhline(0.0, color="#475569", linewidth=1.0)
+
+        ax_q.plot(q_x, acc_v, color=PURPLE, linestyle=":", marker="o", markersize=4.5, linewidth=2.2, zorder=5, label="Accurate %")
+        if not q_avg_rows.empty:
+            avg_acc = float(q_avg_rows.reset_index(drop=True).loc[0, "accurate_pct"])
+            ax_q.axhline(avg_acc, color=PURPLE, linestyle="--", linewidth=1.1, alpha=0.65, label=f"Qtr Avg Accurate ({avg_acc:.1f}%)")
+
+        step = max(1, len(q_labels) // 12)
+        ax_q.set_xticks(q_x[::step])
+        ax_q.set_xticklabels(q_labels[::step], rotation=40, ha="right", fontsize=8.5)
+        ax_q.set_ylabel("Error Share by Direction (% Over ↑ / % Under ↓)")
+        ax_q.set_title("Financial Quarter Error Breakdown", fontsize=12.5, fontweight="bold", pad=10)
+        ax_q.legend(
+            handles=[
+                Patch(facecolor=DEEP_BLUE, alpha=0.88, label="Extreme Over"),
+                Patch(facecolor=BLUE, alpha=0.82, label="Overforecast"),
+                Patch(facecolor=ORANGE, alpha=0.82, label="Underforecast"),
+                Patch(facecolor=DEEP_ORANGE, alpha=0.88, label="Extreme Under"),
+                Line2D([], [], color=PURPLE, linestyle=":", marker="o", markersize=4.5, linewidth=2.2, label="Accurate %"),
+            ],
+            loc="upper right",
+            frameon=False,
+            ncol=3,
+            fontsize=8.5,
+        )
+
+    cfg_mode = _ERROR_BIN_CONFIG["mode"]
+    if cfg_mode == "pct":
+        p_acc, p_ext = _ERROR_BIN_CONFIG["pct_bins"]
+        z_acc, z_ext = _ERROR_BIN_CONFIG["zero_tols"]
+        rule_str = f"mode='pct' (±{p_acc:g}% / ±{p_ext:g}%, zero-target ±{z_acc:g} / ±{z_ext:g})"
+    else:
+        a_acc, a_ext = _ERROR_BIN_CONFIG["abs_bins"]
+        rule_str = f"mode='abs' (±{a_acc:g} / ±{a_ext:g})"
+
+    fig.suptitle(
+        f"[BEST] {title}  \u00b7  Error-Bin Waterfall & Quarterly Breakdown",
+        x=0.04,
+        ha="left",
+        fontsize=17,
+        fontweight="bold",
+        color=PURPLE,
+    )
+    fig.text(
+        0.04,
+        0.02,
+        f"Binning rule: {rule_str} | Total validation points: {total_pts:,} | "
+        f"Overall Accurate: {ov['accurate_pct']:.1f}% | Net Bias (Over% - Under%): {ov['net_bias_pct']:+.1f}% | Extreme Total: {ov['extreme_total_pct']:.1f}%",
+        fontsize=9,
+        color="#555555",
+    )
+    fig.subplots_adjust(left=0.05, right=0.98, top=0.84, bottom=0.18, wspace=0.20)
+    if save_path is not None:
+        target_path = Path(save_path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(target_path, dpi=140)
+    plt.show()
