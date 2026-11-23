@@ -7,6 +7,7 @@ lives in `baseline_utils.py`.
 
 from __future__ import annotations
 
+import gc
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -212,17 +213,18 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
         sample_weight: Optional[Any] = None,
         eras: Optional[Any] = None,
     ) -> "LightGBMNumeraiEstimator":
-        _, feature_matrix, target_values, _, sample_weights, era_values = self._prepare_fit_inputs(
-            X, y, sample_weight=sample_weight, eras=eras
+        features_df, _, target_values, _, sample_weights, era_values = self._prepare_fit_inputs(
+            X, y, sample_weight=sample_weight, eras=eras, return_matrix=False
         )
-        selected_matrix = np.asarray(feature_matrix[:, self.selected_indices_], dtype=np.float32)
+        selected_cols = list(self.selected_feature_names_)
+        selected_df = features_df if len(selected_cols) == len(features_df.columns) and list(features_df.columns) == selected_cols else features_df[selected_cols]
 
         model = self._build_lgbm_model()
         fit_kwargs: Dict[str, Any] = {}
         if sample_weights is not None:
             fit_kwargs["sample_weight"] = sample_weights
 
-        model.fit(selected_matrix, target_values, **fit_kwargs)
+        model.fit(selected_df, target_values, **fit_kwargs)
         self.model_ = model
 
         booster = model.booster_
@@ -231,7 +233,7 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
         self.feature_importances_ = np.asarray(model.feature_importances_, dtype=np.float64)
         self.feature_importance_df_ = (
             pd.DataFrame({
-                "feature": list(self.selected_feature_names_),
+                "feature": selected_cols,
                 "gain_importance": gain_imp,
                 "split_importance": split_imp,
                 "train_corr": np.asarray(self.selected_corrs_, dtype=np.float64),
@@ -240,16 +242,25 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
             .reset_index(drop=True)
         )
 
-        raw_train_pred = np.asarray(model.predict(selected_matrix), dtype=np.float64).ravel()
-        self._fit_bias_correction(target_values, raw_train_pred, era_values)
+        if self.bias_correction not in (None, False, "None", "none", ""):
+            raw_train_pred = np.asarray(model.predict(selected_df), dtype=np.float64).ravel()
+            self._fit_bias_correction(target_values, raw_train_pred, era_values)
+            del raw_train_pred
+        else:
+            self.learned_bias_offset_ = 0.0
+
+        del selected_df, features_df
+        gc.collect()
         return self
 
     def predict(self, X: Any) -> np.ndarray:
         if not hasattr(self, "model_"):
             raise ValueError("LightGBMNumeraiEstimator must be fitted before calling predict.")
-        feature_matrix, era_values = self._prepare_predict_matrix(X)
-        selected_matrix = np.asarray(feature_matrix[:, self.selected_indices_], dtype=np.float32)
-        raw_pred = np.asarray(self.model_.predict(selected_matrix), dtype=np.float64).ravel()
+        features_df, era_values = self._prepare_predict_df(X)
+        selected_cols = list(self.selected_feature_names_)
+        selected_df = features_df if len(selected_cols) == len(features_df.columns) and list(features_df.columns) == selected_cols else features_df[selected_cols]
+        raw_pred = np.asarray(self.model_.predict(selected_df), dtype=np.float64).ravel()
+        del selected_df, features_df
         return self._apply_prediction_transform(raw_pred, era_values)
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 from pathlib import Path
@@ -144,17 +145,44 @@ def _parse_pipe_tokens(option: Any, valid_tokens: Sequence[str]) -> set:
     return tokens
 
 
+def _all_integer_dtypes(df: pd.DataFrame) -> bool:
+    """True when every column in `df` has a non-nullable NumPy integer dtype (guaranteed no NaNs)."""
+    return all(
+        isinstance(dt, np.dtype) and np.issubdtype(dt, np.integer)
+        for dt in df.dtypes
+    )
+
+
+def _all_numeric_dtypes(df: pd.DataFrame) -> bool:
+    """True when every column in `df` is already numeric (`int8`, `int16`, `int32`, `float32`, etc.)."""
+    return all(pd.api.types.is_numeric_dtype(dt) for dt in df.dtypes)
+
+
 def _fill_missing_features(
     df: pd.DataFrame,
     missing_fill_value: Any = 2.0,
     era_series: Optional[pd.Series] = None,
     learned_fill_map: Optional[pd.Series] = None,
 ) -> Tuple[pd.DataFrame, pd.Series]:
-    """Impute missing values using `sklearn.impute.SimpleImputer` for constant/mean/median and `groupby(era)` for `'era_mean'`/`'era_median'`."""
-    numeric_df = df.apply(pd.to_numeric, errors="coerce")
-    cols = numeric_df.columns
+    """Impute missing values using `sklearn.impute.SimpleImputer` for constant/mean/median and `groupby(era)` for `'era_mean'`/`'era_median'`.
+
+    Fast-paths already-numeric DataFrames (`int8`/`int16`/`int32`/`float32`) with no missing values without
+    copying or upcasting to `float64`. When imputation is required, operates in `np.float32`.
+    """
+    cols = df.columns
     if len(cols) == 0:
-        return numeric_df.copy(), pd.Series(dtype=np.float64)
+        return df, pd.Series(dtype=np.float32)
+
+    all_numeric = _all_numeric_dtypes(df)
+    if all_numeric:
+        numeric_df = df
+    else:
+        numeric_df = df.copy()
+        for col in cols:
+            if not pd.api.types.is_numeric_dtype(numeric_df[col].dtype):
+                numeric_df[col] = pd.to_numeric(numeric_df[col], errors="coerce").astype(np.float32)
+
+    has_missing = False if _all_integer_dtypes(numeric_df) else bool(numeric_df.isna().any().any())
 
     mode = "2.0" if missing_fill_value is None else str(missing_fill_value).strip().lower()
     const_val: Optional[float] = None
@@ -168,32 +196,41 @@ def _fill_missing_features(
         const_val = float(missing_fill_value)
 
     if const_val is not None:
-        col_defaults = pd.Series(const_val, index=cols, dtype=np.float64)
-        if not bool(numeric_df.isna().any().any()):
+        col_defaults = pd.Series(np.float32(const_val), index=cols, dtype=np.float32)
+        if not has_missing:
             return numeric_df, col_defaults
-        imputer = SimpleImputer(strategy="constant", fill_value=const_val, keep_empty_features=True)
-        imputed_arr = imputer.fit_transform(numeric_df.to_numpy(dtype=np.float64, copy=False))
-        return pd.DataFrame(imputed_arr, index=numeric_df.index, columns=cols), col_defaults
+        imputer = SimpleImputer(strategy="constant", fill_value=np.float32(const_val), keep_empty_features=True)
+        imputed_arr = imputer.fit_transform(numeric_df.to_numpy(dtype=np.float32, copy=False))
+        return pd.DataFrame(np.asarray(imputed_arr, dtype=np.float32), index=numeric_df.index, columns=cols), col_defaults
 
     if learned_fill_map is not None:
-        col_defaults = learned_fill_map.reindex(cols).fillna(2.0)
+        col_defaults = learned_fill_map.reindex(cols).fillna(2.0).astype(np.float32)
     else:
-        base_strategy = "median" if mode in ("median", "era_median") else "mean"
-        imputer = SimpleImputer(strategy=base_strategy, keep_empty_features=True)
-        imputer.fit(numeric_df.to_numpy(dtype=np.float64, copy=False))
-        stats_arr = np.where(np.isfinite(imputer.statistics_), imputer.statistics_, 2.0)
-        col_defaults = pd.Series(stats_arr, index=cols, dtype=np.float64)
+        if not has_missing:
+            stats_series = (
+                numeric_df.median(numeric_only=True)
+                if mode in ("median", "era_median")
+                else numeric_df.mean(numeric_only=True)
+            )
+            col_defaults = stats_series.reindex(cols).fillna(2.0).astype(np.float32)
+        else:
+            base_strategy = "median" if mode in ("median", "era_median") else "mean"
+            imputer = SimpleImputer(strategy=base_strategy, keep_empty_features=True)
+            imputer.fit(numeric_df.to_numpy(dtype=np.float32, copy=False))
+            stats_arr = np.where(np.isfinite(imputer.statistics_), imputer.statistics_, 2.0).astype(np.float32)
+            col_defaults = pd.Series(stats_arr, index=cols, dtype=np.float32)
 
-    if mode in ("era_mean", "era_median") and era_series is not None and bool(numeric_df.isna().any().any()):
+    if not has_missing:
+        return numeric_df, col_defaults
+
+    if mode in ("era_mean", "era_median") and era_series is not None:
         agg_fn = "mean" if mode == "era_mean" else "median"
-        era_filled = numeric_df.groupby(era_series).transform(
+        era_filled = numeric_df.astype(np.float32, copy=False).groupby(era_series).transform(
             lambda s: s.fillna(s.mean() if agg_fn == "mean" else s.median())
         )
-        return era_filled.fillna(col_defaults).fillna(2.0), col_defaults
+        return era_filled.fillna(col_defaults).fillna(np.float32(2.0)).astype(np.float32, copy=False), col_defaults
 
-    if not bool(numeric_df.isna().any().any()):
-        return numeric_df, col_defaults
-    return numeric_df.fillna(col_defaults).fillna(2.0), col_defaults
+    return numeric_df.astype(np.float32, copy=False).fillna(col_defaults).fillna(np.float32(2.0)), col_defaults
 
 
 def prepare_bayesian_space(space: Mapping[str, Any]) -> Dict[str, Any]:
@@ -369,21 +406,29 @@ def compute_feature_target_correlations(
     if method in ("none", ""):
         return pd.Series(np.ones(n_features, dtype=np.float64), index=feature_cols)
 
-    clean_df = features_df.apply(pd.to_numeric, errors="coerce").fillna(2.0).astype(np.float64)
-    clean_target = pd.Series(np.asarray(target_series, dtype=np.float64).ravel(), index=clean_df.index, name="target")
+    clean_df, _ = _fill_missing_features(features_df, missing_fill_value=2.0)
+    clean_target = pd.Series(np.asarray(target_series, dtype=np.float32).ravel(), index=clean_df.index, name="target")
 
     if method == "pandas_mean":
         if era_series is not None and len(era_series) == len(clean_df):
             eras = pd.Series(np.asarray(era_series).ravel(), index=clean_df.index)
-            per_era_corrs: List[pd.Series] = []
+            corr_sum = np.zeros(n_features, dtype=np.float64)
+            n_valid_eras = 0
             for _, era_features in clean_df.groupby(eras, sort=True):
                 era_target = clean_target.loc[era_features.index]
                 if len(era_features) < 3 or float(era_target.std()) <= 1e-12:
                     continue
-                per_era_corrs.append(era_features.corrwith(era_target).fillna(0.0))
-            if per_era_corrs:
-                return pd.concat(per_era_corrs, axis=1).mean(axis=1).reindex(feature_cols).fillna(0.0)
-        return clean_df.corrwith(clean_target).reindex(feature_cols).fillna(0.0)
+                era_x = era_features.to_numpy(dtype=np.float32, copy=False)
+                era_y = era_target.to_numpy(dtype=np.float32, copy=False)
+                era_c = np.nan_to_num(r_regression(era_x, era_y), nan=0.0, posinf=0.0, neginf=0.0)
+                corr_sum += era_c
+                n_valid_eras += 1
+            if n_valid_eras > 0:
+                return pd.Series(corr_sum / float(n_valid_eras), index=feature_cols, dtype=np.float64)
+        feature_matrix = clean_df.to_numpy(dtype=np.float32, copy=False)
+        target_values = clean_target.to_numpy(dtype=np.float32, copy=False)
+        corrs = np.nan_to_num(r_regression(feature_matrix, target_values), nan=0.0, posinf=0.0, neginf=0.0)
+        return pd.Series(corrs, index=feature_cols, dtype=np.float64)
 
     if method == "numerai_mean":
         if era_series is not None and len(era_series) == len(clean_df):
@@ -393,19 +438,27 @@ def compute_feature_target_correlations(
                 era_target = clean_target.loc[era_features.index]
                 if len(era_features) < 3 or float(era_target.std()) <= 1e-12:
                     continue
-                per_era_num_corrs.append(numerai_corr(era_features, era_target).fillna(0.0))
+                era_f32 = era_features.astype(np.float32, copy=False)
+                per_era_num_corrs.append(numerai_corr(era_f32, era_target).fillna(0.0))
             if per_era_num_corrs:
                 return pd.concat(per_era_num_corrs, axis=1).mean(axis=1).reindex(feature_cols).fillna(0.0)
-        return numerai_corr(clean_df, clean_target).reindex(feature_cols).fillna(0.0)
+        return numerai_corr(clean_df.astype(np.float32, copy=False), clean_target).reindex(feature_cols).fillna(0.0)
 
-    feature_matrix = clean_df.to_numpy(dtype=np.float64, copy=False)
-    target_values = clean_target.to_numpy(dtype=np.float64, copy=False)
+    target_values = clean_target.to_numpy(dtype=np.float32, copy=False)
     if method == "spearman":
-        ranked_features = np.apply_along_axis(stats.rankdata, 0, feature_matrix)
-        ranked_target = stats.rankdata(target_values)
-        corrs = np.nan_to_num(r_regression(ranked_features, ranked_target), nan=0.0, posinf=0.0, neginf=0.0)
+        ranked_target = stats.rankdata(target_values).astype(np.float32, copy=False)
+        corrs = np.zeros(n_features, dtype=np.float64)
+        chunk_size = 128
+        for start in range(0, n_features, chunk_size):
+            chunk_cols = feature_cols[start : start + chunk_size]
+            chunk_mat = clean_df[chunk_cols].to_numpy(dtype=np.float32, copy=False)
+            ranked_chunk = np.apply_along_axis(stats.rankdata, 0, chunk_mat).astype(np.float32, copy=False)
+            corrs[start : start + len(chunk_cols)] = np.nan_to_num(
+                r_regression(ranked_chunk, ranked_target), nan=0.0, posinf=0.0, neginf=0.0
+            )
         return pd.Series(corrs, index=feature_cols, dtype=np.float64)
 
+    feature_matrix = clean_df.to_numpy(dtype=np.float32, copy=False)
     corrs = np.nan_to_num(r_regression(feature_matrix, target_values), nan=0.0, posinf=0.0, neginf=0.0)
     return pd.Series(corrs, index=feature_cols, dtype=np.float64)
 
@@ -532,6 +585,7 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
         )
 
         # Optional `year_horizon_filter` during fit (training-era filter only — never added as a feature)
+        use_filter = False
         fit_mask = pd.Series(True, index=clean_df.index)
         decoded_horizons = _decode_structured(self.year_horizon_filter)
         if era_series is not None and decoded_horizons not in (None, "none", "None", ""):
@@ -540,17 +594,18 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
             else:
                 horizons = [int(h) for h in decoded_horizons]
             candidate_mask = ((era_series - 1) // 52 + 1).isin(horizons)
-            if bool(candidate_mask.any()):
-                fit_mask &= candidate_mask
+            if bool(candidate_mask.any()) and not bool(candidate_mask.all()):
+                fit_mask = candidate_mask
+                use_filter = True
 
-        fit_clean_df = clean_df.loc[fit_mask]
-        fit_era_series = era_series.loc[fit_mask] if era_series is not None else None
+        fit_clean_df = clean_df.loc[fit_mask] if use_filter else clean_df
+        fit_era_series = (era_series.loc[fit_mask] if use_filter else era_series) if era_series is not None else None
 
         var_thresh = max(0.0, float(self.variance_threshold or 0.0))
         if var_thresh > 0.0:
             vt_selector = VarianceThreshold(threshold=var_thresh)
             try:
-                vt_selector.fit(fit_clean_df.to_numpy(dtype=np.float64, copy=False))
+                vt_selector.fit(fit_clean_df.to_numpy(dtype=np.float32, copy=False))
                 support_mask = vt_selector.get_support()
                 kept_cols = [col for col, keep in zip(raw_cols, support_mask) if keep] or raw_cols
             except ValueError:
@@ -558,16 +613,16 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
         else:
             kept_cols = raw_cols
 
-        fit_clean_df = fit_clean_df[kept_cols]
+        fit_clean_df = fit_clean_df if kept_cols == raw_cols else fit_clean_df[kept_cols]
 
         target_vec: Optional[pd.Series] = None
         if self.target_col and self.target_col in X_df.columns:
-            target_vec = pd.to_numeric(X_df[self.target_col], errors="coerce").fillna(0.5).astype(np.float64)
+            target_vec = pd.to_numeric(X_df[self.target_col], errors="coerce").fillna(0.5).astype(np.float32)
         elif y is not None:
-            target_vec = pd.Series(np.asarray(y, dtype=np.float64).ravel(), index=clean_df.index)
+            target_vec = pd.Series(np.asarray(y, dtype=np.float32).ravel(), index=clean_df.index)
 
         if target_vec is not None and self.correlation_method not in (None, "none", "None", ""):
-            target_series = target_vec.loc[fit_mask]
+            target_series = target_vec.loc[fit_mask] if use_filter else target_vec
             corr_series = compute_feature_target_correlations(
                 fit_clean_df,
                 target_series,
@@ -607,15 +662,17 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
             else:
                 raise ValueError(f"Unsupported sparse_selector '{self.sparse_selector}'; use None, 'lasso', or 'elasticnet'.")
             sfm = SelectFromModel(base_sparse)
+            fit_target_arr = (target_vec.loc[fit_mask] if use_filter else target_vec).to_numpy(dtype=np.float32, copy=False)
             sfm.fit(
-                fit_clean_df[selected_cols].to_numpy(dtype=np.float64, copy=False),
-                target_vec.loc[fit_mask].to_numpy(dtype=np.float64, copy=False),
+                fit_clean_df[selected_cols].to_numpy(dtype=np.float32, copy=False),
+                fit_target_arr,
             )
             sparse_support = sfm.get_support()
             sparse_kept = [col for col, keep in zip(selected_cols, sparse_support) if keep]
             if sparse_kept:
                 selected_cols = sparse_kept
             self.sparse_selector_ = sfm
+            gc.collect()
 
         self.pca_: Optional[PCA] = None
         if (
@@ -629,7 +686,8 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
             else:
                 n_comp = min(max(1, int(raw_pca)), len(selected_cols), len(fit_clean_df))
             self.pca_ = PCA(n_components=n_comp, random_state=42)
-            self.pca_.fit(fit_clean_df[selected_cols].to_numpy(dtype=np.float64, copy=False))
+            self.pca_.fit(fit_clean_df[selected_cols].to_numpy(dtype=np.float32, copy=False))
+            gc.collect()
 
         self.feature_names_in_ = np.asarray(raw_cols, dtype=object)
         self.n_features_in_ = len(raw_cols)
@@ -703,7 +761,7 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
 
         dispersion_tokens = _parse_pipe_tokens(self.era_dispersion_features, ("mean", "std", "extreme_frac"))
         if dispersion_tokens:
-            mat = base_features.to_numpy(dtype=np.float64, copy=False)
+            mat = base_features.to_numpy(dtype=np.float32, copy=False)
             if "mean" in dispersion_tokens:
                 extra_cols["row_feat_mean_bin"] = np.clip(np.rint(mat.mean(axis=1)), 0, 4).astype(np.int8)
             if "std" in dispersion_tokens:
@@ -714,6 +772,7 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
                 extra_cols["row_extreme_frac_bin"] = np.clip(
                     np.rint(((mat == 0) | (mat == 4)).mean(axis=1) * 4.0), 0, 4
                 ).astype(np.int8)
+            del mat
 
         seq_top_n = max(1, int(self.sequence_top_n or 4))
 
@@ -803,7 +862,7 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
                         )
 
         if getattr(self, "pca_", None) is not None:
-            pca_scores = self.pca_.transform(base_features.to_numpy(dtype=np.float64, copy=False))
+            pca_scores = self.pca_.transform(base_features.to_numpy(dtype=np.float32, copy=False))
             pca_cols = {
                 f"pca_comp_{comp_idx}": self._quantize_signal(
                     pca_scores[:, comp_idx], era_vals, f"pca_comp_{comp_idx}"
@@ -811,10 +870,11 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
                 for comp_idx in range(pca_scores.shape[1])
             }
             base_features = pd.DataFrame(pca_cols, index=base_features.index)
+            del pca_scores
 
         if extra_cols:
             return pd.concat([base_features, pd.DataFrame(extra_cols, index=base_features.index)], axis=1)
-        return base_features.copy()
+        return base_features
 
 
 NumeraiFeatureExtractor = NumeraiExtractions
@@ -889,7 +949,13 @@ def compute_feature_exposure(
     for col in cols:
         if col not in features_df.columns:
             continue
-        f_vals = pd.to_numeric(features_df[col], errors="coerce").fillna(2.0).to_numpy(dtype=np.float64, copy=False)
+        col_series = features_df[col]
+        if isinstance(col_series.dtype, np.dtype) and np.issubdtype(col_series.dtype, np.integer):
+            f_vals = col_series.to_numpy(dtype=np.float32, copy=False)
+        elif pd.api.types.is_numeric_dtype(col_series.dtype):
+            f_vals = col_series.fillna(2.0).to_numpy(dtype=np.float32, copy=False)
+        else:
+            f_vals = pd.to_numeric(col_series, errors="coerce").fillna(2.0).to_numpy(dtype=np.float32, copy=False)
         if float(np.std(f_vals)) <= 1e-12:
             feature_corrs.append(0.0)
         else:

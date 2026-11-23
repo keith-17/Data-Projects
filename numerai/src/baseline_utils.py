@@ -6,6 +6,7 @@ search space helpers, and Numerai evaluation functions live in `utils.py`.
 
 from __future__ import annotations
 
+import gc
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -17,6 +18,7 @@ from statsmodels.tsa.stattools import pacf as statsmodels_pacf
 from utils import (
     FORBIDDEN_FEATURE_COLS,
     NumeraiExtractions,
+    _all_numeric_dtypes,
     _decode_structured,
     compute_feature_target_correlations,
 )
@@ -103,19 +105,21 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
         y: Any,
         sample_weight: Optional[Any] = None,
         eras: Optional[Any] = None,
-    ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, List[str], Optional[np.ndarray], Optional[np.ndarray]]:
+        return_matrix: bool = True,
+        matrix_dtype: Any = np.float32,
+    ) -> Tuple[pd.DataFrame, Optional[np.ndarray], np.ndarray, List[str], Optional[np.ndarray], Optional[np.ndarray]]:
         if isinstance(X, pd.DataFrame):
-            X_df = X.copy()
+            X_df = X
         else:
-            arr = np.asarray(X, dtype=np.float64)
+            arr = np.asarray(X, dtype=np.float32)
             if arr.ndim == 1:
                 arr = arr.reshape(-1, 1)
             X_df = pd.DataFrame(arr, columns=[f"f{idx}" for idx in range(arr.shape[1])])
 
         if self.target_col and self.target_col in X_df.columns:
-            target_values = pd.to_numeric(X_df[self.target_col], errors="coerce").fillna(0.5).to_numpy(dtype=np.float64)
+            target_values = pd.to_numeric(X_df[self.target_col], errors="coerce").fillna(0.5).to_numpy(dtype=np.float32)
         else:
-            target_values = np.asarray(y, dtype=np.float64).ravel()
+            target_values = np.asarray(y, dtype=np.float32).ravel()
 
         n_samples = len(X_df)
         if len(target_values) != n_samples:
@@ -147,23 +151,36 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
         if not feature_names:
             raise ValueError("No valid feature columns remain after removing forbidden metadata columns.")
 
-        features_df = X_proc[feature_names].apply(pd.to_numeric, errors="coerce")
-        feature_matrix = features_df.to_numpy(dtype=np.float64, copy=False)
+        raw_features_df = X_proc[feature_names]
+        if _all_numeric_dtypes(raw_features_df):
+            features_df = raw_features_df
+        else:
+            features_df = raw_features_df.copy()
+            for col in feature_names:
+                if not pd.api.types.is_numeric_dtype(features_df[col].dtype):
+                    features_df[col] = pd.to_numeric(features_df[col], errors="coerce").astype(np.float32)
+
+        feature_matrix: Optional[np.ndarray] = None
+        if return_matrix:
+            if matrix_dtype is None:
+                feature_matrix = features_df.to_numpy(copy=False)
+            else:
+                feature_matrix = features_df.to_numpy(dtype=matrix_dtype, copy=False)
 
         self.n_features_in_ = len(feature_names)
         self.feature_names_in_ = np.asarray(feature_names, dtype=object)
 
-        corr_series = compute_feature_target_correlations(
-            features_df.fillna(2.0),
-            pd.Series(target_values, index=features_df.index),
-            correlation_method=self.correlation_method,
-            era_series=pd.Series(era_values, index=features_df.index) if era_values is not None else None,
-        )
-        self.feature_corrs_ = corr_series.to_numpy(dtype=np.float64)
-
         if self.correlation_method in (None, "none", "None", ""):
+            self.feature_corrs_ = np.ones(len(feature_names), dtype=np.float64)
             ranking_scores = np.arange(len(feature_names), 0, -1, dtype=np.float64)
         else:
+            corr_series = compute_feature_target_correlations(
+                features_df,
+                pd.Series(target_values, index=features_df.index),
+                correlation_method=self.correlation_method,
+                era_series=pd.Series(era_values, index=features_df.index) if era_values is not None else None,
+            )
+            self.feature_corrs_ = corr_series.to_numpy(dtype=np.float64)
             ranking_scores = np.abs(self.feature_corrs_) if bool(self.abs_corr) else self.feature_corrs_
 
         if self.top_k is not None and str(self.top_k) not in ("None", "none", ""):
@@ -179,11 +196,11 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
         weights = self._compute_era_weights(era_values, sample_weight, n_samples)
         return features_df, feature_matrix, target_values, feature_names, weights, era_values
 
-    def _prepare_predict_matrix(self, X: Any) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    def _prepare_predict_df(self, X: Any) -> Tuple[pd.DataFrame, Optional[np.ndarray]]:
         if isinstance(X, pd.DataFrame):
             X_df = X
         else:
-            arr = np.asarray(X, dtype=np.float64)
+            arr = np.asarray(X, dtype=np.float32)
             if arr.ndim == 1:
                 arr = arr.reshape(-1, 1)
             X_df = pd.DataFrame(arr, columns=list(self.feature_names_in_))
@@ -195,7 +212,21 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
         )
         X_proc = self.extractor_.transform(X_df) if getattr(self, "extractor_", None) is not None else X_df
         feature_names = list(self.feature_names_in_)
-        matrix = X_proc[feature_names].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+        raw_df = X_proc[feature_names]
+        if _all_numeric_dtypes(raw_df):
+            return raw_df, era_values
+        clean_df = raw_df.copy()
+        for col in feature_names:
+            if not pd.api.types.is_numeric_dtype(clean_df[col].dtype):
+                clean_df[col] = pd.to_numeric(clean_df[col], errors="coerce").astype(np.float32)
+        return clean_df, era_values
+
+    def _prepare_predict_matrix(self, X: Any, matrix_dtype: Any = np.float32) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        features_df, era_values = self._prepare_predict_df(X)
+        if matrix_dtype is None:
+            matrix = features_df.to_numpy(copy=False)
+        else:
+            matrix = features_df.to_numpy(dtype=matrix_dtype, copy=False)
         return matrix, era_values
 
     def _transform_predictions_only(self, raw_pred: np.ndarray, era_values: Optional[np.ndarray]) -> np.ndarray:
@@ -335,6 +366,8 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
         }
         raw_train_pred = self._compute_raw_snapped_pred(selected_bins)
         self._fit_bias_correction(target_values, raw_train_pred, era_values)
+        del clean_features, selected_bins, feature_matrix
+        gc.collect()
         return self
 
     def predict(self, X: Any) -> np.ndarray:
@@ -510,6 +543,8 @@ class LagReversalEstimator(BaseNumeraiEstimator):
         adjusted_train = (clean_features - self.feature_means_) if self.center_features else clean_features
         raw_train_pred = adjusted_train @ self.weights_
         self._fit_bias_correction(target_values, raw_train_pred, era_values)
+        del clean_features, raw_features, adjusted_train
+        gc.collect()
 
         self.rule_summary_ = (
             pd.DataFrame({
