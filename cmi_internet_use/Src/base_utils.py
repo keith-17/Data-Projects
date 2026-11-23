@@ -30,6 +30,7 @@ import importlib.util
 import json
 import os
 import time
+import traceback
 import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -5003,6 +5004,7 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
         return base
 
     def fit(self, X: pd.DataFrame, y: Any):
+        t_start = time.perf_counter()
         self.fit_failed_ = False
         y_arr = np.asarray(
             y[self.primary_target] if isinstance(y, pd.DataFrame) and self.primary_target in y.columns else y,
@@ -5119,12 +5121,22 @@ class HandcraftedSequenceBaselineEstimator(BaseEstimator):
 
         preds = apply_thresholds(scores, self.thresholds_)
         self.train_qwk_ = quadratic_weighted_kappa(y_arr, preds)
+        self.train_accuracy_pct_ = float(100.0 * np.mean(y_arr == preds)) if len(y_arr) else np.nan
         self.history_: Dict[str, List[float]] = {
             "loss": [float(1.0 - self.train_qwk_)],
             "val_loss": [float(1.0 - self.train_qwk_)],
             "qwk": [float(self.train_qwk_)],
+            "accuracy_pct": [float(self.train_accuracy_pct_)],
         }
         self.classes_ = np.array([0, 1, 2, 3], dtype=np.int64)
+        if int(self.verbose or 0) >= 2:
+            t_tot = time.perf_counter() - t_start
+            th_str = "[" + ", ".join(f"{float(t):.3f}" for t in self.thresholds_) + "]"
+            print(
+                f"  [Baseline fit] Done in {t_tot:.2f}s (ext={t_ext:.2f}s) | thresholds={th_str} | "
+                f"train: Normal={self.train_accuracy_pct_:.2f}% -> QWK={self.train_qwk_:.5f}",
+                flush=True,
+            )
         return self
 
     def get_history_dict(self) -> Dict[str, List[float]]:
@@ -5376,6 +5388,73 @@ def refit_valid_candidate(cv_results: Any, X: Optional[pd.DataFrame] = None, y: 
     return int(valid[int(np.argmax(means[valid]))])
 
 
+def _fmt_pct(acc: float) -> str:
+    """Format Normal percentage accuracy cleanly with ``nan%`` fallback."""
+    return f"{float(acc):.2f}%" if acc is not None and np.isfinite(acc) else "nan%"
+
+
+def _propagate_verbose(estimator: Any, v_lvl: int) -> None:
+    """Raise verbosity on pipeline inner estimator or standalone estimator to at least ``v_lvl``."""
+    if hasattr(estimator, "named_steps") and "estimator" in estimator.named_steps:
+        inner = estimator.named_steps["estimator"]
+        if hasattr(inner, "verbose"):
+            inner.verbose = max(int(getattr(inner, "verbose", 0) or 0), v_lvl)
+    elif hasattr(estimator, "verbose"):
+        estimator.verbose = max(int(getattr(estimator, "verbose", 0) or 0), v_lvl)
+
+
+def _log_fold_error(f_idx: int, n_splits: int, exc: Exception, v_lvl: int) -> None:
+    """Log fold exception message and full formatted traceback for unexpected failures."""
+    if v_lvl < 1:
+        return
+    print(f"  [Fold {f_idx + 1}/{n_splits} ERROR] {type(exc).__name__}: {exc}", flush=True)
+    if not isinstance(exc, (InvalidParams, InvalidExtractorParams)):
+        for line in traceback.format_exc().rstrip().splitlines():
+            print(f"    {line}", flush=True)
+
+
+def _accumulate_candidate_scores(
+    fold_accs: Sequence[float],
+    fold_qwks: Sequence[float],
+    best_qwk: float,
+    best_acc: float,
+) -> Tuple[List[int], float, float, float, float, str, str, str]:
+    """Summarize successful fold Normal% & QWK and update running best across both metrics."""
+    ok_idx = [
+        i for i, (a, q) in enumerate(zip(fold_accs, fold_qwks))
+        if np.isfinite(a) and a >= 0.0 and np.isfinite(q)
+    ]
+    mean_acc = float(np.mean([fold_accs[i] for i in ok_idx])) if ok_idx else np.nan
+    mean_qwk = float(np.mean([fold_qwks[i] for i in ok_idx])) if ok_idx else float(np.mean(fold_qwks))
+    if mean_qwk > best_qwk:
+        best_qwk = mean_qwk
+        best_acc = mean_acc
+    fold_str = " | ".join(f"F{i + 1}: {fold_accs[i]:.2f}% -> QWK={fold_qwks[i]:.5f}" for i in ok_idx)
+    return ok_idx, mean_acc, mean_qwk, best_qwk, best_acc, _fmt_pct(mean_acc), _fmt_pct(best_acc), fold_str
+
+
+def _ga_gen_summary_line(
+    gen: int,
+    n_gen: int,
+    gen_scores: Sequence[float],
+    gen_accs: Sequence[float],
+    best_qwk: float,
+    best_acc: float,
+) -> str:
+    """Format GA generation summary showing Normal% alongside Competition QWK."""
+    gb_i = int(np.argmax(gen_scores))
+    gb_qwk = float(gen_scores[gb_i])
+    gb_acc = float(gen_accs[gb_i]) if gb_i < len(gen_accs) else np.nan
+    fin_ga = [float(a) for a in gen_accs if np.isfinite(a)]
+    gm_acc = float(np.mean(fin_ga)) if fin_ga else np.nan
+    return (
+        f"[GA gen {gen + 1}/{n_gen} SUMMARY] "
+        f"gen_best: Normal={_fmt_pct(gb_acc)} -> QWK={gb_qwk:.5f} | "
+        f"gen_mean: Normal={_fmt_pct(gm_acc)} -> QWK={float(np.mean(gen_scores)):.5f} | "
+        f"overall_best: Normal={_fmt_pct(best_acc)} -> QWK={best_qwk:.5f}"
+    )
+
+
 def _evaluate_candidate_cv(
     estimator: Any,
     params: Mapping[str, Any],
@@ -5386,18 +5465,30 @@ def _evaluate_candidate_cv(
     scoring: Any,
     *,
     error_score: float = -1.0,
+    verbose: int = 0,
 ) -> Tuple[List[float], List[float], float]:
     t0 = time.perf_counter()
+    v_lvl = int(verbose or 0)
     qwk_scores: List[float] = []
     acc_pct_scores: List[float] = []
     use_default_qwk = scoring is None or scoring is candidate_score
-    for tr_idx, va_idx in cv.split(X, y, groups):
+    splits = list(cv.split(X, y, groups))
+    n_splits = len(splits)
+    for f_idx, (tr_idx, va_idx) in enumerate(splits):
+        t_f0 = time.perf_counter()
         cand_est = clone(estimator).set_params(**params)
+        _propagate_verbose(cand_est, v_lvl)
         y_tr = y.iloc[tr_idx] if isinstance(y, (pd.Series, pd.DataFrame)) else np.asarray(y)[tr_idx]
         y_va = y.iloc[va_idx] if isinstance(y, (pd.Series, pd.DataFrame)) else np.asarray(y)[va_idx]
+        if v_lvl >= 2:
+            print(f"  [Fold {f_idx + 1}/{n_splits}] train={len(tr_idx)} val={len(va_idx)}", flush=True)
         try:
             cand_est.fit(X.iloc[tr_idx], y_tr)
+            if v_lvl >= 2:
+                print(f"  [Fold {f_idx + 1}/{n_splits}] Scoring val={len(va_idx)}...", flush=True)
+            t_p0 = time.perf_counter()
             preds = np.asarray(cand_est.predict(X.iloc[va_idx]), dtype=np.int64).ravel()
+            t_pred = time.perf_counter() - t_p0
             yt_va = (
                 np.asarray(y_va[TARGET_COL], dtype=np.int64).ravel()
                 if isinstance(y_va, pd.DataFrame) and TARGET_COL in y_va.columns
@@ -5408,11 +5499,20 @@ def _evaluate_candidate_cv(
                 qwk = float(competition_score(yt_va, preds))
             else:
                 qwk = float(scoring(cand_est, X.iloc[va_idx], y_va))
-            qwk_scores.append(qwk if np.isfinite(qwk) else error_score)
-            acc_pct_scores.append(acc_pct if np.isfinite(acc_pct) else -1.0)
-        except Exception:
+            qwk_val = qwk if np.isfinite(qwk) else error_score
+            acc_val = acc_pct if np.isfinite(acc_pct) else -1.0
+            qwk_scores.append(qwk_val)
+            acc_pct_scores.append(acc_val)
+            if v_lvl >= 2:
+                print(
+                    f"  [Fold {f_idx + 1}/{n_splits}] val Normal={acc_val:.2f}% -> Comp QWK={qwk_val:.5f} "
+                    f"(pred={t_pred:.2f}s, fold={time.perf_counter() - t_f0:.2f}s)",
+                    flush=True,
+                )
+        except Exception as exc:
             qwk_scores.append(error_score)
             acc_pct_scores.append(-1.0)
+            _log_fold_error(f_idx, n_splits, exc, v_lvl)
     return qwk_scores, acc_pct_scores, float(time.perf_counter() - t0)
 
 
@@ -5492,12 +5592,22 @@ class HierarchicalBayesSearchCV(BaseEstimator):
         init_pt = self._default_starting_point(keys, dimensions, base_params, self.x0)
         scorer = self.scoring or candidate_score
         best_so_far = -np.inf
+        best_acc_so_far = np.nan
         total = max(1, int(self.n_iter))
+        v_lvl = int(self.verbose or 0)
 
         for it in range(total):
             x_pt = init_pt if it == 0 else opt.ask()
             decoded = _decode_skopt_params(dict(zip(keys, x_pt)))
             sig = _canonical_candidate_key(decoded, base_params=base_params)
+            sr = decoded.get("estimator__scoring_rule", decoded.get("scoring_rule", "?"))
+            bm = decoded.get("estimator__extractor__bin_minutes", decoded.get("extractor__bin_minutes", "?"))
+            if v_lvl >= 2:
+                print(f"\n[Bayes {it + 1}/{total} START] rule={sr} bin={bm}m", flush=True)
+            if v_lvl >= 3:
+                inactive = inactive_parameters_for_candidate({**base_params, **decoded})
+                active_d = {k: v for k, v in sorted(decoded.items()) if k not in inactive}
+                print(f"  [Active params ({len(active_d)})]: {active_d}", flush=True)
             if sig in cache:
                 fold_qwks, fold_accs, elapsed = cache[sig]
                 cached_tag = " (cached)"
@@ -5505,29 +5615,26 @@ class HierarchicalBayesSearchCV(BaseEstimator):
                 fold_qwks, fold_accs, elapsed = _evaluate_candidate_cv(
                     self.estimator, decoded, X, y, groups, cv, scorer,
                     error_score=-1.0 if self.error_score == "raise" else float(self.error_score),
+                    verbose=v_lvl,
                 )
                 cache[sig] = (fold_qwks, fold_accs, elapsed)
                 cached_tag = ""
-            ok_idx = [i for i, (a, q) in enumerate(zip(fold_accs, fold_qwks)) if np.isfinite(a) and a >= 0.0 and np.isfinite(q)]
-            mean_acc = float(np.mean([fold_accs[i] for i in ok_idx])) if ok_idx else np.nan
-            mean_qwk = float(np.mean([fold_qwks[i] for i in ok_idx])) if ok_idx else float(np.mean(fold_qwks))
-            best_so_far = max(best_so_far, mean_qwk)
+            ok_idx, mean_acc, mean_qwk, best_so_far, best_acc_so_far, acc_lbl, best_acc_lbl, fold_str = (
+                _accumulate_candidate_scores(fold_accs, fold_qwks, best_so_far, best_acc_so_far)
+            )
             opt.tell(x_pt, -mean_qwk)
             all_params.append(decoded)
             all_fold_qwk.append(fold_qwks)
             all_fold_acc_pct.append(fold_accs)
             all_times.append(elapsed)
-            if self.verbose and int(self.verbose) > 0:
-                sr = decoded.get("estimator__scoring_rule", decoded.get("scoring_rule", "?"))
-                bm = decoded.get("estimator__extractor__bin_minutes", decoded.get("extractor__bin_minutes", "?"))
-                fold_str = " | ".join(f"F{i + 1}: {fold_accs[i]:.2f}% -> QWK={fold_qwks[i]:.5f}" for i in ok_idx)
-                acc_lbl = f"{mean_acc:.2f}%" if np.isfinite(mean_acc) else "nan%"
+            if v_lvl >= 1:
                 print(
                     f"[Bayes {it + 1}/{total}] rule={sr} bin={bm}m | "
-                    f"Normal={acc_lbl} -> Comp QWK={mean_qwk:.5f} | best={best_so_far:.5f} ({elapsed:.2f}s){cached_tag}",
+                    f"Normal={acc_lbl} -> Comp QWK={mean_qwk:.5f} | "
+                    f"best: Normal={best_acc_lbl} -> QWK={best_so_far:.5f} ({elapsed:.2f}s){cached_tag}",
                     flush=True,
                 )
-                if ok_idx:
+                if ok_idx and (v_lvl >= 2 or len(fold_qwks) > 1):
                     print(f"  Successful folds ({len(ok_idx)}/{len(fold_qwks)}): {fold_str}", flush=True)
 
         means = np.array([float(np.mean(s)) for s in all_fold_qwk], dtype=float)
@@ -5565,7 +5672,17 @@ class HierarchicalBayesSearchCV(BaseEstimator):
         self.best_params_ = dict(all_params[self.best_index_])
         self.best_score_ = float(means[self.best_index_])
         if self.refit:
+            if v_lvl >= 1:
+                best_cv_acc = float(self.cv_results_["mean_test_accuracy_pct"][self.best_index_])
+                sr = self.best_params_.get("estimator__scoring_rule", self.best_params_.get("scoring_rule", "?"))
+                bm = self.best_params_.get("estimator__extractor__bin_minutes", self.best_params_.get("extractor__bin_minutes", "?"))
+                print(
+                    f"\n[Bayes REFIT] Refitting best candidate #{self.best_index_ + 1} "
+                    f"(CV Normal={_fmt_pct(best_cv_acc)} -> Comp QWK={self.best_score_:.5f}): rule={sr} bin={bm}m",
+                    flush=True,
+                )
             self.best_estimator_ = clone(self.estimator).set_params(**self.best_params_)
+            _propagate_verbose(self.best_estimator_, v_lvl)
             self.best_estimator_.fit(X, y)
         return self
 
@@ -5646,6 +5763,7 @@ class GASearchCV(BaseEstimator):
         n_gen = max(1, int(self.generations))
         t_size = max(1, min(int(self.tournament_size), pop_size))
         n_elite = max(0, min(int(self.elitism), pop_size - 1))
+        v_lvl = int(self.verbose or 0)
 
         cache: Dict[str, Tuple[List[float], List[float], float]] = {}
         all_params: List[Dict[str, Any]] = []
@@ -5653,6 +5771,7 @@ class GASearchCV(BaseEstimator):
         all_fold_acc_pct: List[List[float]] = []
         all_times: List[float] = []
         best_so_far = -np.inf
+        best_acc_so_far = np.nan
 
         population: List[Dict[str, Any]] = [self._default_seed_candidate(space_dict, base_params, rng)]
         while len(population) < pop_size:
@@ -5660,9 +5779,18 @@ class GASearchCV(BaseEstimator):
 
         for gen in range(n_gen):
             gen_scores: List[float] = []
+            gen_accs: List[float] = []
             for c_idx, raw_cand in enumerate(population):
                 decoded = _decode_skopt_params(raw_cand)
                 sig = _canonical_candidate_key(decoded, base_params=base_params)
+                sr = decoded.get("estimator__scoring_rule", decoded.get("scoring_rule", "?"))
+                bm = decoded.get("estimator__extractor__bin_minutes", decoded.get("extractor__bin_minutes", "?"))
+                if v_lvl >= 2:
+                    print(f"\n[GA gen {gen + 1}/{n_gen} | cand {c_idx + 1}/{pop_size} START] rule={sr} bin={bm}m", flush=True)
+                if v_lvl >= 3:
+                    inactive = inactive_parameters_for_candidate({**base_params, **decoded})
+                    active_d = {k: v for k, v in sorted(decoded.items()) if k not in inactive}
+                    print(f"  [Active params ({len(active_d)})]: {active_d}", flush=True)
                 if sig in cache:
                     fold_qwks, fold_accs, elapsed = cache[sig]
                     cached_tag = " (cached)"
@@ -5670,28 +5798,35 @@ class GASearchCV(BaseEstimator):
                     fold_qwks, fold_accs, elapsed = _evaluate_candidate_cv(
                         self.estimator, decoded, X, y, groups, cv, scorer,
                         error_score=-1.0 if self.error_score == "raise" else float(self.error_score),
+                        verbose=v_lvl,
                     )
                     cache[sig] = (fold_qwks, fold_accs, elapsed)
                     cached_tag = ""
-                ok_idx = [i for i, (a, q) in enumerate(zip(fold_accs, fold_qwks)) if np.isfinite(a) and a >= 0.0 and np.isfinite(q)]
-                mean_acc = float(np.mean([fold_accs[i] for i in ok_idx])) if ok_idx else np.nan
-                mean_qwk = float(np.mean([fold_qwks[i] for i in ok_idx])) if ok_idx else float(np.mean(fold_qwks))
-                best_so_far = max(best_so_far, mean_qwk)
+                ok_idx, mean_acc, mean_qwk, best_so_far, best_acc_so_far, acc_lbl, best_acc_lbl, fold_str = (
+                    _accumulate_candidate_scores(fold_accs, fold_qwks, best_so_far, best_acc_so_far)
+                )
                 gen_scores.append(mean_qwk)
+                gen_accs.append(mean_acc)
                 all_params.append(decoded)
                 all_fold_qwk.append(fold_qwks)
                 all_fold_acc_pct.append(fold_accs)
                 all_times.append(elapsed)
 
-                if self.verbose and int(self.verbose) > 0:
-                    sr = decoded.get("estimator__scoring_rule", decoded.get("scoring_rule", "?"))
-                    bm = decoded.get("estimator__extractor__bin_minutes", decoded.get("extractor__bin_minutes", "?"))
-                    acc_lbl = f"{mean_acc:.2f}%" if np.isfinite(mean_acc) else "nan%"
+                if v_lvl >= 1:
                     print(
                         f"[GA gen {gen + 1}/{n_gen} | cand {c_idx + 1}/{pop_size}] rule={sr} bin={bm}m | "
-                        f"Normal={acc_lbl} -> Comp QWK={mean_qwk:.5f} | best={best_so_far:.5f} ({elapsed:.2f}s){cached_tag}",
+                        f"Normal={acc_lbl} -> Comp QWK={mean_qwk:.5f} | "
+                        f"best: Normal={best_acc_lbl} -> QWK={best_so_far:.5f} ({elapsed:.2f}s){cached_tag}",
                         flush=True,
                     )
+                    if ok_idx and (v_lvl >= 2 or len(fold_qwks) > 1):
+                        print(f"  Successful folds ({len(ok_idx)}/{len(fold_qwks)}): {fold_str}", flush=True)
+
+            if v_lvl >= 1 and gen_scores:
+                print(
+                    _ga_gen_summary_line(gen, n_gen, gen_scores, gen_accs, best_so_far, best_acc_so_far),
+                    flush=True,
+                )
 
             if gen + 1 >= n_gen:
                 break
@@ -5753,7 +5888,17 @@ class GASearchCV(BaseEstimator):
         self.best_params_ = dict(all_params[self.best_index_])
         self.best_score_ = float(means[self.best_index_])
         if self.refit:
+            if v_lvl >= 1:
+                best_cv_acc = float(self.cv_results_["mean_test_accuracy_pct"][self.best_index_])
+                sr = self.best_params_.get("estimator__scoring_rule", self.best_params_.get("scoring_rule", "?"))
+                bm = self.best_params_.get("estimator__extractor__bin_minutes", self.best_params_.get("extractor__bin_minutes", "?"))
+                print(
+                    f"\n[GA REFIT] Refitting best candidate #{self.best_index_ + 1} "
+                    f"(CV Normal={_fmt_pct(best_cv_acc)} -> Comp QWK={self.best_score_:.5f}): rule={sr} bin={bm}m",
+                    flush=True,
+                )
             self.best_estimator_ = clone(self.estimator).set_params(**self.best_params_)
+            _propagate_verbose(self.best_estimator_, v_lvl)
             self.best_estimator_.fit(X, y)
         return self
 

@@ -50,9 +50,14 @@ try:
         Optimizer,
         SequenceExtractor,
         TSAugmentor,
+        _accumulate_candidate_scores,
         _decode_skopt_params,
         _encode_skopt_item,
+        _fmt_pct,
+        _ga_gen_summary_line,
+        _log_fold_error,
         _populate_param_columns,
+        _propagate_verbose,
         _structured,
         candidate_score,
         competition_score,
@@ -80,9 +85,14 @@ except ImportError:
         Optimizer,
         SequenceExtractor,
         TSAugmentor,
+        _accumulate_candidate_scores,
         _decode_skopt_params,
         _encode_skopt_item,
+        _fmt_pct,
+        _ga_gen_summary_line,
+        _log_fold_error,
         _populate_param_columns,
+        _propagate_verbose,
         _structured,
         candidate_score,
         competition_score,
@@ -1063,6 +1073,7 @@ class LightGBMSequenceEstimator(BaseEstimator):
                 warnings.simplefilter("ignore")
                 train_preds = np.clip(np.asarray(lgbm_model.predict(X_orig_mat), dtype=np.int64).ravel(), 0, 3)
             self.calib_qwk_ = float(quadratic_weighted_kappa(y_fit_orig, train_preds))
+            self.calib_accuracy_pct_ = float(100.0 * np.mean(y_fit_orig == train_preds)) if len(y_fit_orig) else np.nan
         else:
             if cal_scores_oof is not None and cal_y_oof is not None:
                 cal_scores, cal_y = cal_scores_oof, cal_y_oof
@@ -1072,17 +1083,22 @@ class LightGBMSequenceEstimator(BaseEstimator):
                 cal_y = y_fit_orig
                 self.calibration_source_ = cal_src
             self.thresholds_ = self._fit_thresholds(cal_y, cal_scores)
-            self.calib_qwk_ = float(quadratic_weighted_kappa(cal_y, apply_thresholds(cal_scores, self.thresholds_)))
+            cal_preds = apply_thresholds(cal_scores, self.thresholds_)
+            self.calib_qwk_ = float(quadratic_weighted_kappa(cal_y, cal_preds))
+            self.calib_accuracy_pct_ = float(100.0 * np.mean(cal_y == cal_preds)) if len(cal_y) else np.nan
             train_scores = self._continuous_from_model(lgbm_model, X_orig_mat)
             train_preds = apply_thresholds(train_scores, self.thresholds_)
         t_cal = time.perf_counter() - t_cal0
 
         self.train_qwk_ = float(quadratic_weighted_kappa(y_fit_orig, train_preds))
+        self.train_accuracy_pct_ = float(100.0 * np.mean(y_fit_orig == train_preds)) if len(y_fit_orig) else np.nan
         self.history_: Dict[str, List[float]] = {
             "loss": [float(1.0 - self.train_qwk_)],
             "val_loss": [float(1.0 - self.calib_qwk_)],
             "qwk": [float(self.train_qwk_)],
             "calib_qwk": [float(self.calib_qwk_)],
+            "accuracy_pct": [float(self.train_accuracy_pct_)],
+            "calib_accuracy_pct": [float(self.calib_accuracy_pct_)],
         }
         self.classes_ = np.array([0, 1, 2, 3], dtype=np.int64)
 
@@ -1092,7 +1108,8 @@ class LightGBMSequenceEstimator(BaseEstimator):
             print(
                 f"  [LGBM fit] Done in {t_tot:.2f}s (ext={t_ext:.2f}s, lgbm={t_lgb:.2f}s, oof/cal={t_cal:.2f}s) | "
                 f"cal_src={self.calibration_source_} | thresholds={th_str} | "
-                f"calib_QWK={self.calib_qwk_:.5f} | train_QWK={self.train_qwk_:.5f}",
+                f"calib: Normal={_fmt_pct(self.calib_accuracy_pct_)} -> QWK={self.calib_qwk_:.5f} | "
+                f"train: Normal={_fmt_pct(self.train_accuracy_pct_)} -> QWK={self.train_qwk_:.5f}",
                 flush=True,
             )
         if v_lvl >= 3 and len(self.feature_names_out_) > 0:
@@ -1332,12 +1349,7 @@ def _evaluate_lgbm_candidate_cv(
     for f_idx, (tr_idx, va_idx) in enumerate(splits):
         t_f0 = time.perf_counter()
         cand_est = clone(estimator).set_params(**params)
-        if hasattr(cand_est, "named_steps") and "estimator" in cand_est.named_steps:
-            inner = cand_est.named_steps["estimator"]
-            if hasattr(inner, "verbose"):
-                inner.verbose = max(int(getattr(inner, "verbose", 0) or 0), v_lvl)
-        elif hasattr(cand_est, "verbose"):
-            cand_est.verbose = max(int(getattr(cand_est, "verbose", 0) or 0), v_lvl)
+        _propagate_verbose(cand_est, v_lvl)
 
         y_tr = y.iloc[tr_idx] if isinstance(y, (pd.Series, pd.DataFrame)) else np.asarray(y)[tr_idx]
         y_va = y.iloc[va_idx] if isinstance(y, (pd.Series, pd.DataFrame)) else np.asarray(y)[va_idx]
@@ -1345,7 +1357,11 @@ def _evaluate_lgbm_candidate_cv(
             print(f"  [Fold {f_idx + 1}/{n_splits}] train={len(tr_idx)} val={len(va_idx)}", flush=True)
         try:
             cand_est.fit(X.iloc[tr_idx], y_tr)
+            if v_lvl >= 2:
+                print(f"  [Fold {f_idx + 1}/{n_splits}] Scoring val={len(va_idx)}...", flush=True)
+            t_p0 = time.perf_counter()
             preds = np.asarray(cand_est.predict(X.iloc[va_idx]), dtype=np.int64).ravel()
+            t_pred = time.perf_counter() - t_p0
             yt_va = (
                 np.asarray(y_va[TARGET_COL], dtype=np.int64).ravel()
                 if isinstance(y_va, pd.DataFrame) and TARGET_COL in y_va.columns
@@ -1362,15 +1378,14 @@ def _evaluate_lgbm_candidate_cv(
             acc_pct_scores.append(acc_val)
             if v_lvl >= 2:
                 print(
-                    f"  [Fold {f_idx + 1}/{n_splits}] val Normal={acc_val:.2f}% | val QWK={qwk_val:.5f} "
-                    f"({time.perf_counter() - t_f0:.2f}s)",
+                    f"  [Fold {f_idx + 1}/{n_splits}] val Normal={acc_val:.2f}% -> Comp QWK={qwk_val:.5f} "
+                    f"(pred={t_pred:.2f}s, fold={time.perf_counter() - t_f0:.2f}s)",
                     flush=True,
                 )
         except Exception as exc:
             qwk_scores.append(error_score)
             acc_pct_scores.append(-1.0)
-            if v_lvl >= 1:
-                print(f"  [Fold {f_idx + 1}/{n_splits} ERROR] {type(exc).__name__}: {exc}", flush=True)
+            _log_fold_error(f_idx, n_splits, exc, v_lvl)
     return qwk_scores, acc_pct_scores, float(time.perf_counter() - t0)
 
 
@@ -1506,6 +1521,7 @@ class LGBMHierarchicalBayesSearchCV(BaseEstimator):
         init_pt = self._default_starting_point(keys, dimensions, base_params, self.x0)
         scorer = self.scoring or candidate_score
         best_so_far = -np.inf
+        best_acc_so_far = np.nan
         total = max(1, int(self.n_iter))
         v_lvl = int(self.verbose or 0)
 
@@ -1545,10 +1561,9 @@ class LGBMHierarchicalBayesSearchCV(BaseEstimator):
                 cache[sig] = (fold_qwks, fold_accs, elapsed)
                 cached_tag = ""
 
-            ok_idx = [i for i, (a, q) in enumerate(zip(fold_accs, fold_qwks)) if np.isfinite(a) and a >= 0.0 and np.isfinite(q)]
-            mean_acc = float(np.mean([fold_accs[i] for i in ok_idx])) if ok_idx else np.nan
-            mean_qwk = float(np.mean([fold_qwks[i] for i in ok_idx])) if ok_idx else float(np.mean(fold_qwks))
-            best_so_far = max(best_so_far, mean_qwk)
+            ok_idx, mean_acc, mean_qwk, best_so_far, best_acc_so_far, acc_lbl, best_acc_lbl, fold_str = (
+                _accumulate_candidate_scores(fold_accs, fold_qwks, best_so_far, best_acc_so_far)
+            )
             opt.tell(x_pt, -mean_qwk)
             all_params.append(decoded)
             all_fold_qwk.append(fold_qwks)
@@ -1561,14 +1576,13 @@ class LGBMHierarchicalBayesSearchCV(BaseEstimator):
                 nt = decoded.get("estimator__n_estimators", decoded.get("n_estimators", "?"))
                 lr = decoded.get("estimator__learning_rate", decoded.get("learning_rate", "?"))
                 bm = decoded.get("estimator__extractor__bin_minutes", decoded.get("extractor__bin_minutes", "?"))
-                fold_str = " | ".join(f"F{i + 1}: {fold_accs[i]:.2f}% -> QWK={fold_qwks[i]:.5f}" for i in ok_idx)
-                acc_lbl = f"{mean_acc:.2f}%" if np.isfinite(mean_acc) else "nan%"
                 print(
                     f"[Bayes {it + 1}/{total}] task={tm} bt={bt} trees={nt} lr={lr} bin={bm}m | "
-                    f"Normal={acc_lbl} -> Comp QWK={mean_qwk:.5f} | best={best_so_far:.5f} ({elapsed:.2f}s){cached_tag}",
+                    f"Normal={acc_lbl} -> Comp QWK={mean_qwk:.5f} | "
+                    f"best: Normal={best_acc_lbl} -> QWK={best_so_far:.5f} ({elapsed:.2f}s){cached_tag}",
                     flush=True,
                 )
-                if ok_idx:
+                if ok_idx and (v_lvl >= 2 or len(fold_qwks) > 1):
                     print(f"  Successful folds ({len(ok_idx)}/{len(fold_qwks)}): {fold_str}", flush=True)
 
         self.cv_results_ = _assemble_search_cv_results(all_params, all_fold_qwk, all_fold_acc_pct, all_times)
@@ -1577,13 +1591,16 @@ class LGBMHierarchicalBayesSearchCV(BaseEstimator):
         self.best_params_ = dict(all_params[self.best_index_])
         self.best_score_ = float(means[self.best_index_])
         if self.refit:
-            if v_lvl >= 2:
-                print(f"\n[Bayes REFIT] Refitting best candidate #{self.best_index_ + 1} (CV QWK={self.best_score_:.5f}): {_lgbm_candidate_brief(self.best_params_)}", flush=True)
+            if v_lvl >= 1:
+                best_cv_acc = float(self.cv_results_["mean_test_accuracy_pct"][self.best_index_])
+                print(
+                    f"\n[Bayes REFIT] Refitting best candidate #{self.best_index_ + 1} "
+                    f"(CV Normal={_fmt_pct(best_cv_acc)} -> Comp QWK={self.best_score_:.5f}): "
+                    f"{_lgbm_candidate_brief(self.best_params_)}",
+                    flush=True,
+                )
             self.best_estimator_ = clone(self.estimator).set_params(**self.best_params_)
-            if hasattr(self.best_estimator_, "named_steps") and "estimator" in self.best_estimator_.named_steps:
-                inner = self.best_estimator_.named_steps["estimator"]
-                if hasattr(inner, "verbose"):
-                    inner.verbose = max(int(getattr(inner, "verbose", 0) or 0), v_lvl)
+            _propagate_verbose(self.best_estimator_, v_lvl)
             self.best_estimator_.fit(X, y)
         return self
 
@@ -1669,6 +1686,7 @@ class LGBMGASearchCV(BaseEstimator):
         all_fold_acc_pct: List[List[float]] = []
         all_times: List[float] = []
         best_so_far = -np.inf
+        best_acc_so_far = np.nan
 
         population: List[Dict[str, Any]] = [self._default_seed_candidate(space_dict, base_params, rng)]
         while len(population) < pop_size:
@@ -1676,6 +1694,7 @@ class LGBMGASearchCV(BaseEstimator):
 
         for gen in range(n_gen):
             gen_scores: List[float] = []
+            gen_accs: List[float] = []
             for c_idx, raw_cand in enumerate(population):
                 decoded = _decode_skopt_params(raw_cand)
                 sig = _canonical_lgbm_candidate_key(decoded, base_params=base_params)
@@ -1711,11 +1730,11 @@ class LGBMGASearchCV(BaseEstimator):
                     cache[sig] = (fold_qwks, fold_accs, elapsed)
                     cached_tag = ""
 
-                ok_idx = [i for i, (a, q) in enumerate(zip(fold_accs, fold_qwks)) if np.isfinite(a) and a >= 0.0 and np.isfinite(q)]
-                mean_acc = float(np.mean([fold_accs[i] for i in ok_idx])) if ok_idx else np.nan
-                mean_qwk = float(np.mean([fold_qwks[i] for i in ok_idx])) if ok_idx else float(np.mean(fold_qwks))
-                best_so_far = max(best_so_far, mean_qwk)
+                ok_idx, mean_acc, mean_qwk, best_so_far, best_acc_so_far, acc_lbl, best_acc_lbl, fold_str = (
+                    _accumulate_candidate_scores(fold_accs, fold_qwks, best_so_far, best_acc_so_far)
+                )
                 gen_scores.append(mean_qwk)
+                gen_accs.append(mean_acc)
                 all_params.append(decoded)
                 all_fold_qwk.append(fold_qwks)
                 all_fold_acc_pct.append(fold_accs)
@@ -1727,20 +1746,18 @@ class LGBMGASearchCV(BaseEstimator):
                     nt = decoded.get("estimator__n_estimators", decoded.get("n_estimators", "?"))
                     lr = decoded.get("estimator__learning_rate", decoded.get("learning_rate", "?"))
                     bm = decoded.get("estimator__extractor__bin_minutes", decoded.get("extractor__bin_minutes", "?"))
-                    fold_str = " | ".join(f"F{i + 1}: {fold_accs[i]:.2f}% -> QWK={fold_qwks[i]:.5f}" for i in ok_idx)
-                    acc_lbl = f"{mean_acc:.2f}%" if np.isfinite(mean_acc) else "nan%"
                     print(
                         f"[GA gen {gen + 1}/{n_gen} | cand {c_idx + 1}/{pop_size}] task={tm} bt={bt} trees={nt} lr={lr} bin={bm}m | "
-                        f"Normal={acc_lbl} -> Comp QWK={mean_qwk:.5f} | best={best_so_far:.5f} ({elapsed:.2f}s){cached_tag}",
+                        f"Normal={acc_lbl} -> Comp QWK={mean_qwk:.5f} | "
+                        f"best: Normal={best_acc_lbl} -> QWK={best_so_far:.5f} ({elapsed:.2f}s){cached_tag}",
                         flush=True,
                     )
-                    if ok_idx and v_lvl >= 2:
+                    if ok_idx and (v_lvl >= 2 or len(fold_qwks) > 1):
                         print(f"  Successful folds ({len(ok_idx)}/{len(fold_qwks)}): {fold_str}", flush=True)
 
-            if v_lvl >= 2 and gen_scores:
+            if v_lvl >= 1 and gen_scores:
                 print(
-                    f"[GA gen {gen + 1}/{n_gen} SUMMARY] gen_best={max(gen_scores):.5f} | "
-                    f"gen_mean={float(np.mean(gen_scores)):.5f} | overall_best={best_so_far:.5f}",
+                    _ga_gen_summary_line(gen, n_gen, gen_scores, gen_accs, best_so_far, best_acc_so_far),
                     flush=True,
                 )
 
@@ -1775,13 +1792,16 @@ class LGBMGASearchCV(BaseEstimator):
         self.best_params_ = dict(all_params[self.best_index_])
         self.best_score_ = float(means[self.best_index_])
         if self.refit:
-            if v_lvl >= 2:
-                print(f"\n[GA REFIT] Refitting best candidate #{self.best_index_ + 1} (CV QWK={self.best_score_:.5f}): {_lgbm_candidate_brief(self.best_params_)}", flush=True)
+            if v_lvl >= 1:
+                best_cv_acc = float(self.cv_results_["mean_test_accuracy_pct"][self.best_index_])
+                print(
+                    f"\n[GA REFIT] Refitting best candidate #{self.best_index_ + 1} "
+                    f"(CV Normal={_fmt_pct(best_cv_acc)} -> Comp QWK={self.best_score_:.5f}): "
+                    f"{_lgbm_candidate_brief(self.best_params_)}",
+                    flush=True,
+                )
             self.best_estimator_ = clone(self.estimator).set_params(**self.best_params_)
-            if hasattr(self.best_estimator_, "named_steps") and "estimator" in self.best_estimator_.named_steps:
-                inner = self.best_estimator_.named_steps["estimator"]
-                if hasattr(inner, "verbose"):
-                    inner.verbose = max(int(getattr(inner, "verbose", 0) or 0), v_lvl)
+            _propagate_verbose(self.best_estimator_, v_lvl)
             self.best_estimator_.fit(X, y)
         return self
 
