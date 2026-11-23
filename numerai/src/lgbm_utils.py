@@ -283,8 +283,10 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
                 "uniform_drop": bool(self.uniform_drop),
             })
 
-        if objective in ("huber", "quantile"):
-            extra_kwargs["alpha"] = float(self.alpha)
+        if objective == "quantile":
+            extra_kwargs["alpha"] = float(np.clip(float(self.alpha), 1e-4, 1.0 - 1e-4))
+        elif objective == "huber":
+            extra_kwargs["alpha"] = max(1e-6, float(self.alpha))
         elif objective == "fair":
             extra_kwargs["fair_c"] = max(1e-6, float(self.fair_c))
 
