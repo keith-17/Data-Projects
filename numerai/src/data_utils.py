@@ -117,6 +117,18 @@ def _has_complete_dataset(directory: Path) -> bool:
     return features_path.is_file() and train_path.is_file() and validation_path.is_file()
 
 
+def _find_dataset_root(base_dir: Path) -> Optional[Path]:
+    """Return `base_dir` or the first nested directory containing `features.json` plus train/validation Parquets."""
+    if not base_dir.is_dir():
+        return None
+    if _has_complete_dataset(base_dir):
+        return base_dir
+    for features_file in sorted(base_dir.rglob("features.json")):
+        if _has_complete_dataset(features_file.parent):
+            return features_file.parent
+    return None
+
+
 def _compute_weeks_since_high_1d(arr: np.ndarray, window: int) -> np.ndarray:
     """Vectorized causal count of observations since `arr` last hit its rolling maximum over `window` steps."""
     arr_1d = np.asarray(arr, dtype=np.float64).ravel()
@@ -327,15 +339,19 @@ def load_unity_numerai_data(
     if workspace_dir.name.lower() == "notebooks":
         workspace_dir = workspace_dir.parent
 
-    # 1. Check standard Kaggle mount (/kaggle/input/<slug>) or local workspace folders
+    # 1. Check standard Kaggle mounts (/kaggle/input/datasets/<owner>/<slug>, /kaggle/input/<slug>, nested rglob) or local workspace folders
     candidate_dirs = (
+        Path("/kaggle/input/datasets") / kaggle_dataset,
+        Path("/kaggle/input/datasets") / kaggle_dataset / data_version,
         Path("/kaggle/input") / dataset_slug_name,
         Path("/kaggle/input") / f"numerai-data-{data_version.replace('.', '-')}",
         workspace_dir / data_folder / data_version,
         workspace_dir / data_folder / dataset_slug_name,
         workspace_dir / data_folder,
     )
-    data_root: Optional[Path] = next((cand for cand in candidate_dirs if _has_complete_dataset(cand)), None)
+    data_root: Optional[Path] = next((found for cand in candidate_dirs if (found := _find_dataset_root(cand)) is not None), None)
+    if data_root is None and Path("/kaggle/input").is_dir():
+        data_root = _find_dataset_root(Path("/kaggle/input"))
 
     # 2. Use official Kaggle clients (`kagglehub` first, then `KaggleApi`), then `NumerAPI` fallback
     if data_root is None and auto_download:
@@ -345,8 +361,7 @@ def load_unity_numerai_data(
         if kagglehub is not None:
             try:
                 resolved_dir = Path(kagglehub.dataset_download(kaggle_dataset))
-                if _has_complete_dataset(resolved_dir):
-                    data_root = resolved_dir
+                data_root = _find_dataset_root(resolved_dir)
             except (KaggleApiHTTPError, ColabHTTPError) as http_error:
                 warnings.warn(_format_http_error(f"kagglehub HTTP error for '{kaggle_dataset}'", http_error))
             except KAGGLEHUB_EXCEPTIONS as hub_error:
@@ -366,8 +381,7 @@ def load_unity_numerai_data(
                     unzip=True,
                     quiet=False,
                 )
-                if _has_complete_dataset(target_download_dir):
-                    data_root = target_download_dir
+                data_root = _find_dataset_root(target_download_dir)
             except (KaggleApiException, HTTPError) as api_error:
                 warnings.warn(_format_http_error(f"KaggleApi HTTP error for '{kaggle_dataset}'", api_error))
             except (OSError, IOError, ValueError, RuntimeError, RequestException) as local_error:
@@ -385,8 +399,7 @@ def load_unity_numerai_data(
                         f"{data_version}/{file_name}",
                         str(target_download_dir / file_name),
                     )
-                if _has_complete_dataset(target_download_dir):
-                    data_root = target_download_dir
+                data_root = _find_dataset_root(target_download_dir)
             except ValueError as graphql_error:
                 raise FileNotFoundError(
                     f"NumerAPI GraphQL error for '{data_version}': {graphql_error}"
@@ -397,8 +410,13 @@ def load_unity_numerai_data(
                 ) from download_error
 
     if data_root is None:
+        mounted_info = (
+            [str(p) for p in sorted(Path("/kaggle/input").rglob("features.json"))]
+            if Path("/kaggle/input").is_dir()
+            else []
+        )
         raise FileNotFoundError(
-            f"Numerai dataset '{kaggle_dataset}' ({data_version}) not found. "
+            f"Numerai dataset '{kaggle_dataset}' ({data_version}) not found (found features.json in /kaggle/input: {mounted_info}). "
             "Attach the Kaggle dataset, configure ~/.kaggle/kaggle.json (or KAGGLE_USERNAME/KAGGLE_KEY), "
             "or enable `use_numerapi_fallback=True` with `numerapi` installed."
         )
