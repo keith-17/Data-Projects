@@ -537,7 +537,7 @@ class LagReversalEstimator(BaseNumeraiEstimator):
 
 
 class PersistenceEstimator(BaseNumeraiEstimator):
-    """Child Class — Brownlee Persistence Baseline: predicts each ticker's last settled training target or historical target mean.
+    """Child Class — Brownlee Persistence Baseline: predicts each ticker's last settled target, trailing rolling target mean, expanding mean, or Zero-Rule global mean.
 
     Decoupled from `NumeraiExtractions` when `extractor=None` so CV search does not waste trials on feature extraction parameters.
     """
@@ -548,6 +548,7 @@ class PersistenceEstimator(BaseNumeraiEstimator):
         ticker_col: str = "numerai_ticker",
         persistence_mode: Optional[str] = "last",
         persistence_lag: Optional[int] = 4,
+        persistence_window: Optional[int] = 4,
         smoothing: Optional[float] = 0.0,
         top_k: Optional[int] = None,
         correlation_method: Optional[str] = None,
@@ -578,6 +579,7 @@ class PersistenceEstimator(BaseNumeraiEstimator):
         self.ticker_col = ticker_col
         self.persistence_mode = persistence_mode
         self.persistence_lag = persistence_lag
+        self.persistence_window = persistence_window
         self.smoothing = smoothing
 
     def get_params(self, deep: bool = True) -> Dict[str, Any]:
@@ -666,6 +668,26 @@ class PersistenceEstimator(BaseNumeraiEstimator):
                     "obs_count": int(counts.get(ticker_key, 1)),
                     "last_era": int(row["era"]),
                 })
+        elif mode == "rolling_mean":
+            win_eras = max(1, int(self.persistence_window if self.persistence_window not in (None, "none", "None", "", 0) else 4))
+            tail_df = hist_df.groupby("ticker", sort=False).tail(win_eras).copy()
+            tail_df["weighted_target"] = tail_df["target"] * tail_df["weight"]
+            grouped = tail_df.groupby("ticker", sort=False)
+            w_sums = grouped["weight"].sum()
+            wt_sums = grouped["weighted_target"].sum()
+            counts = grouped["target"].size()
+            last_eras = grouped["era"].max()
+            for ticker_key in w_sums.index:
+                w_sum = max(1e-12, float(w_sums.loc[ticker_key]))
+                wt_sum = float(wt_sums.loc[ticker_key])
+                persisted = (wt_sum + smoothing_weight * self.global_mean_) / (w_sum + smoothing_weight)
+                self.ticker_lookup_[str(ticker_key)] = float(persisted)
+                summary_rows.append({
+                    "ticker": str(ticker_key),
+                    "persisted_target": float(persisted),
+                    "obs_count": int(counts.loc[ticker_key]),
+                    "last_era": int(last_eras.loc[ticker_key]),
+                })
         elif mode == "expanding_mean":
             hist_df["weighted_target"] = hist_df["target"] * hist_df["weight"]
             grouped = hist_df.groupby("ticker", sort=False)
@@ -685,7 +707,9 @@ class PersistenceEstimator(BaseNumeraiEstimator):
                     "last_era": int(last_eras.loc[ticker_key]),
                 })
         else:
-            raise ValueError(f"Unsupported persistence_mode '{self.persistence_mode}'; use None, 'last', or 'expanding_mean'.")
+            raise ValueError(
+                f"Unsupported persistence_mode '{self.persistence_mode}'; use None, 'last', 'rolling_mean', or 'expanding_mean'."
+            )
 
         self.persistence_table_ = (
             pd.DataFrame(summary_rows)

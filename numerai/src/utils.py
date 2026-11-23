@@ -211,19 +211,141 @@ def prepare_bayesian_space(space: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _is_inactive(val: Any) -> bool:
+    return val in (None, False, 0, "None", "none", "null", "")
+
+
+def _canonicalize_candidate_params(candidate: Mapping[str, Any]) -> Dict[str, Any]:
+    """Canonicalize inactive conditional parameters to a sentinel so `deduplicate_param_grid` prunes no-op combinations."""
+    canon = dict(candidate)
+    if _is_inactive(canon.get("estimator__extractor__sparse_selector")):
+        if "estimator__extractor__sparse_alpha" in canon:
+            canon["estimator__extractor__sparse_alpha"] = "__INACTIVE__"
+    if not bool(canon.get("estimator__extractor__include_rolling_era", False)):
+        if "estimator__extractor__rolling_era_windows" in canon:
+            canon["estimator__extractor__rolling_era_windows"] = "__INACTIVE__"
+    if not bool(canon.get("estimator__extractor__include_lag_diff", False)):
+        if "estimator__extractor__era_lag_scales" in canon:
+            canon["estimator__extractor__era_lag_scales"] = "__INACTIVE__"
+    if _is_inactive(canon.get("estimator__extractor__fourier_order")):
+        if "estimator__extractor__fourier_period_eras" in canon:
+            canon["estimator__extractor__fourier_period_eras"] = "__INACTIVE__"
+    tk_feat = canon.get("estimator__extractor__ticker_features")
+    if _is_inactive(tk_feat):
+        if "estimator__extractor__ticker_windows" in canon:
+            canon["estimator__extractor__ticker_windows"] = "__INACTIVE__"
+        if "estimator__extractor__ticker_lag_steps" in canon:
+            canon["estimator__extractor__ticker_lag_steps"] = "__INACTIVE__"
+    elif tk_feat is not True and "raw_lags" not in str(tk_feat).lower() and "all" not in str(tk_feat).lower():
+        if "estimator__extractor__ticker_lag_steps" in canon:
+            canon["estimator__extractor__ticker_lag_steps"] = "__INACTIVE__"
+    if _is_inactive(canon.get("estimator__extractor__correlation_method")):
+        if "estimator__extractor__abs_corr" in canon:
+            canon["estimator__extractor__abs_corr"] = "__INACTIVE__"
+    if str(canon.get("estimator__era_weighting") or "").strip().lower() != "recency_exp":
+        if "estimator__recency_decay" in canon:
+            canon["estimator__recency_decay"] = "__INACTIVE__"
+    if _is_inactive(canon.get("estimator__correlation_method")):
+        if "estimator__abs_corr" in canon:
+            canon["estimator__abs_corr"] = "__INACTIVE__"
+    p_mode = canon.get("estimator__persistence_mode")
+    if str(p_mode or "").strip().lower() != "rolling_mean":
+        if "estimator__persistence_window" in canon:
+            canon["estimator__persistence_window"] = "__INACTIVE__"
+    if _is_inactive(p_mode) or str(p_mode).strip().lower() == "zero_rule":
+        for p_key in ("estimator__persistence_lag", "estimator__persistence_window", "estimator__smoothing"):
+            if p_key in canon:
+                canon[p_key] = "__INACTIVE__"
+    return canon
+
+
+def build_conditional_bayesian_spaces(
+    space: Mapping[str, Any],
+    total_n_iter: int = 12,
+) -> Any:
+    """Split a Bayesian search space into conditional `(subspace, n_iter)` tuples so inactive child parameters are not wasted."""
+    prepared = prepare_bayesian_space(space)
+    if not SKOPT_AVAILABLE or SkCategorical is None or int(total_n_iter) < 4:
+        return prepared
+
+    def _cats(dim: Any) -> List[Any]:
+        return list(dim.categories) if hasattr(dim, "categories") else []
+
+    # 1. PersistenceEstimator conditional split (`None` vs `last`/`expanding_mean` vs `rolling_mean`)
+    if "estimator__persistence_mode" in prepared:
+        modes = _cats(prepared["estimator__persistence_mode"])
+        if len(modes) >= 2:
+            subspaces: List[Tuple[Dict[str, Any], int]] = []
+            zero_modes = [m for m in modes if _is_inactive(m) or str(m).strip().lower() == "zero_rule"]
+            non_roll_modes = [m for m in modes if str(m).strip().lower() in ("last", "expanding_mean")]
+            roll_modes = [m for m in modes if str(m).strip().lower() == "rolling_mean"]
+            remaining_iter = int(total_n_iter)
+            if zero_modes:
+                sub = dict(prepared)
+                sub["estimator__persistence_mode"] = SkCategorical(zero_modes)
+                if "estimator__persistence_lag" in sub:
+                    sub["estimator__persistence_lag"] = SkCategorical([None])
+                if "estimator__persistence_window" in sub:
+                    sub["estimator__persistence_window"] = SkCategorical([None])
+                if "estimator__smoothing" in sub:
+                    sub["estimator__smoothing"] = SkCategorical([0.0])
+                budget = 1
+                subspaces.append((sub, budget))
+                remaining_iter = max(1, remaining_iter - budget)
+            if non_roll_modes and roll_modes:
+                half = max(1, remaining_iter // 2)
+                sub_nr = dict(prepared)
+                sub_nr["estimator__persistence_mode"] = SkCategorical(non_roll_modes)
+                if "estimator__persistence_window" in sub_nr:
+                    sub_nr["estimator__persistence_window"] = SkCategorical([None])
+                subspaces.append((sub_nr, half))
+                sub_r = dict(prepared)
+                sub_r["estimator__persistence_mode"] = SkCategorical(roll_modes)
+                subspaces.append((sub_r, max(1, remaining_iter - half)))
+            elif non_roll_modes:
+                sub_nr = dict(prepared)
+                sub_nr["estimator__persistence_mode"] = SkCategorical(non_roll_modes)
+                if "estimator__persistence_window" in sub_nr:
+                    sub_nr["estimator__persistence_window"] = SkCategorical([None])
+                subspaces.append((sub_nr, remaining_iter))
+            elif roll_modes:
+                sub_r = dict(prepared)
+                sub_r["estimator__persistence_mode"] = SkCategorical(roll_modes)
+                subspaces.append((sub_r, remaining_iter))
+            if len(subspaces) >= 2:
+                return subspaces
+
+    # 2. Extractor-backed estimators: gate `sparse_alpha` on `sparse_selector` so continuous alpha trials aren't wasted when off
+    if "estimator__extractor__sparse_selector" in prepared and "estimator__extractor__sparse_alpha" in prepared:
+        sel_cats = _cats(prepared["estimator__extractor__sparse_selector"])
+        off_cats = [c for c in sel_cats if _is_inactive(c)]
+        on_cats = [c for c in sel_cats if not _is_inactive(c)]
+        if off_cats and on_cats:
+            half = max(2, int(total_n_iter) // 2)
+            sub_off = dict(prepared)
+            sub_off["estimator__extractor__sparse_selector"] = SkCategorical(off_cats)
+            sub_off["estimator__extractor__sparse_alpha"] = SkCategorical([0.01])
+            sub_on = dict(prepared)
+            sub_on["estimator__extractor__sparse_selector"] = SkCategorical(on_cats)
+            return [(sub_off, half), (sub_on, max(2, int(total_n_iter) - half))]
+
+    return prepared
+
+
 def deduplicate_param_grid(
     param_grid: Mapping[str, Sequence[Any]],
     *,
     base_params: Optional[Mapping[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """Deduplicate a `GridSearchCV` parameter dictionary into unique single-item candidate dicts."""
+    """Deduplicate a `GridSearchCV` parameter dictionary, pruning conditionally inactive no-op combinations."""
     del base_params
     grid = list(ParameterGrid(dict(param_grid)))
     seen: set = set()
     kept: List[Dict[str, Any]] = []
     for candidate in grid:
+        canonical = _canonicalize_candidate_params(candidate)
         sig = hashlib.md5(
-            json.dumps({k: repr(v) for k, v in sorted(candidate.items())}, sort_keys=True).encode()
+            json.dumps({k: repr(v) for k, v in sorted(canonical.items())}, sort_keys=True).encode()
         ).hexdigest()
         if sig not in seen:
             seen.add(sig)
@@ -865,6 +987,10 @@ def evaluate_numerai_predictions(
     else:
         directional_hit_rate = 0.0
 
+    numerai_corr_pct = float(np.round(numerai_corr_mean * 100.0, 2))
+    positive_era_pct = float(np.round(float(np.mean(corrs_arr > 0.0)) * 100.0, 2)) if len(corrs_arr) else 0.0
+    directional_accuracy_pct = float(np.round(directional_hit_rate * 100.0, 2))
+
     cumulative_corr = numerai_era_corrs.cumsum()
     if len(cumulative_corr):
         running_peak = pd.Series(
@@ -903,13 +1029,17 @@ def evaluate_numerai_predictions(
     if verbose:
         if label:
             print(f"--- {label} ---")
+        print(
+            f"Percentage Summary | Numerai CORR: {numerai_corr_pct:+.2f}% | "
+            f"Positive Eras: {positive_era_pct:.1f}% | Directional Accuracy: {directional_accuracy_pct:.1f}%"
+        )
         print(f"Numerai CORR: {numerai_corr_mean:.4f}")
         print(f"Spearman Correlation: {spearman_mean:.4f}")
         print(f"Average Payout: {payout_mean:.4f}")
         print(f"Sharpe Ratio (Numerai / Spearman): {numerai_sharpe:.4f} / {spearman_sharpe:.4f}")
         print(f"Mean Absolute Error (MAE): {mae_val:.4f}")
         print(f"Forecast Bias (mean(y - y_hat)): {forecast_bias:.4f}")
-        print(f"Directional Hit Rate (vs 0.5): {directional_hit_rate:.4f}")
+        print(f"Directional Hit Rate (vs 0.5): {directional_hit_rate:.4f} ({directional_accuracy_pct:.1f}%)")
         print(
             f"Era CORR White-Noise & Regime Tests | Lag-1 ACF: {era_corr_lag1_acf:.4f} | "
             f"Ljung-Box p: {ljung_box_pvalue:.4f} | ARCH-LM p: {arch_lm_pvalue:.4f} | ADF p: {adf_pvalue:.4f}"
@@ -924,6 +1054,9 @@ def evaluate_numerai_predictions(
 
     return {
         "numerai_corr": numerai_corr_mean,
+        "numerai_corr_pct": numerai_corr_pct,
+        "positive_era_pct": positive_era_pct,
+        "directional_accuracy_pct": directional_accuracy_pct,
         "spearman": spearman_mean,
         "payout": payout_mean,
         "numerai_sharpe": numerai_sharpe,
@@ -1061,20 +1194,39 @@ def export_diagnostics_predictions(
 
 
 def candidate_score(estimator: Any, X: pd.DataFrame, y: Any) -> float:
-    """Official per-era `numerai_corr` scorer for `GridSearchCV` / `BayesSearchCV` (evaluates all validation fold eras)."""
-    preds = estimator.predict(X)
+    """Official per-era `numerai_corr` scorer for `GridSearchCV` / `BayesSearchCV` with readable per-fold percentage printout."""
+    preds = np.asarray(estimator.predict(X), dtype=np.float64).ravel()
+    targets = np.asarray(y, dtype=np.float64).ravel()
     eras = X["era"].to_numpy() if isinstance(X, pd.DataFrame) and "era" in X.columns else None
-    era_corrs = compute_per_era_numerai_corr(y, preds, eras=eras)
+    era_corrs = compute_per_era_numerai_corr(targets, preds, eras=eras)
     mean_corr = float(era_corrs.mean()) if len(era_corrs) else 0.0
-    return mean_corr if np.isfinite(mean_corr) else 0.0
+    mean_corr = mean_corr if np.isfinite(mean_corr) else 0.0
+    pos_era_pct = float(np.mean(era_corrs.to_numpy(dtype=np.float64) > 0.0) * 100.0) if len(era_corrs) else 0.0
+    if len(targets):
+        pred_center = 0.5 if (0.15 <= float(np.mean(preds)) <= 0.85) else float(np.mean(preds))
+        non_neutral = np.abs(targets - 0.5) > 1e-9
+        dir_acc_pct = (
+            float(np.mean(np.sign(targets[non_neutral] - 0.5) == np.sign(preds[non_neutral] - pred_center)) * 100.0)
+            if np.any(non_neutral)
+            else 50.0
+        )
+    else:
+        dir_acc_pct = 0.0
+    print(
+        f"  [Fold Score] Numerai CORR: {mean_corr * 100.0:+.2f}% ({mean_corr:.4f}) | "
+        f"Positive Eras: {pos_era_pct:.1f}% | Directional Accuracy: {dir_acc_pct:.1f}%"
+    )
+    return mean_corr
 
 
 def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
-    """Build a flat candidate results table with every hyperparameter expanded into its own column."""
+    """Build a flat candidate results table with percentage score and every hyperparameter expanded into its own column."""
     cv_res = getattr(search_or_results, "cv_results_", search_or_results)
     if not cv_res:
         return pd.DataFrame()
     df = pd.DataFrame(cv_res)
+    if "mean_test_score" in df.columns:
+        df["mean_test_corr_pct"] = (df["mean_test_score"].astype(float) * 100.0).round(2)
     param_prefixed = [col for col in df.columns if col.startswith("param_")]
     if "params" in df.columns:
         params_df = pd.DataFrame(list(df["params"])).rename(
