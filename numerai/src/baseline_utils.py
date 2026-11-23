@@ -23,17 +23,18 @@ from utils import (
     NumeraiExtractions,
     _all_numeric_dtypes,
     _decode_structured,
+    _safe_autocorr,
     compute_feature_target_correlations,
 )
 
 _EXTRACTION_CACHE: "OrderedDict[str, Tuple[NumeraiExtractions, pd.DataFrame]]" = OrderedDict()
 _EXTRACTION_CACHE_CONFIG: Dict[str, Any] = {
     "enabled": True,
-    "max_entries": 16,
+    "max_entries": 4,
 }
 
 
-def configure_extraction_cache(enabled: bool = True, max_entries: int = 16) -> Dict[str, Any]:
+def configure_extraction_cache(enabled: bool = True, max_entries: int = 4) -> Dict[str, Any]:
     """Configure the per-process fold-safe LRU extraction cache used by `BaseNumeraiEstimator`."""
     _EXTRACTION_CACHE_CONFIG["enabled"] = bool(enabled)
     _EXTRACTION_CACHE_CONFIG["max_entries"] = max(0, int(max_entries))
@@ -661,11 +662,11 @@ class LagReversalEstimator(BaseNumeraiEstimator):
                                 pacf_vals = statsmodels_pacf(col_arr, nlags=eff_lag, method="yw")
                                 pacf_list.append(float(pacf_vals[eff_lag]))
                             except Exception:
-                                pacf_list.append(float(era_series_df[column].autocorr(lag=eff_lag)))
+                                pacf_list.append(_safe_autocorr(col_arr, lag=eff_lag))
                     feature_acfs = np.array(pacf_list, dtype=np.float64)
                 elif metric_mode in ("acf", "none", ""):
                     feature_acfs = np.array(
-                        [era_series_df[column].autocorr(lag=lag_steps) for column in feature_names],
+                        [_safe_autocorr(era_series_df[column].to_numpy(dtype=np.float64, copy=False), lag=lag_steps) for column in feature_names],
                         dtype=np.float64,
                     )
                 else:

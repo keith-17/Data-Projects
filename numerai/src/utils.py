@@ -117,12 +117,33 @@ def _quantize_1d_array(
     if std <= 1e-12:
         return np.full(len(arr), 2, dtype=np.int8)
     if strategy == "quantile" and len(np.unique(clean)) >= 5:
-        discretizer = KBinsDiscretizer(n_bins=5, encode="ordinal", strategy="quantile", subsample=None)
-        binned = discretizer.fit_transform(clean.reshape(-1, 1)).ravel()
-        return np.clip(np.rint(binned), 0, 4).astype(np.int8)
+        raw_edges = np.quantile(clean, (0.2, 0.4, 0.6, 0.8))
+        # Deduplicate collapsed quantile edges (ties) cleanly without KBinsDiscretizer UserWarnings
+        unique_edges = raw_edges[np.concatenate(([True], np.diff(raw_edges) > 1e-8))]
+        if len(unique_edges) > 0:
+            binned = np.searchsorted(unique_edges, clean, side="right")
+            return np.clip(binned, 0, 4).astype(np.int8)
     z_scores = (clean - float(np.mean(clean))) / std
     binned = np.rint(np.clip(z_scores, -2.0, 2.0) + 2.0)
     return np.clip(binned, 0, 4).astype(np.int8)
+
+
+def _safe_autocorr(values: Any, lag: int = 1) -> float:
+    """Zero-division-safe lag-k autocorrelation (avoids numpy `c /= stddev` RuntimeWarning on constant slices)."""
+    arr = np.asarray(values, dtype=np.float64).ravel()
+    arr = arr[np.isfinite(arr)]
+    k = max(1, int(lag))
+    if len(arr) <= k + 1:
+        return 0.0
+    x0 = arr[:-k]
+    x1 = arr[k:]
+    c0 = x0 - float(np.mean(x0))
+    c1 = x1 - float(np.mean(x1))
+    denom = float(np.sqrt(np.dot(c0, c0) * np.dot(c1, c1)))
+    if not np.isfinite(denom) or denom <= 1e-12:
+        return 0.0
+    val = float(np.dot(c0, c1) / denom)
+    return val if np.isfinite(val) else 0.0
 
 
 def quantize_to_5bins(
@@ -534,6 +555,36 @@ def _pooled_pearson_corr(
     return corrs
 
 
+def _is_constant_1d(arr: np.ndarray) -> bool:
+    """True when a 1D numeric array has fewer than 2 finite elements or zero variance."""
+    a = np.asarray(arr, dtype=np.float64).ravel()
+    a = a[np.isfinite(a)]
+    if len(a) < 2:
+        return True
+    if bool(np.all(a == a[0])):
+        return True
+    return float(np.nanstd(a)) <= 1e-12
+
+
+def _safe_numerai_corr_frame(features_df: pd.DataFrame, target_series: pd.Series) -> pd.Series:
+    """Compute `numerai_corr` while masking out zero-variance columns so `c /= stddev` never divides by zero."""
+    cols = list(features_df.columns)
+    out = pd.Series(0.0, index=cols, dtype=np.float64)
+    if len(cols) == 0 or _is_constant_1d(target_series.to_numpy(dtype=np.float64, copy=False)):
+        return out
+    mat = features_df.to_numpy(dtype=np.float32, copy=False)
+    if mat.shape[0] < 3:
+        return out
+    col_stds = np.nanstd(mat, axis=0)
+    nonconst_mask = np.isfinite(col_stds) & (col_stds > 1e-12)
+    if not np.any(nonconst_mask):
+        return out
+    active_cols = [col for col, keep in zip(cols, nonconst_mask) if keep]
+    active_scores = numerai_corr(features_df[active_cols].astype(np.float32, copy=False), target_series).fillna(0.0)
+    out.loc[active_cols] = active_scores.reindex(active_cols).fillna(0.0).to_numpy(dtype=np.float64)
+    return out
+
+
 def compute_feature_target_correlations(
     features_df: pd.DataFrame,
     target_series: pd.Series,
@@ -567,15 +618,16 @@ def compute_feature_target_correlations(
             per_era_num_corrs: List[pd.Series] = []
             for _, era_features in clean_df.groupby(eras, sort=True):
                 era_target = clean_target.loc[era_features.index]
-                if len(era_features) < 3 or float(era_target.std()) <= 1e-12:
+                if len(era_features) < 3 or _is_constant_1d(era_target.to_numpy(dtype=np.float64, copy=False)):
                     continue
-                era_f32 = era_features.astype(np.float32, copy=False)
-                per_era_num_corrs.append(numerai_corr(era_f32, era_target).fillna(0.0))
+                per_era_num_corrs.append(_safe_numerai_corr_frame(era_features, era_target))
             if per_era_num_corrs:
                 return pd.concat(per_era_num_corrs, axis=1).mean(axis=1).reindex(feature_cols).fillna(0.0)
-        return numerai_corr(clean_df.astype(np.float32, copy=False), clean_target).reindex(feature_cols).fillna(0.0)
+        return _safe_numerai_corr_frame(clean_df, clean_target).reindex(feature_cols).fillna(0.0)
 
     target_values = clean_target.to_numpy(dtype=np.float64, copy=False)
+    if _is_constant_1d(target_values):
+        return pd.Series(0.0, index=feature_cols, dtype=np.float64)
     if method == "spearman":
         corrs = _pooled_pearson_corr(clean_df, target_values, rank_columns=True)
         return pd.Series(corrs, index=feature_cols, dtype=np.float64)
@@ -1024,10 +1076,15 @@ def compute_per_era_spearman_corr(y_true: Any, y_pred: Any, eras: Optional[Any] 
     era_scores: Dict[Any, float] = {}
     for era_key, era_df in frame.groupby("era", sort=True):
         valid_df = era_df.dropna(subset=["target", "prediction"])
-        if len(valid_df) < 3 or float(valid_df["prediction"].std()) <= 1e-12 or float(valid_df["target"].std()) <= 1e-12:
+        if len(valid_df) < 3:
+            era_scores[era_key] = 0.0
+            continue
+        t_arr = valid_df["target"].to_numpy(dtype=np.float64, copy=False)
+        p_arr = valid_df["prediction"].to_numpy(dtype=np.float64, copy=False)
+        if _is_constant_1d(p_arr) or _is_constant_1d(t_arr):
             era_scores[era_key] = 0.0
         else:
-            corr_val = float(spearmanr(valid_df["target"], valid_df["prediction"])[0])
+            corr_val = float(spearmanr(t_arr, p_arr)[0])
             era_scores[era_key] = corr_val if np.isfinite(corr_val) else 0.0
     return pd.Series(era_scores, dtype=np.float64)
 
@@ -1042,7 +1099,12 @@ def compute_per_era_numerai_corr(y_true: Any, y_pred: Any, eras: Optional[Any] =
     era_scores: Dict[Any, float] = {}
     for era_key, era_df in frame.groupby("era", sort=True):
         valid_df = era_df.dropna(subset=["target", "prediction"])
-        if len(valid_df) < 3 or float(valid_df["prediction"].std()) <= 1e-12 or float(valid_df["target"].std()) <= 1e-12:
+        if len(valid_df) < 3:
+            era_scores[era_key] = 0.0
+            continue
+        t_arr = valid_df["target"].to_numpy(dtype=np.float64, copy=False)
+        p_arr = valid_df["prediction"].to_numpy(dtype=np.float64, copy=False)
+        if _is_constant_1d(p_arr) or _is_constant_1d(t_arr):
             era_scores[era_key] = 0.0
         else:
             score_val = float(numerai_corr(valid_df[["prediction"]], valid_df["target"])["prediction"])
@@ -1056,31 +1118,21 @@ def compute_feature_exposure(
     feature_columns: Optional[Sequence[str]] = None,
 ) -> float:
     """Compute Feature Exposure (`np.std([spearmanr(prediction, f)[0] for f in all_features])`) matching the Numerai starter notebook."""
+    if feature_columns is not None and len(feature_columns) == 0:
+        return float(np.nan)
     preds = np.asarray(predictions, dtype=np.float64).ravel()
-    if len(preds) < 3 or float(np.std(preds)) <= 1e-12:
+    if len(preds) < 3 or _is_constant_1d(preds):
         return 0.0
     cols = (
         list(feature_columns)
         if feature_columns is not None
         else [str(col) for col in features_df.columns if str(col) not in FORBIDDEN_FEATURE_COLS]
     )
-    feature_corrs: List[float] = []
-    for col in cols:
-        if col not in features_df.columns:
-            continue
-        col_series = features_df[col]
-        if isinstance(col_series.dtype, np.dtype) and np.issubdtype(col_series.dtype, np.integer):
-            f_vals = col_series.to_numpy(dtype=np.float32, copy=False)
-        elif pd.api.types.is_numeric_dtype(col_series.dtype):
-            f_vals = col_series.fillna(2.0).to_numpy(dtype=np.float32, copy=False)
-        else:
-            f_vals = pd.to_numeric(col_series, errors="coerce").fillna(2.0).to_numpy(dtype=np.float32, copy=False)
-        if float(np.std(f_vals)) <= 1e-12:
-            feature_corrs.append(0.0)
-        else:
-            corr_val = float(spearmanr(preds, f_vals)[0])
-            feature_corrs.append(corr_val if np.isfinite(corr_val) else 0.0)
-    return float(np.round(np.std(feature_corrs), 4)) if feature_corrs else 0.0
+    valid_cols = [col for col in cols if col in features_df.columns]
+    if not valid_cols:
+        return float(np.nan)
+    feature_corrs = _pooled_pearson_corr(features_df[valid_cols], preds, rank_columns=True)
+    return float(np.round(np.std(feature_corrs), 4)) if len(feature_corrs) else 0.0
 
 
 def evaluate_numerai_predictions(
@@ -1108,7 +1160,7 @@ def evaluate_numerai_predictions(
     numerai_sharpe = float(np.round(sharpe_ratio(numerai_era_corrs), 4))
     mae_val = float(np.round(mean_absolute_error(targets, preds), 4)) if len(targets) else 0.0
     forecast_bias = float(np.round(np.mean(targets - preds), 4)) if len(targets) else 0.0
-    raw_lag1_acf = float(numerai_era_corrs.autocorr(lag=1)) if len(numerai_era_corrs) >= 3 else 0.0
+    raw_lag1_acf = _safe_autocorr(numerai_era_corrs.to_numpy(dtype=np.float64), lag=1) if len(numerai_era_corrs) >= 3 else 0.0
     era_corr_lag1_acf = float(np.round(raw_lag1_acf, 4)) if np.isfinite(raw_lag1_acf) else 0.0
 
     # Expanded Financial Time-Series Diagnostics (Ljung-Box, ARCH-LM, ADF Stationarity, Skew, Kurtosis, Jarque-Bera, Directional Hit Rate)
@@ -1187,7 +1239,7 @@ def evaluate_numerai_predictions(
 
     feature_exposure = (
         compute_feature_exposure(features_df, preds, feature_columns=feature_columns)
-        if features_df is not None
+        if (features_df is not None and (feature_columns is None or len(feature_columns) > 0))
         else np.nan
     )
 
@@ -1486,7 +1538,7 @@ def build_experiment_setup(
     error_zero_tols: Tuple[float, float] = (0.01, 0.10),
     error_abs_bins: Tuple[float, float] = (0.125, 0.375),
     extraction_cache_enabled: bool = True,
-    extraction_cache_max_entries: int = 16,
+    extraction_cache_max_entries: int = 4,
     force_reload_data_cache: bool = False,
     use_wandb: bool = False,
     wandb_project: str = "numerai-baselines",
