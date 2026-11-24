@@ -2029,15 +2029,22 @@ def _compute_clipped_era_returns(
     per_era_corr: pd.Series,
     *,
     per_era_mmc: Optional[pd.Series] = None,
-    corr_weight: float = 0.5,
-    mmc_weight: float = 2.0,
-    payout_factor: Union[float, pd.Series] = 0.5,
-    live_decay: float = 0.75,
-    clip_limit: float = 0.25,
-    stride: int = 1,
+    corr_weight: float = 8.0,
+    mmc_weight: float = 32.0,
+    payout_factor: Union[float, pd.Series] = 1.0,
+    clip_min: float = -1.0,
+    clip_max: float = 2.0,
+    churn_penalty: Optional[Union[float, pd.Series]] = None,
+    stride: int = 4,
     corr_multiplier: Optional[float] = None,
 ) -> Tuple[pd.Series, bool]:
-    """Compute chronologically sorted, clipped per-era Numerai live returns (`pd.Series` indexed by era)."""
+    """Compute chronologically sorted Numerai Round 1393+ payout returns per non-overlapping round.
+
+    Official Classic R1393+ formula:
+        weighted_score_t = corr_weight * NCORR_t + mmc_weight * NMMC_t   (8 * NCORR + 32 * NMMC)
+        return_t = clip(payout_factor_t * weighted_score_t, clip_min=-1.0, clip_max=+2.0)
+    Optional R1399+ neutral-churn penalty reduces positive payouts only after clipping.
+    """
     corr_series = pd.Series(per_era_corr, dtype=np.float64).dropna().sort_index()
     step = max(1, int(stride))
     if step > 1 and len(corr_series) > 0:
@@ -2067,37 +2074,279 @@ def _compute_clipped_era_returns(
             .reindex(corr_series.index)
             .ffill()
             .bfill()
-            .fillna(0.5)
+            .fillna(1.0)
         )
-        era_returns = (raw_score * float(live_decay) * pf_aligned).clip(-float(clip_limit), float(clip_limit))
+        era_returns = (raw_score * pf_aligned).clip(float(clip_min), float(clip_max))
     else:
-        era_returns = (raw_score * float(live_decay) * float(payout_factor)).clip(
-            -float(clip_limit), float(clip_limit)
-        )
+        era_returns = (raw_score * float(payout_factor)).clip(float(clip_min), float(clip_max))
+
+    if churn_penalty is not None:
+        if isinstance(churn_penalty, pd.Series):
+            cp = (
+                pd.Series(churn_penalty, dtype=np.float64)
+                .dropna()
+                .sort_index()
+                .reindex(era_returns.index)
+                .ffill()
+                .bfill()
+                .fillna(0.0)
+                .clip(0.0, 1.0)
+            )
+            era_returns = pd.Series(
+                np.where(era_returns > 0.0, era_returns * (1.0 - cp), era_returns),
+                index=era_returns.index,
+                dtype=np.float64,
+            )
+        else:
+            cp_val = float(np.clip(float(churn_penalty), 0.0, 1.0))
+            era_returns = pd.Series(
+                np.where(era_returns > 0.0, era_returns * (1.0 - cp_val), era_returns),
+                index=era_returns.index,
+                dtype=np.float64,
+            )
+
     return era_returns.astype(np.float64), has_mmc
+
+
+def _simulate_single_window_path(
+    ret_arr: np.ndarray,
+    initial_stake: float,
+    staking_mode: str,
+) -> Tuple[np.ndarray, float, float, float]:
+    """Simulate a single independent Atomic-staking window starting at `initial_stake` (zero cross-window compounding)."""
+    init_stake = float(initial_stake)
+    if len(ret_arr) == 0:
+        return np.empty(0, dtype=np.float64), 0.0, 0.0, 0.0
+
+    if staking_mode == "constant":
+        # Atomic Constant staking: fixed `initial_stake` staked per settled round, excess profits swept idle,
+        # downside bounded at 0 (cannot lose more than available capital).
+        cum_pnl = np.cumsum(init_stake * ret_arr)
+        eq = np.maximum(0.0, init_stake + cum_pnl)
+        # Once wiped out (eq == 0), stay at 0
+        wiped = np.maximum.accumulate(eq <= 0.0)
+        eq = np.where(wiped, 0.0, eq)
+    else:
+        # Atomic Compound staking: settled round balance rolls into next round
+        eq = init_stake * np.cumprod(np.maximum(0.0, 1.0 + ret_arr))
+
+    running_peak = np.maximum.accumulate(np.maximum(init_stake, eq))
+    dd_gbp = eq - running_peak
+    dd_pct = np.where(running_peak > 0.0, (dd_gbp / running_peak) * 100.0, 0.0)
+    prev_eq = np.concatenate(([init_stake], eq[:-1]))
+    round_pnl_gbp = eq - prev_eq
+    return eq, float(dd_pct.min()), float(dd_gbp.min()), float(round_pnl_gbp.min())
+
+
+def _partition_window_slices(n_rounds: int, window_rounds: int) -> List[Tuple[int, int]]:
+    """Split `n_rounds` non-overlapping rounds into independent chronological windows."""
+    if n_rounds <= 0:
+        return []
+    w_len = max(1, int(window_rounds))
+    if n_rounds <= w_len:
+        return [(0, n_rounds)]
+    n_windows = max(1, n_rounds // w_len)
+    edges = np.linspace(0, n_rounds, num=n_windows + 1, dtype=np.int64)
+    return [(int(edges[i]), int(edges[i + 1])) for i in range(n_windows) if edges[i + 1] > edges[i]]
 
 
 def simulate_stake_pnl(
     per_era_corr: pd.Series,
     per_era_mmc: Optional[pd.Series] = None,
     initial_stake: float = 1000.0,
-    corr_weight: float = 0.5,
-    mmc_weight: float = 2.0,
-    payout_factor: Union[float, pd.Series] = 0.5,
-    live_decay: float = 0.75,
-    clip_limit: float = 0.25,
-    n_concurrent_eras: int = 4,
+    corr_weight: float = 8.0,
+    mmc_weight: float = 32.0,
+    payout_factor: Union[float, pd.Series] = 1.0,
+    clip_min: float = -1.0,
+    clip_max: float = 2.0,
+    churn_penalty: Optional[Union[float, pd.Series]] = None,
     staking_mode: str = "compound",
-    stride: int = 1,
+    stride: int = 4,
+    window_rounds: int = 13,
+    score_basis: str = "corr_mmc_proxy",
     nmr_gbp_prices: Optional[pd.Series] = None,
     corr_multiplier: Optional[float] = None,
-) -> Dict[str, Union[float, pd.Series]]:
-    """Vectorized Numerai Staking V3 P&L simulator (£) on unseen out-of-fold or held-out validation eras.
+) -> Dict[str, Any]:
+    """Numerai Classic Round 1393+ Atomic Staking P&L simulator (£) across independent validation windows.
 
-    Splits `initial_stake` across `n_concurrent_eras` (default 4 weekly cohorts = 20-day settlement lockup)
-    so 100% of validation eras are utilized without double-compounding or stride phase bias. Supports
-    `'compound'` and `'constant'` staking modes, scalar or time-varying `payout_factor`, MMC, `live_decay`,
-    and an optional `nmr_gbp_prices` FX overlay.
+    Uses the official R1393+ payout formula (`8 * NCORR + 32 * NMMC`, clipped to `[-100%, +200%]`,
+    `payout_factor=1.0`, optional R1399+ neutral-churn penalty, NO arbitrary live-decay haircut).
+    Partitions non-overlapping settled rounds (`stride=4` -> 13 rounds ≈ 1 year per window) into
+    financially **independent** validation windows each starting fresh at `initial_stake` (£1,000),
+    eliminating artificial compounding across unrelated historical regimes.
+    """
+    init_stake = float(initial_stake)
+    clean_mode = str(staking_mode or "compound").strip().lower()
+    if clean_mode not in ("compound", "constant"):
+        raise ValueError(f"staking_mode must be 'compound' or 'constant', got {staking_mode!r}")
+
+    era_returns, has_mmc = _compute_clipped_era_returns(
+        per_era_corr,
+        per_era_mmc=per_era_mmc,
+        corr_weight=corr_weight,
+        mmc_weight=mmc_weight,
+        payout_factor=payout_factor,
+        clip_min=clip_min,
+        clip_max=clip_max,
+        churn_penalty=churn_penalty,
+        stride=stride,
+        corr_multiplier=corr_multiplier,
+    )
+    if len(era_returns) == 0:
+        empty_series = pd.Series(dtype=np.float64)
+        return {
+            "mean_ending_capital": init_stake,
+            "median_ending_capital": init_stake,
+            "mean_profit": 0.0,
+            "median_profit": 0.0,
+            "mean_return_pct": 0.0,
+            "std_profit": 0.0,
+            "profitable_windows_pct": 0.0,
+            "worst_window_ending_capital": init_stake,
+            "worst_window_profit": 0.0,
+            "best_window_ending_capital": init_stake,
+            "best_window_profit": 0.0,
+            "final_stake": init_stake,
+            "net_profit": 0.0,
+            "total_return_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "max_drawdown_gbp": 0.0,
+            "worst_era_gbp": 0.0,
+            "n_windows": 0,
+            "score_basis": str(score_basis),
+            "has_mmc": False,
+            "window_outcomes_df": pd.DataFrame(),
+            "round_returns": empty_series,
+            "equity_curve": empty_series,
+            "drawdown_pct_series": empty_series,
+        }
+
+    ret_arr = era_returns.to_numpy(dtype=np.float64)
+    idx = era_returns.index
+    fx_arr: Optional[np.ndarray] = None
+    if nmr_gbp_prices is not None and len(nmr_gbp_prices) > 0:
+        fx_aligned = (
+            pd.Series(nmr_gbp_prices, dtype=np.float64)
+            .dropna()
+            .sort_index()
+            .reindex(idx)
+            .ffill()
+            .bfill()
+        )
+        if len(fx_aligned) == len(idx) and not fx_aligned.isna().any():
+            fx_arr = fx_aligned.to_numpy(dtype=np.float64)
+
+    slices = _partition_window_slices(len(ret_arr), window_rounds=window_rounds)
+    window_rows: List[Dict[str, Any]] = []
+    window_curves: Dict[str, pd.Series] = {}
+
+    for w_i, (s, e) in enumerate(slices, start=1):
+        w_ret = ret_arr[s:e]
+        w_idx = idx[s:e]
+        w_eq, w_dd_pct, w_dd_gbp, w_worst_round = _simulate_single_window_path(w_ret, init_stake, clean_mode)
+        if fx_arr is not None and fx_arr[s] > 0.0:
+            w_eq = w_eq * (fx_arr[s:e] / fx_arr[s])
+            w_peak = np.maximum.accumulate(np.maximum(init_stake, w_eq))
+            w_dd_gbp_arr = w_eq - w_peak
+            w_dd_pct = float(np.where(w_peak > 0.0, (w_dd_gbp_arr / w_peak) * 100.0, 0.0).min())
+            w_dd_gbp = float(w_dd_gbp_arr.min())
+            w_prev = np.concatenate(([init_stake], w_eq[:-1]))
+            w_worst_round = float((w_eq - w_prev).min())
+
+        end_cap = float(w_eq[-1])
+        profit = end_cap - init_stake
+        ret_pct = (profit / init_stake) * 100.0 if abs(init_stake) > 1e-12 else 0.0
+        w_label = f"W{w_i} ({w_idx[0]}–{w_idx[-1]})"
+        window_curves[w_label] = pd.Series(w_eq, index=w_idx, dtype=np.float64, name=w_label)
+        window_rows.append({
+            "window": w_label,
+            "start_era": w_idx[0],
+            "end_era": w_idx[-1],
+            "n_rounds": int(len(w_ret)),
+            "ending_capital": round(end_cap, 2),
+            "profit_gbp": round(profit, 2),
+            "return_pct": round(ret_pct, 2),
+            "max_drawdown_pct": round(w_dd_pct, 2),
+            "max_drawdown_gbp": round(w_dd_gbp, 2),
+            "worst_round_gbp": round(w_worst_round, 2),
+            "profitable": bool(profit > 0.0),
+        })
+
+    win_df = pd.DataFrame(window_rows)
+    end_caps = win_df["ending_capital"].to_numpy(dtype=np.float64)
+    profits = win_df["profit_gbp"].to_numpy(dtype=np.float64)
+    ret_pcts = win_df["return_pct"].to_numpy(dtype=np.float64)
+
+    mean_end = float(np.mean(end_caps))
+    median_end = float(np.median(end_caps))
+    mean_prof = float(np.mean(profits))
+    median_prof = float(np.median(profits))
+    mean_ret = float(np.mean(ret_pcts))
+    std_prof = float(np.std(profits, ddof=0))
+    prof_pct = float(np.mean(profits > 0.0) * 100.0)
+    worst_end = float(np.min(end_caps))
+    worst_prof = float(np.min(profits))
+    best_end = float(np.max(end_caps))
+    best_prof = float(np.max(profits))
+    worst_dd_pct = float(win_df["max_drawdown_pct"].min())
+    worst_dd_gbp = float(win_df["max_drawdown_gbp"].min())
+    worst_era_gbp = float(win_df["worst_round_gbp"].min())
+
+    # Independent per-round (£1,000 per single round) equity & drawdown series
+    single_round_eq = pd.Series(init_stake * (1.0 + ret_arr), index=idx, dtype=np.float64, name="independent_round_gbp")
+    single_round_dd_pct = pd.Series(np.minimum(0.0, ret_arr) * 100.0, index=idx, dtype=np.float64, name="round_burn_pct")
+
+    return {
+        "mean_ending_capital": mean_end,
+        "median_ending_capital": median_end,
+        "mean_profit": mean_prof,
+        "median_profit": median_prof,
+        "mean_return_pct": mean_ret,
+        "std_profit": std_prof,
+        "profitable_windows_pct": prof_pct,
+        "worst_window_ending_capital": worst_end,
+        "worst_window_profit": worst_prof,
+        "best_window_ending_capital": best_end,
+        "best_window_profit": best_prof,
+        # Scalar summary keys aligned with CV/comparison tables (mean across independent windows)
+        "final_stake": mean_end,
+        "net_profit": mean_prof,
+        "total_return_pct": mean_ret,
+        "max_drawdown_pct": worst_dd_pct,
+        "max_drawdown_gbp": worst_dd_gbp,
+        "worst_era_gbp": worst_era_gbp,
+        "n_windows": int(len(win_df)),
+        "score_basis": str(score_basis),
+        "has_mmc": bool(has_mmc),
+        "window_outcomes_df": win_df,
+        "window_curves": window_curves,
+        "round_returns": era_returns,
+        "equity_curve": single_round_eq,
+        "drawdown_pct_series": single_round_dd_pct,
+    }
+
+
+def simulate_stake_pnl_monte_carlo(
+    per_era_corr: pd.Series,
+    per_era_mmc: Optional[pd.Series] = None,
+    initial_stake: float = 1000.0,
+    corr_weight: float = 8.0,
+    mmc_weight: float = 32.0,
+    payout_factor: Union[float, pd.Series] = 1.0,
+    clip_min: float = -1.0,
+    clip_max: float = 2.0,
+    churn_penalty: Optional[Union[float, pd.Series]] = None,
+    staking_mode: str = "compound",
+    stride: int = 4,
+    window_rounds: int = 13,
+    n_sims: int = 1000,
+    block_size: int = 3,
+    random_state: int = 42,
+) -> Dict[str, Any]:
+    """Within-window block-bootstrap Monte Carlo simulator under Numerai Classic R1393+ Atomic Staking.
+
+    Resamples actual per-round returns *inside each independent validation window* (each starting at
+    `initial_stake`), then aggregates the terminal capital and max-drawdown distributions across all windows.
     """
     init_stake = float(initial_stake)
     clean_mode = str(staking_mode or "compound").strip().lower()
@@ -2110,172 +2359,86 @@ def simulate_stake_pnl(
         corr_weight=corr_weight,
         mmc_weight=mmc_weight,
         payout_factor=payout_factor,
-        live_decay=live_decay,
-        clip_limit=clip_limit,
-        stride=stride,
-        corr_multiplier=corr_multiplier,
-    )
-    if len(era_returns) == 0:
-        empty_series = pd.Series(dtype=np.float64)
-        return {
-            "final_stake": init_stake,
-            "net_profit": 0.0,
-            "total_return_pct": 0.0,
-            "max_drawdown_pct": 0.0,
-            "max_drawdown_gbp": 0.0,
-            "worst_era_gbp": 0.0,
-            "equity_curve": empty_series,
-            "drawdown_pct_series": empty_series,
-        }
-
-    r_tranches = max(1, int(n_concurrent_eras))
-    tranche_init = init_stake / float(r_tranches)
-    ret_arr = era_returns.to_numpy(dtype=np.float64)
-    n_t = len(ret_arr)
-
-    if clean_mode == "constant":
-        eq_vals = np.maximum(0.0, init_stake + np.cumsum(tranche_init * ret_arr))
-    else:
-        factors = np.ones((r_tranches, n_t), dtype=np.float64)
-        t_idx = np.arange(n_t, dtype=np.int64)
-        factors[t_idx % r_tranches, t_idx] = 1.0 + ret_arr
-        eq_vals = (tranche_init * np.cumprod(factors, axis=1)).sum(axis=0)
-
-    equity_flat_fx = pd.Series(eq_vals, index=era_returns.index, dtype=np.float64, name="equity_gbp")
-
-    equity_curve = equity_flat_fx
-    if nmr_gbp_prices is not None and len(nmr_gbp_prices) > 0:
-        fx = (
-            pd.Series(nmr_gbp_prices, dtype=np.float64)
-            .dropna()
-            .sort_index()
-            .reindex(equity_flat_fx.index)
-            .ffill()
-            .bfill()
-        )
-        if len(fx) == len(equity_flat_fx) and not fx.isna().any():
-            start_fx = float(fx.to_numpy(dtype=np.float64)[0])
-            if start_fx > 0.0:
-                equity_curve = (equity_flat_fx * (fx / start_fx)).rename("equity_gbp_fx")
-
-    running_peak = equity_curve.cummax()
-    drawdown_gbp = equity_curve - running_peak
-    drawdown_pct = (drawdown_gbp / running_peak.replace(0.0, np.nan)).fillna(0.0)
-    drawdown_pct_series = (drawdown_pct * 100.0).rename("drawdown_pct")
-    first_equity = float(equity_curve.to_numpy(dtype=np.float64)[0])
-    era_pnl_gbp = equity_curve.diff().fillna(first_equity - init_stake)
-
-    final_stake = float(equity_curve.to_numpy(dtype=np.float64)[-1])
-    net_profit = final_stake - init_stake
-    total_return_pct = (net_profit / init_stake) * 100.0 if abs(init_stake) > 1e-12 else 0.0
-
-    result: Dict[str, Union[float, pd.Series]] = {
-        "final_stake": final_stake,
-        "net_profit": net_profit,
-        "total_return_pct": total_return_pct,
-        "max_drawdown_pct": float(drawdown_pct_series.min()),
-        "max_drawdown_gbp": float(drawdown_gbp.min()),
-        "worst_era_gbp": float(era_pnl_gbp.min()),
-        "equity_curve": equity_curve,
-        "drawdown_pct_series": drawdown_pct_series,
-    }
-    if nmr_gbp_prices is not None and equity_curve is not equity_flat_fx:
-        result["equity_curve_flat_fx"] = equity_flat_fx
-    return result
-
-
-def simulate_stake_pnl_monte_carlo(
-    per_era_corr: pd.Series,
-    per_era_mmc: Optional[pd.Series] = None,
-    initial_stake: float = 1000.0,
-    corr_weight: float = 0.5,
-    mmc_weight: float = 2.0,
-    payout_factor: Union[float, pd.Series] = 0.5,
-    live_decay: float = 0.75,
-    clip_limit: float = 0.25,
-    n_concurrent_eras: int = 4,
-    staking_mode: str = "compound",
-    stride: int = 1,
-    n_sims: int = 1000,
-    block_size: int = 8,
-    random_state: int = 42,
-) -> Dict[str, Union[float, pd.Series, np.ndarray]]:
-    """Vectorized Moving Block Bootstrap Monte Carlo P&L simulator preserving Numerai era autocorrelation & burn clustering."""
-    init_stake = float(initial_stake)
-    clean_mode = str(staking_mode or "compound").strip().lower()
-    if clean_mode not in ("compound", "constant"):
-        raise ValueError(f"staking_mode must be 'compound' or 'constant', got {staking_mode!r}")
-
-    era_returns, _ = _compute_clipped_era_returns(
-        per_era_corr,
-        per_era_mmc=per_era_mmc,
-        corr_weight=corr_weight,
-        mmc_weight=mmc_weight,
-        payout_factor=payout_factor,
-        live_decay=live_decay,
-        clip_limit=clip_limit,
+        clip_min=clip_min,
+        clip_max=clip_max,
+        churn_penalty=churn_penalty,
         stride=stride,
     )
     if len(era_returns) == 0:
-        empty_s = pd.Series(dtype=np.float64)
         return {
             "mc_p05_final_stake": init_stake,
             "mc_median_final_stake": init_stake,
+            "mc_mean_final_stake": init_stake,
             "mc_p95_final_stake": init_stake,
             "mc_prob_profit_pct": 0.0,
             "mc_p95_max_drawdown_pct": 0.0,
-            "p05_curve": empty_s,
-            "p25_curve": empty_s,
-            "p50_curve": empty_s,
-            "p75_curve": empty_s,
-            "p95_curve": empty_s,
+            "window_mc_df": pd.DataFrame(),
             "final_stakes": np.empty(0, dtype=np.float64),
             "max_drawdowns_pct": np.empty(0, dtype=np.float64),
         }
 
     ret_arr = era_returns.to_numpy(dtype=np.float64)
-    n_t = len(ret_arr)
+    idx = era_returns.index
+    slices = _partition_window_slices(len(ret_arr), window_rounds=window_rounds)
     n_s = max(10, int(n_sims))
-    b_size = min(max(1, int(block_size)), n_t)
-    n_blocks = int(np.ceil(float(n_t) / float(b_size)))
     rng = np.random.default_rng(int(random_state))
 
-    starts = rng.integers(0, max(1, n_t - b_size + 1), size=(n_s, n_blocks))
-    offsets = np.arange(b_size, dtype=np.int64)[None, None, :]
-    boot_idx = (starts[:, :, None] + offsets).reshape(n_s, -1)[:, :n_t]
-    sim_returns = ret_arr[boot_idx]  # (n_sims, T)
+    all_final_stakes: List[np.ndarray] = []
+    all_max_dds: List[np.ndarray] = []
+    win_mc_rows: List[Dict[str, Any]] = []
 
-    r_tranches = max(1, int(n_concurrent_eras))
-    tranche_init = init_stake / float(r_tranches)
-    if clean_mode == "constant":
-        sim_equity = np.maximum(0.0, init_stake + np.cumsum(tranche_init * sim_returns, axis=1))
-    else:
-        sim_equity = np.zeros((n_s, n_t), dtype=np.float64)
-        for k in range(r_tranches):
-            factors = np.ones((n_s, n_t), dtype=np.float64)
-            factors[:, k::r_tranches] = 1.0 + sim_returns[:, k::r_tranches]
-            sim_equity += tranche_init * np.cumprod(factors, axis=1)
+    for w_i, (s, e) in enumerate(slices, start=1):
+        w_ret = ret_arr[s:e]
+        w_idx = idx[s:e]
+        n_t = len(w_ret)
+        b_size = min(max(1, int(block_size)), n_t)
+        n_blocks = int(np.ceil(float(n_t) / float(b_size)))
 
-    running_peak = np.maximum.accumulate(sim_equity, axis=1)
-    sim_dd_pct = np.where(running_peak > 0.0, (sim_equity - running_peak) / running_peak, 0.0) * 100.0
-    max_dd_per_sim = sim_dd_pct.min(axis=1)
-    final_stakes = sim_equity[:, -1]
+        starts = rng.integers(0, max(1, n_t - b_size + 1), size=(n_s, n_blocks))
+        offsets = np.arange(b_size, dtype=np.int64)[None, None, :]
+        boot_idx = (starts[:, :, None] + offsets).reshape(n_s, -1)[:, :n_t]
+        sim_ret = w_ret[boot_idx]  # (n_sims, n_t)
 
-    q_vals = np.percentile(sim_equity, [5.0, 25.0, 50.0, 75.0, 95.0], axis=0)
-    idx = era_returns.index
+        if clean_mode == "constant":
+            sim_eq = np.maximum(0.0, init_stake + np.cumsum(init_stake * sim_ret, axis=1))
+            wiped = np.maximum.accumulate(sim_eq <= 0.0, axis=1)
+            sim_eq = np.where(wiped, 0.0, sim_eq)
+        else:
+            sim_eq = init_stake * np.cumprod(np.maximum(0.0, 1.0 + sim_ret), axis=1)
+
+        running_peak = np.maximum.accumulate(np.maximum(init_stake, sim_eq), axis=1)
+        sim_dd_pct = np.where(running_peak > 0.0, (sim_eq - running_peak) / running_peak, 0.0) * 100.0
+        w_max_dd = sim_dd_pct.min(axis=1)
+        w_finals = sim_eq[:, -1]
+
+        hist_eq, _, _, _ = _simulate_single_window_path(w_ret, init_stake, clean_mode)
+        all_final_stakes.append(w_finals)
+        all_max_dds.append(w_max_dd)
+        win_mc_rows.append({
+            "window": f"W{w_i} ({w_idx[0]}–{w_idx[-1]})",
+            "actual_ending_capital": float(hist_eq[-1]),
+            "p05": float(np.percentile(w_finals, 5.0)),
+            "p25": float(np.percentile(w_finals, 25.0)),
+            "p50": float(np.percentile(w_finals, 50.0)),
+            "p75": float(np.percentile(w_finals, 75.0)),
+            "p95": float(np.percentile(w_finals, 95.0)),
+            "prob_profit_pct": float(np.mean(w_finals > init_stake) * 100.0),
+            "p95_worst_dd_pct": float(np.percentile(w_max_dd, 5.0)),
+        })
+
+    agg_finals = np.concatenate(all_final_stakes)
+    agg_dds = np.concatenate(all_max_dds)
+
     return {
-        "mc_p05_final_stake": float(np.percentile(final_stakes, 5.0)),
-        "mc_median_final_stake": float(np.percentile(final_stakes, 50.0)),
-        "mc_p95_final_stake": float(np.percentile(final_stakes, 95.0)),
-        "mc_prob_profit_pct": float(np.mean(final_stakes > init_stake) * 100.0),
-        "mc_p95_max_drawdown_pct": float(np.percentile(max_dd_per_sim, 5.0)),
-        "p05_curve": pd.Series(q_vals[0], index=idx, dtype=np.float64, name="mc_p05"),
-        "p25_curve": pd.Series(q_vals[1], index=idx, dtype=np.float64, name="mc_p25"),
-        "p50_curve": pd.Series(q_vals[2], index=idx, dtype=np.float64, name="mc_p50"),
-        "p75_curve": pd.Series(q_vals[3], index=idx, dtype=np.float64, name="mc_p75"),
-        "p95_curve": pd.Series(q_vals[4], index=idx, dtype=np.float64, name="mc_p95"),
-        "final_stakes": final_stakes,
-        "max_drawdowns_pct": max_dd_per_sim,
+        "mc_p05_final_stake": float(np.percentile(agg_finals, 5.0)),
+        "mc_median_final_stake": float(np.percentile(agg_finals, 50.0)),
+        "mc_mean_final_stake": float(np.mean(agg_finals)),
+        "mc_p95_final_stake": float(np.percentile(agg_finals, 95.0)),
+        "mc_prob_profit_pct": float(np.mean(agg_finals > init_stake) * 100.0),
+        "mc_p95_max_drawdown_pct": float(np.percentile(agg_dds, 5.0)),
+        "window_mc_df": pd.DataFrame(win_mc_rows),
+        "final_stakes": agg_finals,
+        "max_drawdowns_pct": agg_dds,
     }
 
 
@@ -2285,202 +2448,127 @@ def plot_stake_pnl_dashboard(
     per_era_mmc: Optional[pd.Series] = None,
     title: str = "Best Model",
     initial_stake: float = 1000.0,
-    corr_weight: float = 0.5,
-    mmc_weight: float = 2.0,
-    payout_factor: Union[float, pd.Series] = 0.5,
-    live_decay: float = 0.75,
-    clip_limit: float = 0.25,
-    n_concurrent_eras: int = 4,
-    staking_mode: str = "compound",
-    stride: int = 1,
+    corr_weight: float = 8.0,
+    mmc_weight: float = 32.0,
+    payout_factor: Union[float, pd.Series] = 1.0,
+    clip_min: float = -1.0,
+    clip_max: float = 2.0,
+    churn_penalty: Optional[Union[float, pd.Series]] = None,
+    stride: int = 4,
+    window_rounds: int = 13,
+    score_basis: str = "corr_mmc_proxy",
     nmr_gbp_prices: Optional[pd.Series] = None,
-    pf_stress_levels: Sequence[float] = (1.0, 0.25),
-    show_constant_comparison: bool = True,
     save_path: Optional[Any] = None,
-) -> Dict[str, Union[float, pd.Series]]:
-    """Plot a 2-panel Numerai Staking V3 P&L dashboard (Concurrent-Tranche Equity Curve £ + Burn Drawdown %)."""
+) -> Dict[str, Any]:
+    """Plot a 2-panel Independent-Window Numerai R1393+ Atomic Staking Dashboard (Constant vs Compound + Downside Stress)."""
     import matplotlib.pyplot as plt
 
-    pnl = simulate_stake_pnl(
+    comp_pnl = simulate_stake_pnl(
         per_era_corr,
         per_era_mmc=per_era_mmc,
         initial_stake=initial_stake,
         corr_weight=corr_weight,
         mmc_weight=mmc_weight,
         payout_factor=payout_factor,
-        live_decay=live_decay,
-        clip_limit=clip_limit,
-        n_concurrent_eras=n_concurrent_eras,
-        staking_mode=staking_mode,
+        clip_min=clip_min,
+        clip_max=clip_max,
+        churn_penalty=churn_penalty,
+        staking_mode="compound",
         stride=stride,
+        window_rounds=window_rounds,
+        score_basis=score_basis,
         nmr_gbp_prices=nmr_gbp_prices,
     )
-    equity_curve = pnl["equity_curve"]
-    drawdown_pct_series = pnl["drawdown_pct_series"]
-    if not isinstance(equity_curve, pd.Series) or equity_curve.empty:
-        return pnl
+    const_pnl = simulate_stake_pnl(
+        per_era_corr,
+        per_era_mmc=per_era_mmc,
+        initial_stake=initial_stake,
+        corr_weight=corr_weight,
+        mmc_weight=mmc_weight,
+        payout_factor=payout_factor,
+        clip_min=clip_min,
+        clip_max=clip_max,
+        churn_penalty=churn_penalty,
+        staking_mode="constant",
+        stride=stride,
+        window_rounds=window_rounds,
+        score_basis=score_basis,
+        nmr_gbp_prices=nmr_gbp_prices,
+    )
+    comp_df = comp_pnl["window_outcomes_df"]
+    const_df = const_pnl["window_outcomes_df"]
+    if not isinstance(comp_df, pd.DataFrame) or comp_df.empty:
+        return comp_pnl
 
-    x_pos = np.arange(len(equity_curve))
-    era_labels = [str(e) for e in equity_curve.index]
-    tick_step = max(1, len(era_labels) // 12)
-    final_stake = float(pnl["final_stake"])
-    net_profit = float(pnl["net_profit"])
-    total_return_pct = float(pnl["total_return_pct"])
-    max_dd_pct = float(pnl["max_drawdown_pct"])
-    max_dd_gbp = float(pnl["max_drawdown_gbp"])
-    worst_era_gbp = float(pnl["worst_era_gbp"])
-    pf_label = "Series" if isinstance(payout_factor, pd.Series) else f"{float(payout_factor):.2f}"
+    x_pos = np.arange(len(comp_df))
+    w_labels = comp_df["window"].astype(str).tolist()
+    bar_w = 0.36
 
-    fig, (ax_eq, ax_dd) = plt.subplots(
-        2, 1, figsize=(15, 7.8), sharex=True, gridspec_kw={"height_ratios": [2.0, 1.0]}
+    fig, (ax_cap, ax_dd) = plt.subplots(
+        2, 1, figsize=(15.5, 8.0), sharex=True, gridspec_kw={"height_ratios": [1.85, 1.0]}
     )
     fig.patch.set_facecolor("white")
 
-    # --- Top Subplot: Simulated Equity Curve (£) + Constant Mode & PF Stress ---
-    eq_vals = equity_curve.to_numpy(dtype=np.float64)
-    line_color = "#059669" if net_profit >= 0.0 else "#dc2626"
-    ax_eq.plot(
-        x_pos,
-        eq_vals,
-        color=line_color,
-        linewidth=2.2,
-        label=f"{staking_mode.title()} Equity (PF={pf_label}: £{final_stake:,.0f})",
-    )
-
-    if show_constant_comparison and str(staking_mode).strip().lower() == "compound":
-        const_pnl = simulate_stake_pnl(
-            per_era_corr,
-            per_era_mmc=per_era_mmc,
-            initial_stake=initial_stake,
-            corr_weight=corr_weight,
-            mmc_weight=mmc_weight,
-            payout_factor=payout_factor,
-            live_decay=live_decay,
-            clip_limit=clip_limit,
-            n_concurrent_eras=n_concurrent_eras,
-            staking_mode="constant",
-            stride=stride,
-            nmr_gbp_prices=nmr_gbp_prices,
-        )
-        const_eq = const_pnl["equity_curve"]
-        if isinstance(const_eq, pd.Series) and len(const_eq) == len(x_pos):
-            ax_eq.plot(
-                x_pos,
-                const_eq.to_numpy(dtype=np.float64),
-                color="#7c3aed",
-                linestyle="--",
-                linewidth=1.35,
-                alpha=0.80,
-                label=f"Constant Mode (PF={pf_label}: £{float(const_pnl['final_stake']):,.0f})",
-            )
-
-    stress_styles = [("#2563eb", ":"), ("#d97706", "-.")]
-    for idx_s, pf_val in enumerate(pf_stress_levels):
-        if not isinstance(payout_factor, pd.Series) and abs(float(pf_val) - float(payout_factor)) <= 1e-9:
-            continue
-        s_pnl = simulate_stake_pnl(
-            per_era_corr,
-            per_era_mmc=per_era_mmc,
-            initial_stake=initial_stake,
-            corr_weight=corr_weight,
-            mmc_weight=mmc_weight,
-            payout_factor=float(pf_val),
-            live_decay=live_decay,
-            clip_limit=clip_limit,
-            n_concurrent_eras=n_concurrent_eras,
-            staking_mode=staking_mode,
-            stride=stride,
-            nmr_gbp_prices=nmr_gbp_prices,
-        )
-        s_eq = s_pnl["equity_curve"]
-        if isinstance(s_eq, pd.Series) and len(s_eq) == len(x_pos):
-            sc, ls = stress_styles[idx_s % len(stress_styles)]
-            ax_eq.plot(
-                x_pos,
-                s_eq.to_numpy(dtype=np.float64),
-                color=sc,
-                linestyle=ls,
-                linewidth=1.2,
-                alpha=0.72,
-                label=f"PF Stress (PF={pf_val:.2f}: £{float(s_pnl['final_stake']):,.0f})",
-            )
-
-    if "equity_curve_flat_fx" in pnl and isinstance(pnl["equity_curve_flat_fx"], pd.Series):
-        ax_eq.plot(
-            x_pos,
-            pnl["equity_curve_flat_fx"].to_numpy(dtype=np.float64),
-            color="#64748b",
-            linestyle=":",
-            linewidth=1.3,
-            label="Flat NMR/GBP Reference",
-        )
-
-    ax_eq.axhline(float(initial_stake), color="#64748b", linestyle="--", linewidth=1.2, label=f"Breakeven (£{initial_stake:,.0f})")
-    ax_eq.fill_between(
-        x_pos, eq_vals, float(initial_stake), where=eq_vals >= float(initial_stake), color="#10b981", alpha=0.09, interpolate=True
-    )
-    ax_eq.fill_between(
-        x_pos, eq_vals, float(initial_stake), where=eq_vals < float(initial_stake), color="#ef4444", alpha=0.09, interpolate=True
-    )
-    ax_eq.set_ylabel("Stake Equity (£)")
-    ax_eq.grid(axis="y", color="#e2e8f0", linewidth=0.8)
-    ax_eq.legend(loc="upper left", frameon=True, facecolor="white", framealpha=0.9, fontsize=8.5)
+    # --- Top Subplot: Independent Window Ending Capital (Constant vs Compound) ---
+    comp_caps = comp_df["ending_capital"].to_numpy(dtype=np.float64)
+    const_caps = const_df["ending_capital"].to_numpy(dtype=np.float64)
+    ax_cap.bar(x_pos - bar_w / 2.0, const_caps, width=bar_w, color="#7c3aed", alpha=0.84, label=f"Constant (Mean £{const_pnl['mean_ending_capital']:,.0f} | Med £{const_pnl['median_ending_capital']:,.0f})")
+    ax_cap.bar(x_pos + bar_w / 2.0, comp_caps, width=bar_w, color="#059669", alpha=0.86, label=f"Compound (Mean £{comp_pnl['mean_ending_capital']:,.0f} | Med £{comp_pnl['median_ending_capital']:,.0f})")
+    ax_cap.axhline(float(initial_stake), color="#475569", linestyle="--", linewidth=1.3, label=f"Initial Capital (£{initial_stake:,.0f})")
+    ax_cap.axhline(float(comp_pnl["mean_ending_capital"]), color="#059669", linestyle=":", linewidth=1.2, alpha=0.8)
+    ax_cap.axhline(float(const_pnl["mean_ending_capital"]), color="#7c3aed", linestyle=":", linewidth=1.2, alpha=0.8)
+    ax_cap.set_ylabel("Independent Window Ending Capital (£)")
+    ax_cap.grid(axis="y", color="#e2e8f0", linewidth=0.8)
+    ax_cap.legend(loc="upper left", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.8)
 
     summary_box = (
-        f"Final Stake: £{final_stake:,.2f}\n"
-        f"Net Profit: £{net_profit:+,.2f}\n"
-        f"Total Return: {total_return_pct:+.2f}%"
+        f"Compound — Mean: £{comp_pnl['mean_ending_capital']:,.0f} | Median: £{comp_pnl['median_ending_capital']:,.0f}\n"
+        f"  Mean P&L: £{comp_pnl['mean_profit']:+,.0f} (±£{comp_pnl['std_profit']:,.0f}) | Profitable: {comp_pnl['profitable_windows_pct']:.0f}%\n"
+        f"  Worst Window: £{comp_pnl['worst_window_ending_capital']:,.0f} | Best: £{comp_pnl['best_window_ending_capital']:,.0f}\n"
+        f"Constant — Mean: £{const_pnl['mean_ending_capital']:,.0f} | Worst: £{const_pnl['worst_window_ending_capital']:,.0f}"
     )
-    ax_eq.text(
+    ax_cap.text(
         0.99,
         0.95,
         summary_box,
-        transform=ax_eq.transAxes,
+        transform=ax_cap.transAxes,
         ha="right",
         va="top",
-        fontsize=9.5,
+        fontsize=8.6,
         fontweight="bold",
         bbox={"boxstyle": "round,pad=0.45", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
     )
 
-    # --- Bottom Subplot: Burn / Drawdown Curve (%) ---
-    dd_vals = drawdown_pct_series.to_numpy(dtype=np.float64)
-    ax_dd.plot(x_pos, dd_vals, color="#dc2626", linewidth=1.5, label="Drawdown (%)")
-    ax_dd.fill_between(x_pos, dd_vals, 0.0, color="#ef4444", alpha=0.25, label="Burn Period")
+    # --- Bottom Subplot: Within-Window Max Drawdown (%) ---
+    comp_dds = comp_df["max_drawdown_pct"].to_numpy(dtype=np.float64)
+    const_dds = const_df["max_drawdown_pct"].to_numpy(dtype=np.float64)
+    ax_dd.bar(x_pos - bar_w / 2.0, const_dds, width=bar_w, color="#f97316", alpha=0.80, label="Constant Max DD (%)")
+    ax_dd.bar(x_pos + bar_w / 2.0, comp_dds, width=bar_w, color="#dc2626", alpha=0.82, label="Compound Max DD (%)")
     ax_dd.axhline(0.0, color="#475569", linewidth=1.0)
-    ax_dd.set_ylim(min(-1.0, max_dd_pct * 1.15), 0.5)
-    ax_dd.set_ylabel("Drawdown (%)")
-    ax_dd.set_xlabel(f"Validation Era ({n_concurrent_eras} Concurrent Tranches, 100% of Eras)")
-    ax_dd.set_xticks(x_pos[::tick_step])
-    ax_dd.set_xticklabels(era_labels[::tick_step], rotation=40, ha="right", fontsize=8.5)
+    min_dd = min(-5.0, float(min(comp_dds.min(), const_dds.min())) * 1.18)
+    ax_dd.set_ylim(min_dd, 2.0)
+    ax_dd.set_ylabel("Within-Window Max DD (%)")
+    ax_dd.set_xlabel("Independent Chronological Validation Windows (Each Starting Fresh at £1,000)")
+    ax_dd.set_xticks(x_pos)
+    ax_dd.set_xticklabels(w_labels, rotation=32, ha="right", fontsize=8.5)
     ax_dd.grid(axis="y", color="#e2e8f0", linewidth=0.8)
-    ax_dd.legend(loc="lower left", frameon=True, facecolor="white", framealpha=0.9)
-    ax_dd.text(
-        0.99,
-        0.10,
-        f"Max Drawdown: {max_dd_pct:.2f}% (£{max_dd_gbp:,.2f}) | Worst Era: £{worst_era_gbp:+,.2f}",
-        transform=ax_dd.transAxes,
-        ha="right",
-        va="bottom",
-        fontsize=9.0,
-        bbox={"boxstyle": "round,pad=0.35", "facecolor": "#fef2f2", "edgecolor": "#fecaca"},
-    )
+    ax_dd.legend(loc="lower left", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.8)
 
-    has_mmc = per_era_mmc is not None and len(per_era_mmc) > 0
-    payout_mode_str = (
-        f"CORR×{corr_weight} + MMC×{mmc_weight}"
-        if has_mmc
-        else f"CORR-only (CORR×{corr_weight}, excluding MMC)"
+    basis_tag = (
+        "Official NCORR/NMMC"
+        if str(score_basis).strip().lower() == "ncorr_nmmc"
+        else "PROXY (CORR/MMC on R1393+ Formula)"
     )
-    fx_mode_str = "NMR/GBP FX overlay" if "equity_curve_flat_fx" in pnl else "flat NMR/GBP rate"
-    fig.suptitle(f"Numerai Staking V3 P&L Dashboard — {title}", fontsize=13.5, fontweight="bold", y=0.98)
+    mmc_tag = f"{corr_weight:g}×CORR + {mmc_weight:g}×MMC" if comp_pnl["has_mmc"] else f"{corr_weight:g}×CORR only (no meta_model.parquet)"
+    pf_label = "Series" if isinstance(payout_factor, pd.Series) else f"{float(payout_factor):.2f}"
+    fig.suptitle(f"Numerai Classic R1393+ Independent-Window Staking P&L — {title}", fontsize=13.2, fontweight="bold", y=0.985)
     fig.text(
         0.5,
-        0.935,
-        f"{payout_mode_str} | {n_concurrent_eras} tranches | PF={pf_label} | live_decay={live_decay:.2f} | {fx_mode_str}",
+        0.938,
+        f"{basis_tag} | {mmc_tag} | clip=[{clip_min * 100:.0f}%, +{clip_max * 100:.0f}%] | PF={pf_label} | stride={stride} | no cross-window compounding",
         ha="center",
         va="top",
-        fontsize=9.5,
+        fontsize=9.2,
         color="#475569",
     )
     plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
@@ -2489,7 +2577,14 @@ def plot_stake_pnl_dashboard(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(out_path, dpi=140)
     plt.show()
-    return pnl
+    comp_pnl["constant_summary"] = {
+        "mean_ending_capital": const_pnl["mean_ending_capital"],
+        "median_ending_capital": const_pnl["median_ending_capital"],
+        "mean_profit": const_pnl["mean_profit"],
+        "worst_window_ending_capital": const_pnl["worst_window_ending_capital"],
+        "profitable_windows_pct": const_pnl["profitable_windows_pct"],
+    }
+    return comp_pnl
 
 
 def plot_stake_pnl_monte_carlo(
@@ -2498,125 +2593,88 @@ def plot_stake_pnl_monte_carlo(
     per_era_mmc: Optional[pd.Series] = None,
     title: str = "Best Model",
     initial_stake: float = 1000.0,
-    corr_weight: float = 0.5,
-    mmc_weight: float = 2.0,
-    payout_factor: Union[float, pd.Series] = 0.5,
-    live_decay: float = 0.75,
-    clip_limit: float = 0.25,
-    n_concurrent_eras: int = 4,
-    staking_mode: str = "compound",
-    stride: int = 1,
+    corr_weight: float = 8.0,
+    mmc_weight: float = 32.0,
+    payout_factor: Union[float, pd.Series] = 1.0,
+    clip_min: float = -1.0,
+    clip_max: float = 2.0,
+    churn_penalty: Optional[Union[float, pd.Series]] = None,
+    stride: int = 4,
+    window_rounds: int = 13,
+    score_basis: str = "corr_mmc_proxy",
     n_sims: int = 1000,
-    block_size: int = 8,
+    block_size: int = 3,
     random_state: int = 42,
     save_path: Optional[Any] = None,
-) -> Dict[str, Union[float, pd.Series, np.ndarray]]:
-    """Plot a separate 2-panel Moving Block Bootstrap Monte Carlo Risk Dashboard (Equity Fan Chart + Terminal Stake Distribution)."""
+) -> Dict[str, Any]:
+    """Plot a separate 2-panel Within-Window Block-Bootstrap Monte Carlo Dashboard (Aggregated Distribution + Per-Window Uncertainty)."""
     import matplotlib.pyplot as plt
 
-    hist_pnl = simulate_stake_pnl(
+    mc_comp = simulate_stake_pnl_monte_carlo(
         per_era_corr,
         per_era_mmc=per_era_mmc,
         initial_stake=initial_stake,
         corr_weight=corr_weight,
         mmc_weight=mmc_weight,
         payout_factor=payout_factor,
-        live_decay=live_decay,
-        clip_limit=clip_limit,
-        n_concurrent_eras=n_concurrent_eras,
-        staking_mode=staking_mode,
+        clip_min=clip_min,
+        clip_max=clip_max,
+        churn_penalty=churn_penalty,
+        staking_mode="compound",
         stride=stride,
-    )
-    mc = simulate_stake_pnl_monte_carlo(
-        per_era_corr,
-        per_era_mmc=per_era_mmc,
-        initial_stake=initial_stake,
-        corr_weight=corr_weight,
-        mmc_weight=mmc_weight,
-        payout_factor=payout_factor,
-        live_decay=live_decay,
-        clip_limit=clip_limit,
-        n_concurrent_eras=n_concurrent_eras,
-        staking_mode=staking_mode,
-        stride=stride,
+        window_rounds=window_rounds,
         n_sims=n_sims,
         block_size=block_size,
         random_state=random_state,
     )
-    p50_curve = mc["p50_curve"]
-    if not isinstance(p50_curve, pd.Series) or p50_curve.empty:
-        return mc
+    mc_const = simulate_stake_pnl_monte_carlo(
+        per_era_corr,
+        per_era_mmc=per_era_mmc,
+        initial_stake=initial_stake,
+        corr_weight=corr_weight,
+        mmc_weight=mmc_weight,
+        payout_factor=payout_factor,
+        clip_min=clip_min,
+        clip_max=clip_max,
+        churn_penalty=churn_penalty,
+        staking_mode="constant",
+        stride=stride,
+        window_rounds=window_rounds,
+        n_sims=n_sims,
+        block_size=block_size,
+        random_state=random_state,
+    )
+    win_mc_df = mc_comp["window_mc_df"]
+    if not isinstance(win_mc_df, pd.DataFrame) or win_mc_df.empty:
+        return mc_comp
 
-    x_pos = np.arange(len(p50_curve))
-    era_labels = [str(e) for e in p50_curve.index]
-    tick_step = max(1, len(era_labels) // 10)
-
-    fig, (ax_fan, ax_dist) = plt.subplots(
-        1, 2, figsize=(17, 5.8), gridspec_kw={"width_ratios": [1.55, 1.0]}
+    fig, (ax_dist, ax_win) = plt.subplots(
+        1, 2, figsize=(17, 5.8), gridspec_kw={"width_ratios": [1.15, 1.35]}
     )
     fig.patch.set_facecolor("white")
 
-    # --- Left Panel: Block-Bootstrap Monte Carlo Fan Chart ---
-    ax_fan.fill_between(
-        x_pos,
-        mc["p05_curve"].to_numpy(dtype=np.float64),
-        mc["p95_curve"].to_numpy(dtype=np.float64),
-        color="#3b82f6",
-        alpha=0.14,
-        label="5th–95th Percentile Band",
-    )
-    ax_fan.fill_between(
-        x_pos,
-        mc["p25_curve"].to_numpy(dtype=np.float64),
-        mc["p75_curve"].to_numpy(dtype=np.float64),
-        color="#2563eb",
-        alpha=0.24,
-        label="25th–75th Percentile Band",
-    )
-    ax_fan.plot(
-        x_pos,
-        p50_curve.to_numpy(dtype=np.float64),
-        color="#1d4ed8",
-        linewidth=2.0,
-        label=f"MC Median (£{float(mc['mc_median_final_stake']):,.0f})",
-    )
-    hist_eq = hist_pnl["equity_curve"]
-    if isinstance(hist_eq, pd.Series) and len(hist_eq) == len(x_pos):
-        ax_fan.plot(
-            x_pos,
-            hist_eq.to_numpy(dtype=np.float64),
-            color="#059669",
-            linewidth=2.0,
-            linestyle="--",
-            label=f"Actual Historical Path (£{float(hist_pnl['final_stake']):,.0f})",
-        )
-    ax_fan.axhline(float(initial_stake), color="#64748b", linestyle=":", linewidth=1.3, label=f"Breakeven (£{initial_stake:,.0f})")
-    ax_fan.set_xticks(x_pos[::tick_step])
-    ax_fan.set_xticklabels(era_labels[::tick_step], rotation=40, ha="right", fontsize=8.5)
-    ax_fan.set_xlabel("Validation Era")
-    ax_fan.set_ylabel("Simulated Stake Equity (£)")
-    ax_fan.set_title("Block-Bootstrap Equity Fan Chart", fontsize=12.0, fontweight="bold")
-    ax_fan.grid(axis="y", color="#e2e8f0", linewidth=0.8)
-    ax_fan.legend(loc="upper left", frameon=True, facecolor="white", framealpha=0.9, fontsize=8.5)
+    # --- Left Panel: Aggregated Terminal Capital Distribution (Constant vs Compound) ---
+    comp_f = np.asarray(mc_comp["final_stakes"], dtype=np.float64)
+    const_f = np.asarray(mc_const["final_stakes"], dtype=np.float64)
+    p99 = float(np.percentile(np.concatenate([comp_f, const_f]), 99.0))
+    comp_plot = np.clip(comp_f, 0.0, max(initial_stake * 1.5, p99))
+    const_plot = np.clip(const_f, 0.0, max(initial_stake * 1.5, p99))
 
-    # --- Right Panel: Terminal Stake (£) Distribution ---
-    final_stakes = np.asarray(mc["final_stakes"], dtype=np.float64)
-    ax_dist.hist(final_stakes, bins=35, color="#3b82f6", alpha=0.72, edgecolor="white", linewidth=0.6)
-    ax_dist.axvline(float(initial_stake), color="#64748b", linestyle=":", linewidth=1.4, label=f"Breakeven (£{initial_stake:,.0f})")
-    ax_dist.axvline(float(mc["mc_p05_final_stake"]), color="#dc2626", linestyle="--", linewidth=1.5, label=f"5th Pct (£{float(mc['mc_p05_final_stake']):,.0f})")
-    ax_dist.axvline(float(mc["mc_median_final_stake"]), color="#1d4ed8", linewidth=1.8, label=f"Median (£{float(mc['mc_median_final_stake']):,.0f})")
-    ax_dist.axvline(float(mc["mc_p95_final_stake"]), color="#059669", linestyle="--", linewidth=1.5, label=f"95th Pct (£{float(mc['mc_p95_final_stake']):,.0f})")
-    ax_dist.set_xlabel("Terminal Stake (£)")
-    ax_dist.set_ylabel("Simulated Paths")
-    ax_dist.set_title("Terminal Stake Distribution", fontsize=12.0, fontweight="bold")
+    ax_dist.hist(const_plot, bins=35, color="#7c3aed", alpha=0.45, edgecolor="white", label=f"Constant (Med £{mc_const['mc_median_final_stake']:,.0f})")
+    ax_dist.hist(comp_plot, bins=35, color="#059669", alpha=0.50, edgecolor="white", label=f"Compound (Med £{mc_comp['mc_median_final_stake']:,.0f})")
+    ax_dist.axvline(float(initial_stake), color="#475569", linestyle="--", linewidth=1.4, label=f"Initial (£{initial_stake:,.0f})")
+    ax_dist.axvline(float(mc_comp["mc_p05_final_stake"]), color="#dc2626", linestyle=":", linewidth=1.6, label=f"Comp 5th Pct (£{mc_comp['mc_p05_final_stake']:,.0f})")
+    ax_dist.set_xlabel("Terminal Window Capital (£, clipped at 99th pct for display)")
+    ax_dist.set_ylabel("Simulated Paths (Aggregated Across Windows)")
+    ax_dist.set_title("Aggregated Within-Window Terminal Capital", fontsize=11.8, fontweight="bold")
     ax_dist.grid(axis="y", color="#e2e8f0", linewidth=0.8)
-    ax_dist.legend(loc="upper right", frameon=True, facecolor="white", framealpha=0.9, fontsize=8.5)
+    ax_dist.legend(loc="upper right", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.5)
 
     risk_box = (
-        f"P(Profit): {float(mc['mc_prob_profit_pct']):.1f}%\n"
-        f"5th Pct Stake: £{float(mc['mc_p05_final_stake']):,.0f}\n"
-        f"Median Stake: £{float(mc['mc_median_final_stake']):,.0f}\n"
-        f"95% Worst DD: {float(mc['mc_p95_max_drawdown_pct']):.2f}%"
+        f"Compound MC — P(Profit): {mc_comp['mc_prob_profit_pct']:.1f}%\n"
+        f"  5th / 50th / 95th: £{mc_comp['mc_p05_final_stake']:,.0f} / £{mc_comp['mc_median_final_stake']:,.0f} / £{mc_comp['mc_p95_final_stake']:,.0f}\n"
+        f"  95% Worst DD: {mc_comp['mc_p95_max_drawdown_pct']:.1f}%\n"
+        f"Constant MC — P(Profit): {mc_const['mc_prob_profit_pct']:.1f}% | 5th: £{mc_const['mc_p05_final_stake']:,.0f}"
     )
     ax_dist.text(
         0.03,
@@ -2625,20 +2683,46 @@ def plot_stake_pnl_monte_carlo(
         transform=ax_dist.transAxes,
         ha="left",
         va="top",
-        fontsize=8.8,
+        fontsize=8.3,
         fontweight="bold",
         bbox={"boxstyle": "round,pad=0.4", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
     )
 
-    pf_label = "Series" if isinstance(payout_factor, pd.Series) else f"{float(payout_factor):.2f}"
-    fig.suptitle(f"Monte Carlo Block-Bootstrap Risk Analysis — {title}", fontsize=13.5, fontweight="bold", y=0.99)
+    # --- Right Panel: Per-Window Monte Carlo Uncertainty Intervals (Compound) ---
+    wx = np.arange(len(win_mc_df))
+    p05 = win_mc_df["p05"].to_numpy(dtype=np.float64)
+    p25 = win_mc_df["p25"].to_numpy(dtype=np.float64)
+    p50 = win_mc_df["p50"].to_numpy(dtype=np.float64)
+    p75 = win_mc_df["p75"].to_numpy(dtype=np.float64)
+    p95 = win_mc_df["p95"].to_numpy(dtype=np.float64)
+    actual = win_mc_df["actual_ending_capital"].to_numpy(dtype=np.float64)
+
+    ax_win.vlines(wx, p05, p95, color="#3b82f6", linewidth=2.0, alpha=0.55, label="5th–95th Pct Range")
+    ax_win.vlines(wx, p25, p75, color="#1d4ed8", linewidth=6.5, alpha=0.75, label="25th–75th IQR")
+    ax_win.scatter(wx, p50, color="#1e3a8a", s=38, zorder=5, label="MC Median")
+    ax_win.scatter(wx, actual, color="#059669", marker="D", s=42, zorder=6, label="Actual Window Outcome")
+    ax_win.axhline(float(initial_stake), color="#475569", linestyle="--", linewidth=1.3, label=f"Initial (£{initial_stake:,.0f})")
+    ax_win.set_xticks(wx)
+    ax_win.set_xticklabels(win_mc_df["window"].astype(str).tolist(), rotation=32, ha="right", fontsize=8.5)
+    ax_win.set_ylabel("Window Ending Capital (£)")
+    ax_win.set_xlabel("Independent Validation Window")
+    ax_win.set_title("Per-Window Monte Carlo Uncertainty (Compound)", fontsize=11.8, fontweight="bold")
+    ax_win.grid(axis="y", color="#e2e8f0", linewidth=0.8)
+    ax_win.legend(loc="upper left", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.5)
+
+    basis_tag = (
+        "Official NCORR/NMMC"
+        if str(score_basis).strip().lower() == "ncorr_nmmc"
+        else "PROXY (CORR/MMC on R1393+ Formula)"
+    )
+    fig.suptitle(f"Within-Window Monte Carlo Block-Bootstrap Risk — {title}", fontsize=13.2, fontweight="bold", y=0.99)
     fig.text(
         0.5,
         0.925,
-        f"n_sims={n_sims:,} | block_size={block_size} eras (preserves regime burn clustering) | {n_concurrent_eras} tranches | {staking_mode} | PF={pf_label} | live_decay={live_decay:.2f}",
+        f"{basis_tag} | n_sims={n_sims:,}/window | block_size={block_size} rounds | each window starts fresh at £{initial_stake:,.0f}",
         ha="center",
         va="top",
-        fontsize=9.3,
+        fontsize=9.2,
         color="#475569",
     )
     plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.90))
@@ -2647,7 +2731,12 @@ def plot_stake_pnl_monte_carlo(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(out_path, dpi=140)
     plt.show()
-    return mc
+    mc_comp["constant_mc"] = {
+        "mc_p05_final_stake": mc_const["mc_p05_final_stake"],
+        "mc_median_final_stake": mc_const["mc_median_final_stake"],
+        "mc_prob_profit_pct": mc_const["mc_prob_profit_pct"],
+    }
+    return mc_comp
 
 
 def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
@@ -2716,8 +2805,8 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
             if fold_era_corrs:
                 stitched_oof = pd.concat(fold_era_corrs).sort_index()
                 stitched_oof = stitched_oof.loc[~stitched_oof.index.duplicated(keep="last")]
-                oof_tranches = _infer_non_overlapping_stride(stitched_oof.index, default_stride=4)
-                oof_pnl = simulate_stake_pnl(stitched_oof, n_concurrent_eras=oof_tranches, stride=1)
+                oof_stride = _infer_non_overlapping_stride(stitched_oof.index, default_stride=4)
+                oof_pnl = simulate_stake_pnl(stitched_oof, stride=oof_stride)
                 for k in pnl_scalar_keys:
                     pnl_cols[k].append(round(float(oof_pnl[k]), 2))
             else:
