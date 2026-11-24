@@ -1497,9 +1497,9 @@ _ERROR_BIN_CONFIG: Dict[str, Any] = {
 
 
 def infer_target_horizon_eras(target_col: str) -> int:
-    """Infer target settlement horizon in weekly eras from a Numerai target name (`_60` -> 12, `_4` -> 1, default/20d -> 4)."""
+    """Infer target settlement horizon in weekly eras from a Numerai Unity v6.0 target name (`target` / `*_60` -> 12, `*_4` -> 1, `*_20` / other -> 4)."""
     name = str(target_col or "target").strip().lower()
-    if name.endswith("_60"):
+    if name == "target" or name.endswith("_60"):
         return 12
     if name.endswith("_4"):
         return 1
@@ -1817,6 +1817,19 @@ def compute_error_bin_shares(
         "overforecast_pct": float(pcts[3]),
         "extreme_overforecast_pct": float(pcts[4]),
     }
+
+
+def prepare_tuned_pipeline(pipeline: Any, best_params: Mapping[str, Any]) -> Any:
+    """Clone `pipeline`, apply `best_params`, and clear `walk_forward_step_eras` so full-train refit stays RAM-lean."""
+    tuned = clone(pipeline)
+    if best_params:
+        tuned.set_params(**dict(best_params))
+    tuned_params = tuned.get_params(deep=True)
+    if "estimator__walk_forward_step_eras" in tuned_params:
+        tuned.set_params(estimator__walk_forward_step_eras=None)
+    elif "walk_forward_step_eras" in tuned_params:
+        tuned.set_params(walk_forward_step_eras=None)
+    return tuned
 
 
 def reset_cv_metric_log() -> None:

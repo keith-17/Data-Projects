@@ -1048,6 +1048,7 @@ def run_baseline(
         configure_error_binning,
         deduplicate_param_grid,
         evaluate_numerai_predictions,
+        prepare_tuned_pipeline,
         reset_cv_metric_log,
         simulate_stake_pnl,
         walk_forward_predict,
@@ -1229,11 +1230,138 @@ def run_baseline(
     reset_cv_metric_log()
     search.fit(X_train, y_train, groups=train_eras)
     cv_results_df = build_quick_results_df(search)
+    best_params = dict(search.best_params_)
     search_summary_row = {
         "baseline": baseline_name,
         "search_mode": search_mode,
         "best_cv_corr": float(search.best_score_),
         "best_cv_corr_pct": round(float(search.best_score_) * 100.0, 2),
-        "best_params": dict(search.best_params_),
+        "best_params": best_params,
     }
-    return baseline_name, results_entries, cv_results_df, search_summary_row, default_model
+
+    # Post-search refit of the best CV candidate on 100% of X_train -> evaluate on held-out X_validation
+    tuned_pipeline = prepare_tuned_pipeline(pipeline, best_params)
+    tuned_model = clone(tuned_pipeline).fit(X_train, y_train)
+    tuned_train_preds = tuned_model.predict(X_train)
+    tuned_val_preds = tuned_model.predict(X_validation)
+
+    tuned_train_eval = evaluate_numerai_predictions(
+        y_train,
+        tuned_train_preds,
+        eras=train_eras,
+        features_df=X_train,
+        feature_columns=feature_columns,
+        label=f"{baseline_name} [Tuned] — Final Training Scores",
+        verbose=True,
+    )
+    tuned_val_eval = evaluate_numerai_predictions(
+        y_validation,
+        tuned_val_preds,
+        eras=validation_eras,
+        features_df=X_validation,
+        feature_columns=feature_columns,
+        label=f"{baseline_name} [Tuned] — Final Validation Scores",
+        verbose=True,
+    )
+
+    if eval_mode in ("static", "both"):
+        tuned_val_pnl = simulate_stake_pnl(tuned_val_eval["numerai_era_corrs"])
+        tuned_variant_name = f"{baseline_name} [Tuned]"
+        results_entries[tuned_variant_name] = {
+            "variant": tuned_variant_name,
+            "train_corr": tuned_train_eval["numerai_corr"],
+            "validation_corr": tuned_val_eval["numerai_corr"],
+            "validation_corr_pct": tuned_val_eval["numerai_corr_pct"],
+            "positive_era_pct": tuned_val_eval["positive_era_pct"],
+            "directional_accuracy_pct": tuned_val_eval["directional_accuracy_pct"],
+            "validation_spearman": tuned_val_eval["spearman"],
+            "validation_payout": tuned_val_eval["payout"],
+            "validation_sharpe": tuned_val_eval["numerai_sharpe"],
+            "validation_spearman_sharpe": tuned_val_eval["spearman_sharpe"],
+            "validation_mae": tuned_val_eval["mae"],
+            "forecast_bias": tuned_val_eval["forecast_bias"],
+            "directional_hit_rate": tuned_val_eval["directional_hit_rate"],
+            "era_corr_lag1_acf": tuned_val_eval["era_corr_lag1_acf"],
+            "ljung_box_pvalue": tuned_val_eval["ljung_box_pvalue"],
+            "arch_lm_pvalue": tuned_val_eval["arch_lm_pvalue"],
+            "adf_pvalue": tuned_val_eval["adf_pvalue"],
+            "era_corr_skew": tuned_val_eval["era_corr_skew"],
+            "era_corr_kurtosis": tuned_val_eval["era_corr_kurtosis"],
+            "jarque_bera_pvalue": tuned_val_eval["jarque_bera_pvalue"],
+            "feature_exposure": tuned_val_eval["feature_exposure"],
+            "max_drawdown": tuned_val_eval["max_drawdown"],
+            "final_stake": round(float(tuned_val_pnl["final_stake"]), 2),
+            "net_profit": round(float(tuned_val_pnl["net_profit"]), 2),
+            "total_return_pct": round(float(tuned_val_pnl["total_return_pct"]), 2),
+            "max_drawdown_pct": round(float(tuned_val_pnl["max_drawdown_pct"]), 2),
+            "max_drawdown_gbp": round(float(tuned_val_pnl["max_drawdown_gbp"]), 2),
+            "worst_era_gbp": round(float(tuned_val_pnl["worst_era_gbp"]), 2),
+            "corr_gap": tuned_train_eval["numerai_corr"] - tuned_val_eval["numerai_corr"],
+            "sanity_status": tuned_val_eval["sanity_status"],
+            "validation_preds": tuned_val_preds,
+            "validation_era_corrs": tuned_val_eval["numerai_era_corrs"],
+            "params": tuned_model.named_steps["estimator"].get_params(),
+        }
+
+    if eval_mode in ("walk_forward", "both"):
+        tuned_wf_preds = walk_forward_predict(
+            tuned_pipeline,
+            X_train,
+            y_train,
+            train_eras,
+            X_validation,
+            y_validation,
+            validation_eras,
+            step_eras=walk_forward_step_eras,
+            window_mode=walk_forward_window,
+            target_horizon_eras=target_horizon_eras,
+            era_stride=era_stride,
+        )
+        tuned_wf_eval = evaluate_numerai_predictions(
+            y_validation,
+            tuned_wf_preds,
+            eras=validation_eras,
+            features_df=X_validation,
+            feature_columns=feature_columns,
+            label=f"{baseline_name} [Tuned] — Walk-Forward Validation Scores",
+            verbose=True,
+        )
+        tuned_wf_pnl = simulate_stake_pnl(tuned_wf_eval["numerai_era_corrs"])
+        tuned_wf_variant_name = f"{baseline_name} [Tuned Walk-Forward]"
+        results_entries[tuned_wf_variant_name] = {
+            "variant": tuned_wf_variant_name,
+            "train_corr": tuned_train_eval["numerai_corr"],
+            "validation_corr": tuned_wf_eval["numerai_corr"],
+            "validation_corr_pct": tuned_wf_eval["numerai_corr_pct"],
+            "positive_era_pct": tuned_wf_eval["positive_era_pct"],
+            "directional_accuracy_pct": tuned_wf_eval["directional_accuracy_pct"],
+            "validation_spearman": tuned_wf_eval["spearman"],
+            "validation_payout": tuned_wf_eval["payout"],
+            "validation_sharpe": tuned_wf_eval["numerai_sharpe"],
+            "validation_spearman_sharpe": tuned_wf_eval["spearman_sharpe"],
+            "validation_mae": tuned_wf_eval["mae"],
+            "forecast_bias": tuned_wf_eval["forecast_bias"],
+            "directional_hit_rate": tuned_wf_eval["directional_hit_rate"],
+            "era_corr_lag1_acf": tuned_wf_eval["era_corr_lag1_acf"],
+            "ljung_box_pvalue": tuned_wf_eval["ljung_box_pvalue"],
+            "arch_lm_pvalue": tuned_wf_eval["arch_lm_pvalue"],
+            "adf_pvalue": tuned_wf_eval["adf_pvalue"],
+            "era_corr_skew": tuned_wf_eval["era_corr_skew"],
+            "era_corr_kurtosis": tuned_wf_eval["era_corr_kurtosis"],
+            "jarque_bera_pvalue": tuned_wf_eval["jarque_bera_pvalue"],
+            "feature_exposure": tuned_wf_eval["feature_exposure"],
+            "max_drawdown": tuned_wf_eval["max_drawdown"],
+            "final_stake": round(float(tuned_wf_pnl["final_stake"]), 2),
+            "net_profit": round(float(tuned_wf_pnl["net_profit"]), 2),
+            "total_return_pct": round(float(tuned_wf_pnl["total_return_pct"]), 2),
+            "max_drawdown_pct": round(float(tuned_wf_pnl["max_drawdown_pct"]), 2),
+            "max_drawdown_gbp": round(float(tuned_wf_pnl["max_drawdown_gbp"]), 2),
+            "worst_era_gbp": round(float(tuned_wf_pnl["worst_era_gbp"]), 2),
+            "corr_gap": tuned_train_eval["numerai_corr"] - tuned_wf_eval["numerai_corr"],
+            "sanity_status": tuned_wf_eval["sanity_status"],
+            "validation_preds": tuned_wf_preds,
+            "validation_era_corrs": tuned_wf_eval["numerai_era_corrs"],
+            "params": tuned_model.named_steps["estimator"].get_params(),
+        }
+
+    return baseline_name, results_entries, cv_results_df, search_summary_row, tuned_model
