@@ -779,12 +779,75 @@ class PersistenceEstimator(BaseNumeraiEstimator):
     def get_params(self, deep: bool = True) -> Dict[str, Any]:
         return BaseEstimator.get_params(self, deep=deep)
 
-    def _raw_persistence_lookup(self, X_df: pd.DataFrame) -> np.ndarray:
+    def _causal_persistence_lookup(
+        self,
+        X_df: pd.DataFrame,
+        era_values: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Strictly causal per-ticker lookup: row at `(ticker, era)` only sees history with `era_hist <= era - eff_lag`."""
         n_rows = len(X_df)
-        if not self.ticker_lookup_ or self.ticker_col not in X_df.columns:
+        mode = getattr(self, "active_persistence_mode_", "none")
+        if mode in ("none", "", "zero_rule") or not getattr(self, "ticker_history_", None) or self.ticker_col not in X_df.columns:
             return np.full(n_rows, self.global_mean_, dtype=np.float64)
-        tickers = X_df[self.ticker_col].astype(str)
-        return tickers.map(self.ticker_lookup_).fillna(self.global_mean_).to_numpy(dtype=np.float64)
+
+        if era_values is None:
+            # No era index supplied: fall back to settled end-of-training lookup table
+            tickers = X_df[self.ticker_col].astype(str)
+            return tickers.map(self.ticker_lookup_).fillna(self.global_mean_).to_numpy(dtype=np.float64)
+
+        eff_lag = int(getattr(self, "effective_lag_eras_", 4))
+        smoothing_weight = float(getattr(self, "smoothing_weight_", 0.0))
+        win_eras = int(getattr(self, "effective_window_eras_", 4))
+        global_mean = float(self.global_mean_)
+        history_map: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = self.ticker_history_
+
+        tickers_arr = X_df[self.ticker_col].astype(str).to_numpy()
+        eras_arr = np.asarray(era_values, dtype=np.int64).ravel()
+        out = np.full(n_rows, global_mean, dtype=np.float64)
+
+        # Group query indices by ticker via stable argsort (zero Python per-row loop)
+        order = np.argsort(tickers_arr, kind="stable")
+        sorted_tickers = tickers_arr[order]
+        change = np.empty(n_rows, dtype=bool)
+        change[0] = True
+        if n_rows > 1:
+            change[1:] = sorted_tickers[1:] != sorted_tickers[:-1]
+        starts = np.flatnonzero(change)
+        ends = np.append(starts[1:], n_rows)
+
+        for s, e in zip(starts, ends):
+            t_key = str(sorted_tickers[s])
+            hist_entry = history_map.get(t_key)
+            if hist_entry is None:
+                continue
+            h_eras, h_targets, h_cum_w, h_cum_wt = hist_entry
+            q_positions = order[s:e]
+            q_cutoffs = eras_arr[q_positions] - eff_lag
+            idx = np.searchsorted(h_eras, q_cutoffs, side="right") - 1
+            valid = idx >= 0
+            if not np.any(valid):
+                continue
+            v_pos = q_positions[valid]
+            v_idx = idx[valid]
+
+            if mode == "last":
+                w_last = h_cum_w[v_idx] - np.where(v_idx > 0, h_cum_w[np.maximum(0, v_idx - 1)], 0.0)
+                w_last = np.maximum(w_last, 1e-12)
+                y_last = h_targets[v_idx]
+                out[v_pos] = (w_last * y_last + smoothing_weight * global_mean) / (w_last + smoothing_weight)
+            elif mode == "expanding_mean":
+                w_sum = np.maximum(h_cum_w[v_idx], 1e-12)
+                wt_sum = h_cum_wt[v_idx]
+                out[v_pos] = (wt_sum + smoothing_weight * global_mean) / (w_sum + smoothing_weight)
+            elif mode == "rolling_mean":
+                left_idx = v_idx - win_eras
+                w_left = np.where(left_idx >= 0, h_cum_w[np.maximum(0, left_idx)], 0.0)
+                wt_left = np.where(left_idx >= 0, h_cum_wt[np.maximum(0, left_idx)], 0.0)
+                w_sum = np.maximum(h_cum_w[v_idx] - w_left, 1e-12)
+                wt_sum = h_cum_wt[v_idx] - wt_left
+                out[v_pos] = (wt_sum + smoothing_weight * global_mean) / (w_sum + smoothing_weight)
+
+        return out
 
     def fit(
         self,
@@ -817,7 +880,6 @@ class PersistenceEstimator(BaseNumeraiEstimator):
                 era_values = era_values[stride_mask]
                 if sample_weight is not None:
                     sample_weight = np.asarray(sample_weight, dtype=np.float64).ravel()[stride_mask]
-                n_samples = len(X_df)
 
         sample_weights = self._compute_era_weights(era_values, sample_weight, len(X_df))
         if self.walk_forward_step_eras not in (None, False, "None", "none", "null", "", 0):
@@ -834,114 +896,96 @@ class PersistenceEstimator(BaseNumeraiEstimator):
             self.global_mean_ = float(np.mean(target_values)) if len(target_values) else 0.5
 
         self.ticker_lookup_: Dict[str, float] = {}
+        self.ticker_history_: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
         mode = "none" if self.persistence_mode is None else str(self.persistence_mode).strip().lower()
+        self.active_persistence_mode_ = mode
+        raw_lag = int(self.persistence_lag) if self.persistence_lag not in (None, "none", "None", "", 0) else 0
+        horizon_lag = max(1, int(self.target_horizon_eras or 4))
+        self.effective_lag_eras_ = max(horizon_lag, raw_lag)
+        self.effective_window_eras_ = max(
+            1, int(self.persistence_window if self.persistence_window not in (None, "none", "None", "", 0) else 4)
+        )
+        self.smoothing_weight_ = max(0.0, float(self.smoothing or 0.0))
+
         if mode in ("none", "", "zero_rule") or self.ticker_col not in X_df.columns:
             self.persistence_table_ = pd.DataFrame(columns=["ticker", "persisted_target", "obs_count", "last_era"])
             raw_train_pred = np.full(len(X_df), self.global_mean_, dtype=np.float64)
             self._fit_bias_correction(target_values, raw_train_pred, era_values)
             return self
+        if mode not in ("last", "rolling_mean", "expanding_mean"):
+            raise ValueError(
+                f"Unsupported persistence_mode '{self.persistence_mode}'; use None, 'last', 'rolling_mean', or 'expanding_mean'."
+            )
 
         era_arr = (
-            era_values
+            np.asarray(era_values, dtype=np.int64)
             if era_values is not None
-            else np.ones(len(target_values), dtype=np.int32)
+            else np.ones(len(target_values), dtype=np.int64)
         )
         weights_arr = (
             sample_weights
             if sample_weights is not None
             else np.ones(len(target_values), dtype=np.float64)
         )
-        hist_df = pd.DataFrame({
-            "ticker": X_df[self.ticker_col].astype(str).to_numpy(),
-            "era": era_arr,
-            "target": target_values,
-            "weight": weights_arr,
-        })
+        tickers_arr = X_df[self.ticker_col].astype(str).to_numpy()
 
-        if self.persistence_lag not in (None, "none", "None", "", 0) and len(hist_df):
-            lag_eras = max(0, int(self.persistence_lag))
-            cutoff_era = int(hist_df["era"].max()) - lag_eras
-            settled_df = hist_df.loc[hist_df["era"] <= cutoff_era]
-            if len(settled_df):
-                hist_df = settled_df
+        # Sort by (ticker, era) once to build compact per-ticker causal prefix arrays
+        order = np.lexsort((era_arr, tickers_arr))
+        s_tickers = tickers_arr[order]
+        s_eras = era_arr[order]
+        s_targets = target_values[order]
+        s_weights = np.maximum(weights_arr[order], 1e-12)
 
-        hist_df = hist_df.sort_values(["ticker", "era"], kind="stable")
-        smoothing_weight = max(0.0, float(self.smoothing or 0.0))
+        n_obs = len(s_tickers)
+        if n_obs > 0:
+            change = np.empty(n_obs, dtype=bool)
+            change[0] = True
+            if n_obs > 1:
+                change[1:] = s_tickers[1:] != s_tickers[:-1]
+            starts = np.flatnonzero(change)
+            ends = np.append(starts[1:], n_obs)
 
-        if len(hist_df) == 0:
-            self.persistence_table_ = pd.DataFrame(columns=["ticker", "persisted_target", "obs_count", "last_era"])
-        elif mode == "last":
-            grouped = hist_df.groupby("ticker", sort=False)
-            last_rows = grouped.last()
-            counts = grouped["target"].size()
-            w_arr = np.maximum(last_rows["weight"].to_numpy(dtype=np.float64), 1e-12)
-            y_arr = last_rows["target"].to_numpy(dtype=np.float64)
-            persisted_arr = (w_arr * y_arr + smoothing_weight * self.global_mean_) / (w_arr + smoothing_weight)
-            tickers_str = last_rows.index.astype(str)
-            self.ticker_lookup_ = dict(zip(tickers_str.tolist(), persisted_arr.tolist()))
-            self.persistence_table_ = (
-                pd.DataFrame({
-                    "ticker": tickers_str.to_numpy(),
-                    "persisted_target": persisted_arr,
-                    "obs_count": counts.reindex(last_rows.index).to_numpy(dtype=np.int64),
-                    "last_era": last_rows["era"].to_numpy(dtype=np.int64),
+            table_rows: List[Dict[str, Any]] = []
+            sm = self.smoothing_weight_
+            gm = self.global_mean_
+            win_k = self.effective_window_eras_
+            for s, e in zip(starts, ends):
+                t_key = str(s_tickers[s])
+                te = s_eras[s:e]
+                ty = s_targets[s:e]
+                tw = s_weights[s:e]
+                cw = np.cumsum(tw)
+                cwt = np.cumsum(tw * ty)
+                self.ticker_history_[t_key] = (te, ty, cw, cwt)
+
+                if mode == "last":
+                    w_val = float(tw[-1])
+                    p_val = (w_val * float(ty[-1]) + sm * gm) / (w_val + sm)
+                elif mode == "expanding_mean":
+                    p_val = (float(cwt[-1]) + sm * gm) / (float(cw[-1]) + sm)
+                else:
+                    left_i = len(te) - win_k - 1
+                    w_sub = float(cw[-1] - (cw[left_i] if left_i >= 0 else 0.0))
+                    wt_sub = float(cwt[-1] - (cwt[left_i] if left_i >= 0 else 0.0))
+                    p_val = (wt_sub + sm * gm) / (max(w_sub, 1e-12) + sm)
+
+                self.ticker_lookup_[t_key] = float(p_val)
+                table_rows.append({
+                    "ticker": t_key,
+                    "persisted_target": float(p_val),
+                    "obs_count": int(e - s),
+                    "last_era": int(te[-1]),
                 })
-                .sort_values("obs_count", ascending=False, kind="stable")
-                .reset_index(drop=True)
-            )
-        elif mode == "rolling_mean":
-            win_eras = max(1, int(self.persistence_window if self.persistence_window not in (None, "none", "None", "", 0) else 4))
-            tail_df = hist_df.groupby("ticker", sort=False).tail(win_eras).copy()
-            tail_df["weighted_target"] = tail_df["target"] * tail_df["weight"]
-            agg_df = tail_df.groupby("ticker", sort=False).agg(
-                w_sum=("weight", "sum"),
-                wt_sum=("weighted_target", "sum"),
-                obs_count=("target", "size"),
-                last_era=("era", "max"),
-            )
-            w_arr = np.maximum(agg_df["w_sum"].to_numpy(dtype=np.float64), 1e-12)
-            wt_arr = agg_df["wt_sum"].to_numpy(dtype=np.float64)
-            persisted_arr = (wt_arr + smoothing_weight * self.global_mean_) / (w_arr + smoothing_weight)
-            tickers_str = agg_df.index.astype(str)
-            self.ticker_lookup_ = dict(zip(tickers_str.tolist(), persisted_arr.tolist()))
+
             self.persistence_table_ = (
-                pd.DataFrame({
-                    "ticker": tickers_str.to_numpy(),
-                    "persisted_target": persisted_arr,
-                    "obs_count": agg_df["obs_count"].to_numpy(dtype=np.int64),
-                    "last_era": agg_df["last_era"].to_numpy(dtype=np.int64),
-                })
-                .sort_values("obs_count", ascending=False, kind="stable")
-                .reset_index(drop=True)
-            )
-        elif mode == "expanding_mean":
-            hist_df["weighted_target"] = hist_df["target"] * hist_df["weight"]
-            agg_df = hist_df.groupby("ticker", sort=False).agg(
-                w_sum=("weight", "sum"),
-                wt_sum=("weighted_target", "sum"),
-                obs_count=("target", "size"),
-                last_era=("era", "max"),
-            )
-            w_arr = np.maximum(agg_df["w_sum"].to_numpy(dtype=np.float64), 1e-12)
-            wt_arr = agg_df["wt_sum"].to_numpy(dtype=np.float64)
-            persisted_arr = (wt_arr + smoothing_weight * self.global_mean_) / (w_arr + smoothing_weight)
-            tickers_str = agg_df.index.astype(str)
-            self.ticker_lookup_ = dict(zip(tickers_str.tolist(), persisted_arr.tolist()))
-            self.persistence_table_ = (
-                pd.DataFrame({
-                    "ticker": tickers_str.to_numpy(),
-                    "persisted_target": persisted_arr,
-                    "obs_count": agg_df["obs_count"].to_numpy(dtype=np.int64),
-                    "last_era": agg_df["last_era"].to_numpy(dtype=np.int64),
-                })
+                pd.DataFrame(table_rows)
                 .sort_values("obs_count", ascending=False, kind="stable")
                 .reset_index(drop=True)
             )
         else:
-            raise ValueError(
-                f"Unsupported persistence_mode '{self.persistence_mode}'; use None, 'last', 'rolling_mean', or 'expanding_mean'."
-            )
-        raw_train_pred = self._raw_persistence_lookup(X_df)
+            self.persistence_table_ = pd.DataFrame(columns=["ticker", "persisted_target", "obs_count", "last_era"])
+
+        raw_train_pred = self._causal_persistence_lookup(X_df, era_values)
         self._fit_bias_correction(target_values, raw_train_pred, era_values)
         return self
 
@@ -954,7 +998,7 @@ class PersistenceEstimator(BaseNumeraiEstimator):
             if self.era_col in X_df.columns
             else None
         )
-        raw_pred = self._raw_persistence_lookup(X_df)
+        raw_pred = self._causal_persistence_lookup(X_df, era_values)
         return self._apply_prediction_transform(raw_pred, era_values)
 
 

@@ -1396,8 +1396,8 @@ def walk_forward_predict(
         has_val_settled = len(settled_val_eras) > 0
 
         if not has_train and not has_val_settled:
-            X_fit = X_train
-            y_fit = y_train_s
+            # No settled historical eras exist prior to `settled_cutoff_era` — never leak unsettled `X_train`
+            continue
         elif has_train and not has_val_settled:
             if bool(np.all(train_mask)):
                 X_fit = X_train
@@ -1416,6 +1416,13 @@ def walk_forward_predict(
             X_fit = pd.concat([X_tr_part, X_validation.loc[val_fit_mask]], axis=0, ignore_index=True)
             y_fit = pd.concat([y_tr_part.reset_index(drop=True), y_val_s.loc[val_fit_mask].reset_index(drop=True)], axis=0, ignore_index=True)
             del X_tr_part, y_tr_part
+
+        if isinstance(X_fit, pd.DataFrame) and "era" in X_fit.columns and len(X_fit) > 0:
+            max_fit_era = int(pd.to_numeric(X_fit["era"], errors="coerce").max())
+            if max_fit_era > settled_cutoff_era:
+                raise ValueError(
+                    f"Walk-forward leakage detected: max fit era ({max_fit_era}) > settled_cutoff_era ({settled_cutoff_era})."
+                )
 
         step_model = clone(estimator)
         chunk_params = step_model.get_params(deep=True)
@@ -2032,8 +2039,8 @@ def _compute_clipped_era_returns(
     corr_weight: float = 8.0,
     mmc_weight: float = 32.0,
     payout_factor: Union[float, pd.Series] = 1.0,
-    clip_min: float = -1.0,
-    clip_max: float = 2.0,
+    clip_min: float = -0.25,
+    clip_max: float = 0.25,
     churn_penalty: Optional[Union[float, pd.Series]] = None,
     stride: int = 4,
     corr_multiplier: Optional[float] = None,
@@ -2157,8 +2164,8 @@ def simulate_stake_pnl(
     corr_weight: float = 8.0,
     mmc_weight: float = 32.0,
     payout_factor: Union[float, pd.Series] = 1.0,
-    clip_min: float = -1.0,
-    clip_max: float = 2.0,
+    clip_min: float = -0.25,
+    clip_max: float = 0.25,
     churn_penalty: Optional[Union[float, pd.Series]] = None,
     staking_mode: str = "compound",
     stride: int = 4,
@@ -2333,8 +2340,8 @@ def simulate_stake_pnl_monte_carlo(
     corr_weight: float = 8.0,
     mmc_weight: float = 32.0,
     payout_factor: Union[float, pd.Series] = 1.0,
-    clip_min: float = -1.0,
-    clip_max: float = 2.0,
+    clip_min: float = -0.25,
+    clip_max: float = 0.25,
     churn_penalty: Optional[Union[float, pd.Series]] = None,
     staking_mode: str = "compound",
     stride: int = 4,
@@ -2451,8 +2458,8 @@ def plot_stake_pnl_dashboard(
     corr_weight: float = 8.0,
     mmc_weight: float = 32.0,
     payout_factor: Union[float, pd.Series] = 1.0,
-    clip_min: float = -1.0,
-    clip_max: float = 2.0,
+    clip_min: float = -0.25,
+    clip_max: float = 0.25,
     churn_penalty: Optional[Union[float, pd.Series]] = None,
     stride: int = 4,
     window_rounds: int = 13,
@@ -2596,8 +2603,8 @@ def plot_stake_pnl_monte_carlo(
     corr_weight: float = 8.0,
     mmc_weight: float = 32.0,
     payout_factor: Union[float, pd.Series] = 1.0,
-    clip_min: float = -1.0,
-    clip_max: float = 2.0,
+    clip_min: float = -0.25,
+    clip_max: float = 0.25,
     churn_penalty: Optional[Union[float, pd.Series]] = None,
     stride: int = 4,
     window_rounds: int = 13,

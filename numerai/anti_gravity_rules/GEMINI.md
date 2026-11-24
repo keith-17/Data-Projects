@@ -1,2 +1,3 @@
-- Do not put functions in the notebook.
-- Do not use iloc.
+- Do not put functions (`def`) in any notebook.
+- Do not use `.iloc` anywhere (notebooks or Python modules).
+- Never put `import` or `from ... import ...` statements anywhere outside the top imports cell (Cell 1) of any Jupyter notebook. All imports must live at the very top of the notebook.
