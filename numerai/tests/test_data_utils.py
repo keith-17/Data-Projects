@@ -15,8 +15,11 @@ from _fixtures import make_synthetic_numerai_panel, write_synthetic_unity_datase
 import data_utils
 from data_utils import (
     FORBIDDEN_FEATURE_COLS,
+    POLARS_AVAILABLE,
     _compute_weeks_since_change_1d,
+    _compute_weeks_since_change_grouped,
     _compute_weeks_since_high_1d,
+    _compute_weeks_since_high_grouped,
     _extract_http_status_code,
     _find_dataset_root,
     _format_http_error,
@@ -103,6 +106,53 @@ class TestCausalTickerTimeSeriesFeatures(unittest.TestCase):
             _compute_weeks_since_change_1d(np.array([2.0, 2.0, 2.0, 4.0, 4.0, 1.0])),
             np.array([0.0, 1.0, 2.0, 0.0, 1.0, 0.0]),
         )
+
+    def test_grouped_weeks_helpers_match_1d_reference(self) -> None:
+        g1 = np.array([2.0, 10.0, 5.0, 3.0, 1.0])
+        g2 = np.array([4.0, 4.0, 4.0, 1.0])
+        combined = np.concatenate([g1, g2])
+        pos = np.concatenate([np.arange(len(g1)), np.arange(len(g2))])
+
+        expected_wsh = np.concatenate([_compute_weeks_since_high_1d(g1, 4), _compute_weeks_since_high_1d(g2, 4)])
+        np.testing.assert_array_equal(_compute_weeks_since_high_grouped(combined, pos, 4), expected_wsh)
+
+        expected_wsc = np.concatenate([_compute_weeks_since_change_1d(g1), _compute_weeks_since_change_1d(g2)])
+        np.testing.assert_array_equal(_compute_weeks_since_change_grouped(combined, pos), expected_wsc)
+
+    def test_polars_vs_pandas_timeseries_parity(self) -> None:
+        if not POLARS_AVAILABLE:
+            self.skipTest("Polars not installed")
+        df, feature_cols = make_synthetic_numerai_panel(n_eras=10, n_tickers=8, n_features=4, seed=71)
+        shuffled = df.sample(frac=1.0, random_state=71)
+
+        out_pl, cols_pl = compute_per_ticker_timeseries_features(
+            shuffled,
+            feature_cols,
+            ticker_features="all",
+            ticker_windows=(2, 4),
+            ticker_lag_steps=(1, 2),
+            top_n_cols=2,
+            quantize_scope="era",
+        )
+        with patch.object(data_utils, "POLARS_AVAILABLE", False):
+            out_pd, cols_pd = compute_per_ticker_timeseries_features(
+                shuffled,
+                feature_cols,
+                ticker_features="all",
+                ticker_windows=(2, 4),
+                ticker_lag_steps=(1, 2),
+                top_n_cols=2,
+                quantize_scope="era",
+            )
+
+        self.assertEqual(cols_pl, cols_pd)
+        self.assertEqual(list(out_pl.index), list(out_pd.index))
+        for col in cols_pl:
+            self.assertEqual(out_pl[col].dtype, np.int8)
+            diff = np.abs(out_pl[col].to_numpy(dtype=np.int16) - out_pd[col].to_numpy(dtype=np.int16))
+            # Half-away-from-zero vs half-to-even rounding can differ by at most 1 bin on exact .5 ties
+            self.assertLessEqual(int(diff.max()), 1, f"Column {col} diverged beyond tie-rounding tolerance")
+            self.assertGreaterEqual(float(np.mean(diff == 0)), 0.90, f"Column {col} agreement too low")
 
     def test_compute_per_ticker_timeseries_features_all_modes_and_dtypes(self) -> None:
         df, feature_cols = make_synthetic_numerai_panel(n_eras=8, n_tickers=6, n_features=4, seed=17)
@@ -390,6 +440,39 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
                     force_reload=True,
                 )
                 self.assertEqual(spy.call_count, 1)
+
+    def test_polars_vs_pandas_load_unity_parity(self) -> None:
+        if not POLARS_AVAILABLE:
+            self.skipTest("Polars not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            write_synthetic_unity_dataset(
+                ws / "data_folder" / "v6.0",
+                n_train_eras=8,
+                n_val_eras=4,
+                n_tickers=6,
+                n_features=6,
+                float_unit_features=True,
+                include_non_validation_rows=True,
+                include_nan_targets=True,
+            )
+            tr_pl, va_pl, cols_pl, _ = load_unity_numerai_data(
+                data_version="v6.0", feature_set="small", era_stride=2, workspace_root=ws, auto_download=False
+            )
+            with patch.object(data_utils, "POLARS_AVAILABLE", False):
+                tr_pd, va_pd, cols_pd, _ = load_unity_numerai_data(
+                    data_version="v6.0", feature_set="small", era_stride=2, workspace_root=ws, auto_download=False
+                )
+
+            self.assertEqual(cols_pl, cols_pd)
+            self.assertEqual(tr_pl.shape, tr_pd.shape)
+            self.assertEqual(va_pl.shape, va_pd.shape)
+            np.testing.assert_array_equal(tr_pl["era"].to_numpy(), tr_pd["era"].to_numpy())
+            np.testing.assert_array_equal(va_pl["era"].to_numpy(), va_pd["era"].to_numpy())
+            np.testing.assert_allclose(tr_pl["target"].to_numpy(), tr_pd["target"].to_numpy())
+            for col in cols_pl:
+                np.testing.assert_array_equal(tr_pl[col].to_numpy(), tr_pd[col].to_numpy())
+                np.testing.assert_array_equal(va_pl[col].to_numpy(), va_pd[col].to_numpy())
 
 
 if __name__ == "__main__":

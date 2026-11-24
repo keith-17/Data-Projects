@@ -17,6 +17,13 @@ from requests.exceptions import HTTPError, RequestException
 from utils import quantize_to_5bins
 
 try:
+    import polars as pl
+    POLARS_AVAILABLE = True
+except ImportError:
+    pl = None  # type: ignore[assignment]
+    POLARS_AVAILABLE = False
+
+try:
     import kagglehub
     from kagglehub.exceptions import (
         BackendError,
@@ -157,6 +164,202 @@ def _compute_weeks_since_change_1d(arr: np.ndarray) -> np.ndarray:
     return (idx - last_change_idx).astype(np.float64)
 
 
+def _compute_weeks_since_high_grouped(
+    sorted_vals: np.ndarray,
+    pos_in_group: np.ndarray,
+    window: int,
+) -> np.ndarray:
+    """Vectorized O(N * window) causal weeks-since-high across all contiguous ticker groups without per-group Python loops."""
+    n = len(sorted_vals)
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+    w = max(2, int(window))
+    clean = np.where(np.isfinite(sorted_vals), sorted_vals, -np.inf)
+    best_val = clean.copy()
+    best_lag = np.zeros(n, dtype=np.int32)
+    for lag in range(1, min(w, n)):
+        valid = pos_in_group[lag:] >= lag
+        shifted = clean[:-lag]
+        better = valid & (shifted > best_val[lag:])
+        best_val[lag:] = np.where(better, shifted, best_val[lag:])
+        best_lag[lag:] = np.where(better, lag, best_lag[lag:])
+    return best_lag.astype(np.float64)
+
+
+def _compute_weeks_since_change_grouped(
+    sorted_vals: np.ndarray,
+    pos_in_group: np.ndarray,
+) -> np.ndarray:
+    """Vectorized O(N) causal weeks-since-change across all contiguous ticker groups without per-group Python loops."""
+    n = len(sorted_vals)
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+    idx = np.arange(n, dtype=np.int64)
+    changed = np.ones(n, dtype=bool)
+    if n > 1:
+        changed[1:] = (pos_in_group[1:] == 0) | (np.abs(sorted_vals[1:] - sorted_vals[:-1]) > 1e-12)
+    last_change_idx = np.maximum.accumulate(np.where(changed, idx, 0))
+    return (idx - last_change_idx).astype(np.float64)
+
+
+def _pl_quantize_to_5bins_expr(
+    col_name: str,
+    era_col: str,
+    quantize_scope: str,
+) -> Any:
+    """Polars expression for 5-bin (`0..4` `Int8`) z-score quantization (`'era'` or `'global'`)."""
+    scope = str(quantize_scope or "era").strip().lower()
+    raw = pl.col(col_name).cast(pl.Float64)
+    finite = raw.is_finite()
+    if scope == "era":
+        med = raw.filter(finite).median().over(era_col)
+        clean = pl.when(finite).then(raw).otherwise(med).fill_null(0.0)
+        mean_e = clean.mean().over(era_col)
+        std_e = clean.std(ddof=0).over(era_col)
+    else:
+        med = raw.filter(finite).median()
+        clean = pl.when(finite).then(raw).otherwise(med).fill_null(0.0)
+        mean_e = clean.mean()
+        std_e = clean.std(ddof=0)
+
+    valid_std = std_e.is_not_null() & (std_e > 1e-12)
+    safe_std = pl.when(valid_std).then(std_e).otherwise(1.0)
+    z = (clean - mean_e) / safe_std
+    binned = (z.clip(-2.0, 2.0) + 2.0).round(0).clip(0.0, 4.0).fill_nan(2.0).fill_null(2.0).cast(pl.Int8)
+    return pl.when(valid_std).then(binned).otherwise(pl.lit(2, dtype=pl.Int8)).alias(col_name)
+
+
+def _compute_per_ticker_timeseries_polars(
+    df: pd.DataFrame,
+    chosen_cols: List[str],
+    *,
+    ticker_col: str,
+    era_col: str,
+    active_modes: set,
+    windows: List[int],
+    lag_steps: List[int],
+    quantize_scope: str,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Multi-threaded Polars + vectorized NumPy implementation of `compute_per_ticker_timeseries_features`."""
+    n_rows = len(df)
+    if n_rows == 0:
+        return df, []
+
+    sub_data: Dict[str, Any] = {
+        "_orig_row_idx_": np.arange(n_rows, dtype=np.int64),
+        ticker_col: df[ticker_col].astype(str).to_numpy(),
+        era_col: df[era_col].to_numpy(),
+    }
+    for col in chosen_cols:
+        sub_data[col] = pd.to_numeric(df[col], errors="coerce").fillna(2.0).to_numpy(dtype=np.float64, copy=False)
+
+    pl_df = pl.DataFrame(sub_data).sort([ticker_col, era_col], maintain_order=True)
+
+    # Contiguous per-ticker 0-based position for vectorized weeks_since_high / weeks_since_change
+    need_pos = ("weeks_since_high" in active_modes) or ("weeks_since_change" in active_modes)
+    pos_in_group = (
+        pl_df.select(pl.int_range(0, pl.len()).over(ticker_col).alias("_pos_")).get_column("_pos_").to_numpy()
+        if need_pos
+        else None
+    )
+
+    quantize_cols: List[str] = []
+    direct_int8_cols: List[str] = []
+    exprs: List[Any] = []
+    extra_numpy_series: Dict[str, np.ndarray] = {}
+
+    for col in chosen_cols:
+        c_expr = pl.col(col)
+        sorted_vals = pl_df.get_column(col).to_numpy() if need_pos else None
+
+        if "weeks_since_change" in active_modes and sorted_vals is not None and pos_in_group is not None:
+            cname = f"{col}_ticker_wks_change"
+            extra_numpy_series[cname] = _compute_weeks_since_change_grouped(sorted_vals, pos_in_group)
+            quantize_cols.append(cname)
+
+        if "expanding_stats" in active_modes:
+            exp_mean_name = f"{col}_ticker_exp_mean"
+            exp_min_name = f"{col}_ticker_exp_min"
+            exp_max_name = f"{col}_ticker_exp_max"
+            exprs.append((c_expr.cum_sum().over(ticker_col) / c_expr.cum_count().over(ticker_col)).alias(exp_mean_name))
+            exprs.append(c_expr.cum_min().over(ticker_col).round(0).clip(0.0, 4.0).cast(pl.Int8).alias(exp_min_name))
+            exprs.append(c_expr.cum_max().over(ticker_col).round(0).clip(0.0, 4.0).cast(pl.Int8).alias(exp_max_name))
+            quantize_cols.append(exp_mean_name)
+            direct_int8_cols.extend([exp_min_name, exp_max_name])
+
+        if "raw_lags" in active_modes:
+            for lag_k in lag_steps:
+                cname = f"{col}_ticker_lag{lag_k}"
+                exprs.append(
+                    c_expr.shift(lag_k).over(ticker_col).fill_null(2.0).round(0).clip(0.0, 4.0).cast(pl.Int8).alias(cname)
+                )
+                direct_int8_cols.append(cname)
+
+        for w in windows:
+            need_roll_mean = ("rolling_mean" in active_modes) or ("momentum_diff" in active_modes)
+            roll_mean_expr = c_expr.rolling_mean(window_size=w, min_samples=1).over(ticker_col) if need_roll_mean else None
+            if "rolling_mean" in active_modes and roll_mean_expr is not None:
+                cname = f"{col}_ticker_roll_mean{w}"
+                exprs.append(roll_mean_expr.alias(cname))
+                quantize_cols.append(cname)
+            if "momentum_diff" in active_modes and roll_mean_expr is not None:
+                cname = f"{col}_ticker_mom_diff{w}"
+                exprs.append((c_expr - roll_mean_expr).alias(cname))
+                quantize_cols.append(cname)
+            if "weeks_since_high" in active_modes and sorted_vals is not None and pos_in_group is not None:
+                cname = f"{col}_ticker_wks_high{w}"
+                wsh_arr = _compute_weeks_since_high_grouped(sorted_vals, pos_in_group, w)
+                scaled_wsh = np.clip(np.rint(wsh_arr * 4.0 / max(1.0, float(w - 1))), 0, 4).astype(np.int8)
+                extra_numpy_series[cname] = scaled_wsh
+                direct_int8_cols.append(cname)
+            if "rolling_rank" in active_modes:
+                cname = f"{col}_ticker_roll_rank{w}"
+                denom = pl.min_horizontal(c_expr.cum_count().over(ticker_col), pl.lit(w)).cast(pl.Float64)
+                rr_expr = (
+                    c_expr.rolling_rank(window_size=w, min_samples=1, method="average").over(ticker_col) / denom
+                ).fill_null(0.5)
+                exprs.append(rr_expr.alias(cname))
+                quantize_cols.append(cname)
+
+    if not exprs and not extra_numpy_series:
+        return df, []
+
+    if extra_numpy_series:
+        pl_df = pl_df.with_columns([pl.Series(name, arr) for name, arr in extra_numpy_series.items()])
+    if exprs:
+        pl_df = pl_df.with_columns(exprs)
+    if quantize_cols:
+        pl_df = pl_df.with_columns([_pl_quantize_to_5bins_expr(c, era_col, quantize_scope) for c in quantize_cols])
+
+    # Preserve exact deterministic column ordering matching the legacy Pandas path
+    added_col_names: List[str] = []
+    for col in chosen_cols:
+        if "weeks_since_change" in active_modes:
+            added_col_names.append(f"{col}_ticker_wks_change")
+        if "expanding_stats" in active_modes:
+            added_col_names.extend([f"{col}_ticker_exp_mean", f"{col}_ticker_exp_min", f"{col}_ticker_exp_max"])
+        if "raw_lags" in active_modes:
+            added_col_names.extend([f"{col}_ticker_lag{k}" for k in lag_steps])
+        for w in windows:
+            if "rolling_mean" in active_modes:
+                added_col_names.append(f"{col}_ticker_roll_mean{w}")
+            if "momentum_diff" in active_modes:
+                added_col_names.append(f"{col}_ticker_mom_diff{w}")
+            if "weeks_since_high" in active_modes:
+                added_col_names.append(f"{col}_ticker_wks_high{w}")
+            if "rolling_rank" in active_modes:
+                added_col_names.append(f"{col}_ticker_roll_rank{w}")
+
+    restored = pl_df.sort("_orig_row_idx_").select(added_col_names)
+    added_df = restored.to_pandas()
+    added_df.index = df.index
+    for cname in added_col_names:
+        if added_df[cname].dtype != np.int8:
+            added_df[cname] = added_df[cname].to_numpy(dtype=np.int8, copy=False)
+    out_df = pd.concat([df, added_df], axis=1)
+    return out_df, added_col_names
+
+
 def compute_per_ticker_timeseries_features(
     df: pd.DataFrame,
     base_feature_cols: Sequence[str],
@@ -213,6 +416,19 @@ def compute_per_ticker_timeseries_features(
         if isinstance(ticker_lag_steps, (list, tuple, set))
         else [1, 2, 4]
     ) or [1, 2, 4]
+
+    if POLARS_AVAILABLE and pl is not None:
+        return _compute_per_ticker_timeseries_polars(
+            df,
+            chosen_cols,
+            ticker_col=ticker_col,
+            era_col=era_col,
+            active_modes=active_modes,
+            windows=windows,
+            lag_steps=lag_steps,
+            quantize_scope=quantize_scope,
+        )
+
     sorted_df = df.sort_values([ticker_col, era_col], kind="stable")
     sorted_eras = sorted_df[era_col].to_numpy()
 
@@ -396,6 +612,119 @@ def downsample_training_data(
     return train_df.loc[train_df[era_col].isin(kept_eras)].copy()
 
 
+def _polars_cast_features_to_int8(pl_df: Any, feature_columns: List[str]) -> Any:
+    """Cast non-Int8 feature columns to Int8 in parallel inside Polars, preserving `[0, 1]` -> `0..4` scaling."""
+    schema = pl_df.schema
+    non_int8 = [col for col in feature_columns if schema.get(col) != pl.Int8]
+    if not non_int8:
+        return pl_df
+
+    # Compute min/max in a single parallel pass to detect float [0, 1] unit-interval columns
+    stat_exprs: List[Any] = []
+    for col in non_int8:
+        dt = schema.get(col)
+        is_int_dt = dt in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64)
+        if not is_int_dt:
+            c_f = pl.col(col).cast(pl.Float32, strict=False)
+            c_fin = c_f.filter(c_f.is_finite())
+            stat_exprs.append(c_fin.min().alias(f"__min__{col}"))
+            stat_exprs.append(c_fin.max().alias(f"__max__{col}"))
+
+    stats_row = pl_df.select(stat_exprs).row(0, named=True) if stat_exprs else {}
+
+    cast_exprs: List[Any] = []
+    for col in non_int8:
+        dt = schema.get(col)
+        is_int_dt = dt in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64)
+        c_f = pl.col(col).cast(pl.Float32, strict=False)
+        is_fin = c_f.is_finite()
+        if not is_int_dt:
+            lo = stats_row.get(f"__min__{col}")
+            hi = stats_row.get(f"__max__{col}")
+            is_unit = lo is not None and hi is not None and 0.0 <= float(lo) and float(hi) <= 1.0 + 1e-6
+        else:
+            is_unit = False
+
+        if is_unit:
+            cast_exprs.append(
+                (pl.when(is_fin).then(c_f).otherwise(0.5) * 4.0).round(0).clip(0.0, 4.0).cast(pl.Int8).alias(col)
+            )
+        else:
+            cast_exprs.append(
+                pl.when(is_fin).then(c_f).otherwise(2.0).round(0).clip(-128.0, 127.0).cast(pl.Int8).alias(col)
+            )
+    return pl_df.with_columns(cast_exprs)
+
+
+def _load_and_clean_splits_polars(
+    train_path: Path,
+    validation_path: Path,
+    train_cols: List[str],
+    val_cols: List[str],
+    feature_columns: List[str],
+    target_col: str,
+    *,
+    apply_era_stride_early: Optional[int] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Fast multi-threaded Polars Parquet reader with predicate pushdown, parallel Int8 casting, and era unification."""
+    train_lf = pl.scan_parquet(train_path).select(train_cols).filter(pl.col(target_col).is_not_null())
+    val_lf = pl.scan_parquet(validation_path).select(val_cols).filter(pl.col(target_col).is_not_null())
+
+    train_pl = train_lf.collect()
+    val_pl = val_lf.collect()
+
+    if "data_type" in val_pl.columns:
+        val_mask = val_pl.get_column("data_type").cast(pl.Utf8).str.to_lowercase() == "validation"
+        if bool(val_mask.any()):
+            val_pl = val_pl.filter(val_mask)
+
+    train_pl = train_pl.with_columns(pl.col(target_col).cast(pl.Float32))
+    val_pl = val_pl.with_columns(pl.col(target_col).cast(pl.Float32))
+
+    # Unify era across classic `era` and v6.0 `date`
+    if "era" in train_pl.columns and "era" in val_pl.columns:
+        tr_num = train_pl.get_column("era").cast(pl.Int32, strict=False)
+        va_num = val_pl.get_column("era").cast(pl.Int32, strict=False)
+        if tr_num.null_count() == 0 and va_num.null_count() == 0:
+            train_pl = train_pl.with_columns(tr_num.alias("era"))
+            val_pl = val_pl.with_columns(va_num.alias("era"))
+            tr_keys = va_keys = None
+        else:
+            tr_keys = train_pl.get_column("era").cast(pl.Utf8)
+            va_keys = val_pl.get_column("era").cast(pl.Utf8)
+    elif "date" in train_pl.columns and "date" in val_pl.columns:
+        def _date_to_str_series(series: Any) -> Any:
+            if series.dtype == pl.Date:
+                return series.dt.strftime("%Y-%m-%d")
+            if series.dtype == pl.Datetime:
+                return series.dt.strftime("%Y-%m-%d")
+            return pl.Series("date", pd.to_datetime(series.to_pandas()).dt.strftime("%Y-%m-%d").to_numpy())
+
+        tr_keys = _date_to_str_series(train_pl.get_column("date"))
+        va_keys = _date_to_str_series(val_pl.get_column("date"))
+    else:
+        raise KeyError("Expected 'era' or 'date' column in both train and validation Parquet files.")
+
+    if tr_keys is not None and va_keys is not None:
+        all_keys = sorted(set(tr_keys.unique().to_list()) | set(va_keys.unique().to_list()))
+        key_to_id = {k: np.int32(pos + 1) for pos, k in enumerate(all_keys)}
+        train_pl = train_pl.with_columns(tr_keys.replace_strict(key_to_id, return_dtype=pl.Int32).alias("era"))
+        val_pl = val_pl.with_columns(va_keys.replace_strict(key_to_id, return_dtype=pl.Int32).alias("era"))
+
+    train_pl = train_pl.sort("era", maintain_order=True)
+    val_pl = val_pl.sort("era", maintain_order=True)
+
+    # Apply era_stride early before Int8 casting / Pandas conversion when pre-stride ticker features are not requested
+    if apply_era_stride_early is not None and int(apply_era_stride_early) > 1:
+        kept_eras = sorted(train_pl.get_column("era").unique().to_list())[:: int(apply_era_stride_early)]
+        train_pl = train_pl.filter(pl.col("era").is_in(kept_eras))
+
+    train_pl = _polars_cast_features_to_int8(train_pl, feature_columns)
+    val_pl = _polars_cast_features_to_int8(val_pl, feature_columns)
+
+    return train_pl.to_pandas(), val_pl.to_pandas()
+
+
 def load_unity_numerai_data(
     data_version: str = "v6.0",
     data_folder: str = "data_folder",
@@ -534,75 +863,87 @@ def load_unity_numerai_data(
 
     train_meta_cols = [column for column in METADATA_COLS if column in train_schema_cols]
     val_meta_cols = [column for column in METADATA_COLS if column in validation_schema_cols]
-    train_df = pd.read_parquet(
-        train_path,
-        columns=list(dict.fromkeys(train_meta_cols + feature_columns + [target_col])),
-    )
-    validation_df = pd.read_parquet(
-        validation_path,
-        columns=list(dict.fromkeys(val_meta_cols + feature_columns + [target_col])),
-    )
+    train_req_cols = list(dict.fromkeys(train_meta_cols + feature_columns + [target_col]))
+    val_req_cols = list(dict.fromkeys(val_meta_cols + feature_columns + [target_col]))
+    want_ticker_ts = ticker_timeseries_features not in (None, False, "None", "none", "null", "")
+    strided_early = False
 
-    # 4. Clean targets, unify era across classic `era` and v6.0 `date`, cast features to int8
-    if "data_type" in validation_df.columns:
-        is_validation_row = validation_df["data_type"].astype(str).str.lower() == "validation"
-        if is_validation_row.any():
-            validation_df = validation_df.loc[is_validation_row].copy()
-
-    train_df = train_df.dropna(subset=[target_col]).copy()
-    validation_df = validation_df.dropna(subset=[target_col]).copy()
-    train_df[target_col] = train_df[target_col].astype(np.float32)
-    validation_df[target_col] = validation_df[target_col].astype(np.float32)
-
-    if "era" in train_df.columns and "era" in validation_df.columns:
-        train_era_numeric = pd.to_numeric(train_df["era"], errors="coerce")
-        validation_era_numeric = pd.to_numeric(validation_df["era"], errors="coerce")
-        if train_era_numeric.notna().all() and validation_era_numeric.notna().all():
-            train_df["era"] = train_era_numeric.astype(np.int32)
-            validation_df["era"] = validation_era_numeric.astype(np.int32)
-            train_era_keys = validation_era_keys = None
-        else:
-            train_era_keys = train_df["era"].astype(str)
-            validation_era_keys = validation_df["era"].astype(str)
-    elif "date" in train_df.columns and "date" in validation_df.columns:
-        train_era_keys = pd.to_datetime(train_df["date"]).dt.strftime("%Y-%m-%d")
-        validation_era_keys = pd.to_datetime(validation_df["date"]).dt.strftime("%Y-%m-%d")
+    if POLARS_AVAILABLE and pl is not None:
+        early_stride = int(era_stride) if (not want_ticker_ts and int(era_stride) > 1) else None
+        train_df, validation_df = _load_and_clean_splits_polars(
+            train_path,
+            validation_path,
+            train_req_cols,
+            val_req_cols,
+            feature_columns,
+            target_col,
+            apply_era_stride_early=early_stride,
+        )
+        strided_early = early_stride is not None
     else:
-        raise KeyError("Expected 'era' or 'date' column in both train and validation Parquet files.")
+        train_df = pd.read_parquet(train_path, columns=train_req_cols)
+        validation_df = pd.read_parquet(validation_path, columns=val_req_cols)
 
-    if train_era_keys is not None:
-        all_era_keys = sorted(set(train_era_keys.unique()) | set(validation_era_keys.unique()))
-        era_key_to_id = {era_key: np.int32(position + 1) for position, era_key in enumerate(all_era_keys)}
-        train_df["era"] = train_era_keys.map(era_key_to_id).astype(np.int32)
-        validation_df["era"] = validation_era_keys.map(era_key_to_id).astype(np.int32)
+        # 4. Clean targets, unify era across classic `era` and v6.0 `date`, cast features to int8
+        if "data_type" in validation_df.columns:
+            is_validation_row = validation_df["data_type"].astype(str).str.lower() == "validation"
+            if is_validation_row.any():
+                validation_df = validation_df.loc[is_validation_row].copy()
 
-    train_df = train_df.sort_values("era", kind="stable")
-    validation_df = validation_df.sort_values("era", kind="stable")
+        train_df = train_df.dropna(subset=[target_col]).copy()
+        validation_df = validation_df.dropna(subset=[target_col]).copy()
+        train_df[target_col] = train_df[target_col].astype(np.float32)
+        validation_df[target_col] = validation_df[target_col].astype(np.float32)
 
-    for split_df in (train_df, validation_df):
-        for column in feature_columns:
-            if split_df[column].dtype == np.int8:
-                continue
-            values = pd.to_numeric(split_df[column], errors="coerce").to_numpy(dtype=np.float32, copy=False)
-            missing_mask = ~np.isfinite(values)
-            observed_values = values[~missing_mask]
-            is_unit_interval = (
-                len(observed_values) > 0
-                and 0.0 <= float(observed_values.min())
-                and float(observed_values.max()) <= 1.0 + 1e-6
-                and not pd.api.types.is_integer_dtype(split_df[column])
-            )
-            if is_unit_interval:
-                binned_values = np.rint(np.where(missing_mask, 0.5, values) * 4.0)
-                split_df[column] = np.clip(binned_values, 0, 4).astype(np.int8)
+        if "era" in train_df.columns and "era" in validation_df.columns:
+            train_era_numeric = pd.to_numeric(train_df["era"], errors="coerce")
+            validation_era_numeric = pd.to_numeric(validation_df["era"], errors="coerce")
+            if train_era_numeric.notna().all() and validation_era_numeric.notna().all():
+                train_df["era"] = train_era_numeric.astype(np.int32)
+                validation_df["era"] = validation_era_numeric.astype(np.int32)
+                train_era_keys = validation_era_keys = None
             else:
-                filled_values = np.rint(np.where(missing_mask, 2.0, values))
-                split_df[column] = np.clip(filled_values, -128, 127).astype(np.int8)
+                train_era_keys = train_df["era"].astype(str)
+                validation_era_keys = validation_df["era"].astype(str)
+        elif "date" in train_df.columns and "date" in validation_df.columns:
+            train_era_keys = pd.to_datetime(train_df["date"]).dt.strftime("%Y-%m-%d")
+            validation_era_keys = pd.to_datetime(validation_df["date"]).dt.strftime("%Y-%m-%d")
+        else:
+            raise KeyError("Expected 'era' or 'date' column in both train and validation Parquet files.")
+
+        if train_era_keys is not None:
+            all_era_keys = sorted(set(train_era_keys.unique()) | set(validation_era_keys.unique()))
+            era_key_to_id = {era_key: np.int32(position + 1) for position, era_key in enumerate(all_era_keys)}
+            train_df["era"] = train_era_keys.map(era_key_to_id).astype(np.int32)
+            validation_df["era"] = validation_era_keys.map(era_key_to_id).astype(np.int32)
+
+        train_df = train_df.sort_values("era", kind="stable")
+        validation_df = validation_df.sort_values("era", kind="stable")
+
+        for split_df in (train_df, validation_df):
+            for column in feature_columns:
+                if split_df[column].dtype == np.int8:
+                    continue
+                values = pd.to_numeric(split_df[column], errors="coerce").to_numpy(dtype=np.float32, copy=False)
+                missing_mask = ~np.isfinite(values)
+                observed_values = values[~missing_mask]
+                is_unit_interval = (
+                    len(observed_values) > 0
+                    and 0.0 <= float(observed_values.min())
+                    and float(observed_values.max()) <= 1.0 + 1e-6
+                    and not pd.api.types.is_integer_dtype(split_df[column])
+                )
+                if is_unit_interval:
+                    binned_values = np.rint(np.where(missing_mask, 0.5, values) * 4.0)
+                    split_df[column] = np.clip(binned_values, 0, 4).astype(np.int8)
+                else:
+                    filled_values = np.rint(np.where(missing_mask, 2.0, values))
+                    split_df[column] = np.clip(filled_values, -128, 127).astype(np.int8)
 
     # 5. Optional causal per-ticker time-series features computed BEFORE `era_stride` subsampling
     #    Concatenate the warm-up tail of `train_df` onto `validation_df` before computing validation
     #    per-ticker rolling/lag features so early validation eras do not suffer a cold-start boundary.
-    if ticker_timeseries_features not in (None, False, "None", "none", "null", ""):
+    if want_ticker_ts:
         base_cols_snapshot = list(feature_columns)
         win_candidates = [int(w) for w in (ticker_rolling_windows or (4, 12))] if isinstance(ticker_rolling_windows, (list, tuple, set)) else [4, 12]
         lag_candidates = [int(k) for k in (ticker_lag_steps or (1, 2, 4))] if isinstance(ticker_lag_steps, (list, tuple, set)) else [1, 2, 4]
@@ -651,7 +992,7 @@ def load_unity_numerai_data(
         feature_columns = feature_columns + common_added
 
     # 6. Apply `era_stride` strictly once to `train_df` after pre-stride ticker history features (validation keeps every era)
-    if int(era_stride) > 1:
+    if not strided_early and int(era_stride) > 1:
         kept_train_eras = sorted(train_df["era"].unique())[:: int(era_stride)]
         train_df = train_df.loc[train_df["era"].isin(kept_train_eras)]
 
