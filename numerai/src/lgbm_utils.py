@@ -388,7 +388,7 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
         )
 
         if self.bias_correction not in (None, False, "None", "none", ""):
-            raw_train_pred = np.asarray(model.predict(selected_df), dtype=np.float64).ravel()
+            raw_train_pred = np.asarray(self.model_.predict(selected_df), dtype=np.float64).ravel()
             self._fit_bias_correction(target_values, raw_train_pred, era_values)
             del raw_train_pred
         else:

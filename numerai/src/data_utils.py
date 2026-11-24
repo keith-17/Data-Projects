@@ -676,7 +676,7 @@ def _source_files_fingerprint(
     data_folder: str,
     kaggle_dataset: str,
     workspace_dir: Path,
-) -> Optional[List[Tuple[str, int, int]]]:
+) -> Optional[List[List[Any]]]:
     dataset_slug_name = kaggle_dataset.split("/")[-1]
     candidate_dirs = (
         Path("/kaggle/input/datasets") / kaggle_dataset,
@@ -693,10 +693,10 @@ def _source_files_fingerprint(
     if data_root is None:
         return None
     train_p, val_p, feat_p = _resolve_numerai_paths(data_root)
-    fp: List[Tuple[str, int, int]] = []
+    fp: List[List[Any]] = []
     for p in (train_p, val_p, feat_p):
         st = p.stat()
-        fp.append((p.name, int(st.st_mtime_ns), int(st.st_size)))
+        fp.append([p.name, int(st.st_mtime_ns), int(st.st_size)])
     return fp
 
 
