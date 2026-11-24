@@ -8,7 +8,7 @@ import inspect
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -1471,7 +1471,7 @@ def export_diagnostics_predictions(
     return target_path
 
 
-_CV_FOLD_METRIC_LOG: List[Dict[str, float]] = []
+_CV_FOLD_METRIC_LOG: List[Dict[str, Any]] = []
 
 ERROR_BIN_LABELS: Tuple[str, ...] = (
     "Extreme Underforecast",
@@ -1908,6 +1908,7 @@ def candidate_score(estimator: Any, X: pd.DataFrame, y: Any) -> float:
         "mae": mae_val,
         "forecast_bias": bias_val,
         "max_drawdown": max_dd,
+        "era_corrs": era_corrs,
         **bin_shares,
     })
 
@@ -1919,8 +1920,206 @@ def candidate_score(estimator: Any, X: pd.DataFrame, y: Any) -> float:
     return mean_corr
 
 
+def _infer_non_overlapping_stride(era_index: pd.Index, default_stride: int = 4) -> int:
+    """Infer stride so non-overlapping 4-week target eras are not double-strided on pre-strided CV folds."""
+    step = max(1, int(default_stride))
+    if len(era_index) < 2:
+        return 1
+    numeric_idx = pd.to_numeric(pd.Index(era_index), errors="coerce")
+    if numeric_idx.isna().any():
+        return step
+    diffs = np.diff(numeric_idx.to_numpy(dtype=np.float64))
+    pos_diffs = diffs[diffs > 0.0]
+    if len(pos_diffs) == 0:
+        return step
+    median_step = float(np.median(pos_diffs))
+    return max(1, int(round(float(step) / median_step)))
+
+
+def simulate_stake_pnl(
+    per_era_corr: pd.Series,
+    initial_stake: float = 1000.0,
+    corr_multiplier: float = 0.5,
+    clip_limit: float = 0.25,
+    stride: int = 4,
+) -> Dict[str, Union[float, pd.Series]]:
+    """Vectorized Numerai CORR-only staking P&L simulator (£) on unseen out-of-fold or held-out validation eras.
+
+    Applies optional `stride` slicing (`corr_series[::stride]`) so overlapping 4-week target eras are
+    not double-compounded, then computes compounded equity, running drawdown, and per-era P&L.
+    """
+    init_stake = float(initial_stake)
+    corr_series = pd.Series(per_era_corr, dtype=np.float64).dropna().sort_index()
+    step = max(1, int(stride))
+    if step > 1 and len(corr_series) > 0:
+        corr_series = corr_series.loc[corr_series.index[::step]]
+
+    if len(corr_series) == 0:
+        empty_series = pd.Series(dtype=np.float64)
+        return {
+            "final_stake": init_stake,
+            "net_profit": 0.0,
+            "total_return_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "max_drawdown_gbp": 0.0,
+            "worst_era_gbp": 0.0,
+            "equity_curve": empty_series,
+            "drawdown_pct_series": empty_series,
+        }
+
+    era_returns = (corr_series * float(corr_multiplier)).clip(-float(clip_limit), float(clip_limit))
+    equity_curve = (init_stake * (1.0 + era_returns).cumprod()).rename("equity_gbp")
+    running_peak = equity_curve.cummax()
+    drawdown_gbp = equity_curve - running_peak
+    drawdown_pct = (drawdown_gbp / running_peak.replace(0.0, np.nan)).fillna(0.0)
+    drawdown_pct_series = (drawdown_pct * 100.0).rename("drawdown_pct")
+    first_equity = float(equity_curve.to_numpy(dtype=np.float64)[0])
+    era_pnl_gbp = equity_curve.diff().fillna(first_equity - init_stake)
+
+    final_stake = float(equity_curve.to_numpy(dtype=np.float64)[-1])
+    net_profit = final_stake - init_stake
+    total_return_pct = (net_profit / init_stake) * 100.0 if abs(init_stake) > 1e-12 else 0.0
+
+    return {
+        "final_stake": final_stake,
+        "net_profit": net_profit,
+        "total_return_pct": total_return_pct,
+        "max_drawdown_pct": float(drawdown_pct_series.min()),
+        "max_drawdown_gbp": float(drawdown_gbp.min()),
+        "worst_era_gbp": float(era_pnl_gbp.min()),
+        "equity_curve": equity_curve,
+        "drawdown_pct_series": drawdown_pct_series,
+    }
+
+
+def plot_stake_pnl_dashboard(
+    per_era_corr: pd.Series,
+    *,
+    title: str = "Best Model",
+    initial_stake: float = 1000.0,
+    corr_multiplier: float = 0.5,
+    clip_limit: float = 0.25,
+    stride: int = 4,
+    save_path: Optional[Any] = None,
+) -> Dict[str, Union[float, pd.Series]]:
+    """Plot a 2-panel Numerai staking P&L dashboard (Equity Curve £ + Burn Drawdown %) on held-out validation eras."""
+    import matplotlib.pyplot as plt
+
+    pnl = simulate_stake_pnl(
+        per_era_corr,
+        initial_stake=initial_stake,
+        corr_multiplier=corr_multiplier,
+        clip_limit=clip_limit,
+        stride=stride,
+    )
+    equity_curve = pnl["equity_curve"]
+    drawdown_pct_series = pnl["drawdown_pct_series"]
+    if not isinstance(equity_curve, pd.Series) or equity_curve.empty:
+        return pnl
+
+    x_pos = np.arange(len(equity_curve))
+    era_labels = [str(e) for e in equity_curve.index]
+    tick_step = max(1, len(era_labels) // 12)
+    final_stake = float(pnl["final_stake"])
+    net_profit = float(pnl["net_profit"])
+    total_return_pct = float(pnl["total_return_pct"])
+    max_dd_pct = float(pnl["max_drawdown_pct"])
+    max_dd_gbp = float(pnl["max_drawdown_gbp"])
+    worst_era_gbp = float(pnl["worst_era_gbp"])
+
+    fig, (ax_eq, ax_dd) = plt.subplots(
+        2, 1, figsize=(15, 7.5), sharex=True, gridspec_kw={"height_ratios": [2.0, 1.0]}
+    )
+    fig.patch.set_facecolor("white")
+
+    # --- Top Subplot: Simulated Equity Curve (£) ---
+    eq_vals = equity_curve.to_numpy(dtype=np.float64)
+    line_color = "#059669" if net_profit >= 0.0 else "#dc2626"
+    ax_eq.plot(x_pos, eq_vals, color=line_color, linewidth=2.0, label="Simulated Equity (£)")
+    ax_eq.axhline(float(initial_stake), color="#64748b", linestyle="--", linewidth=1.3, label=f"Breakeven (£{initial_stake:,.0f})")
+    ax_eq.fill_between(
+        x_pos,
+        eq_vals,
+        float(initial_stake),
+        where=eq_vals >= float(initial_stake),
+        color="#10b981",
+        alpha=0.12,
+        interpolate=True,
+    )
+    ax_eq.fill_between(
+        x_pos,
+        eq_vals,
+        float(initial_stake),
+        where=eq_vals < float(initial_stake),
+        color="#ef4444",
+        alpha=0.12,
+        interpolate=True,
+    )
+    ax_eq.set_ylabel("Stake Equity (£)")
+    ax_eq.grid(axis="y", color="#e2e8f0", linewidth=0.8)
+    ax_eq.legend(loc="upper left", frameon=True, facecolor="white", framealpha=0.9)
+
+    summary_box = (
+        f"Final Stake: £{final_stake:,.2f}\n"
+        f"Net Profit: £{net_profit:+,.2f}\n"
+        f"Total Return: {total_return_pct:+.2f}%"
+    )
+    ax_eq.text(
+        0.99,
+        0.95,
+        summary_box,
+        transform=ax_eq.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9.5,
+        fontweight="bold",
+        bbox={"boxstyle": "round,pad=0.45", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
+    )
+
+    # --- Bottom Subplot: Burn / Drawdown Curve (%) ---
+    dd_vals = drawdown_pct_series.to_numpy(dtype=np.float64)
+    ax_dd.plot(x_pos, dd_vals, color="#dc2626", linewidth=1.5, label="Drawdown (%)")
+    ax_dd.fill_between(x_pos, dd_vals, 0.0, color="#ef4444", alpha=0.25, label="Burn Period")
+    ax_dd.axhline(0.0, color="#475569", linewidth=1.0)
+    ax_dd.set_ylim(min(-1.0, max_dd_pct * 1.15), 0.5)
+    ax_dd.set_ylabel("Drawdown (%)")
+    ax_dd.set_xlabel("Validation Era (Non-Overlapping Strided)")
+    ax_dd.set_xticks(x_pos[::tick_step])
+    ax_dd.set_xticklabels(era_labels[::tick_step], rotation=40, ha="right", fontsize=8.5)
+    ax_dd.grid(axis="y", color="#e2e8f0", linewidth=0.8)
+    ax_dd.legend(loc="lower left", frameon=True, facecolor="white", framealpha=0.9)
+    ax_dd.text(
+        0.99,
+        0.10,
+        f"Max Drawdown: {max_dd_pct:.2f}% (£{max_dd_gbp:,.2f}) | Worst Era: £{worst_era_gbp:+,.2f}",
+        transform=ax_dd.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=9.0,
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "#fef2f2", "edgecolor": "#fecaca"},
+    )
+
+    fig.suptitle(f"Numerai Staking P&L Dashboard — {title}", fontsize=13.5, fontweight="bold", y=0.98)
+    fig.text(
+        0.5,
+        0.935,
+        f"CORR-only simulation (corr_multiplier={corr_multiplier}, stride={stride} non-overlapping eras, flat NMR/GBP rate, excluding MMC)",
+        ha="center",
+        va="top",
+        fontsize=9.5,
+        color="#475569",
+    )
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
+    if save_path is not None:
+        out_path = Path(save_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, dpi=140)
+    plt.show()
+    return pnl
+
+
 def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
-    """Build a flat candidate results table with percentage score, extended CV metrics, and every hyperparameter expanded into its own column."""
+    """Build a flat candidate results table with percentage score, extended CV metrics, OOF staking P&L scalars, and every hyperparameter expanded into its own column."""
     cv_res = getattr(search_or_results, "cv_results_", search_or_results)
     if not cv_res:
         _CV_FOLD_METRIC_LOG.clear()
@@ -1929,7 +2128,7 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
     if "mean_test_score" in df.columns:
         df["mean_test_corr_pct"] = (df["mean_test_score"].astype(float) * 100.0).round(2)
 
-    # Attach per-candidate extended metrics logged by `candidate_score` during CV folds
+    # Attach per-candidate extended metrics & OOF staking P&L scalars logged by `candidate_score`
     split_cols = sorted(
         [col for col in df.columns if col.startswith("split") and col.endswith("_test_score")],
         key=lambda c: int(c[len("split") : c.index("_test_score")]),
@@ -1949,27 +2148,53 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
             ("mean_forecast_bias", "forecast_bias", 4),
             ("mean_max_drawdown", "max_drawdown", 4),
         )
+        pnl_scalar_keys = (
+            "final_stake",
+            "net_profit",
+            "total_return_pct",
+            "max_drawdown_pct",
+            "max_drawdown_gbp",
+            "worst_era_gbp",
+        )
         used_mask = [False] * len(_CV_FOLD_METRIC_LOG)
         agg_cols: Dict[str, List[float]] = {out_col: [] for out_col, _, _ in metric_specs}
+        pnl_cols: Dict[str, List[float]] = {k: [] for k in pnl_scalar_keys}
         for row_idx in range(len(df)):
-            matched_records: List[Dict[str, float]] = []
+            matched_records: List[Dict[str, Any]] = []
             for s_col in split_cols:
                 score_val = float(df.loc[row_idx, s_col])
                 if not np.isfinite(score_val):
                     continue
                 for log_idx, rec in enumerate(_CV_FOLD_METRIC_LOG):
-                    if not used_mask[log_idx] and abs(rec["numerai_corr"] - score_val) <= 1e-12:
+                    if not used_mask[log_idx] and abs(float(rec["numerai_corr"]) - score_val) <= 1e-12:
                         used_mask[log_idx] = True
                         matched_records.append(rec)
                         break
             for out_col, src_key, decimals in metric_specs:
                 if matched_records:
-                    val = float(np.mean([rec[src_key] for rec in matched_records]))
+                    val = float(np.mean([float(rec[src_key]) for rec in matched_records]))
                     agg_cols[out_col].append(round(val, decimals))
                 else:
                     agg_cols[out_col].append(np.nan)
+            fold_era_corrs = [
+                rec["era_corrs"]
+                for rec in matched_records
+                if isinstance(rec.get("era_corrs"), pd.Series) and len(rec["era_corrs"]) > 0
+            ]
+            if fold_era_corrs:
+                stitched_oof = pd.concat(fold_era_corrs).sort_index()
+                stitched_oof = stitched_oof.loc[~stitched_oof.index.duplicated(keep="last")]
+                oof_stride = _infer_non_overlapping_stride(stitched_oof.index, default_stride=4)
+                oof_pnl = simulate_stake_pnl(stitched_oof, stride=oof_stride)
+                for k in pnl_scalar_keys:
+                    pnl_cols[k].append(round(float(oof_pnl[k]), 2))
+            else:
+                for k in pnl_scalar_keys:
+                    pnl_cols[k].append(np.nan)
         for out_col, vals in agg_cols.items():
             df[out_col] = vals
+        for k, vals in pnl_cols.items():
+            df[k] = vals
     _CV_FOLD_METRIC_LOG.clear()
 
     param_prefixed = [col for col in df.columns if col.startswith("param_")]

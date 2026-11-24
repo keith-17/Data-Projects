@@ -1005,6 +1005,7 @@ def run_baseline(
         deduplicate_param_grid,
         evaluate_numerai_predictions,
         reset_cv_metric_log,
+        simulate_stake_pnl,
         walk_forward_predict,
     )
 
@@ -1045,6 +1046,7 @@ def run_baseline(
 
     default_variant_name = f"{baseline_name} [Default]"
     if eval_mode in ("static", "both"):
+        val_pnl = simulate_stake_pnl(val_eval["numerai_era_corrs"])
         results_entries[default_variant_name] = {
             "variant": default_variant_name,
             "train_corr": train_eval["numerai_corr"],
@@ -1068,6 +1070,12 @@ def run_baseline(
             "jarque_bera_pvalue": val_eval["jarque_bera_pvalue"],
             "feature_exposure": val_eval["feature_exposure"],
             "max_drawdown": val_eval["max_drawdown"],
+            "final_stake": round(float(val_pnl["final_stake"]), 2),
+            "net_profit": round(float(val_pnl["net_profit"]), 2),
+            "total_return_pct": round(float(val_pnl["total_return_pct"]), 2),
+            "max_drawdown_pct": round(float(val_pnl["max_drawdown_pct"]), 2),
+            "max_drawdown_gbp": round(float(val_pnl["max_drawdown_gbp"]), 2),
+            "worst_era_gbp": round(float(val_pnl["worst_era_gbp"]), 2),
             "corr_gap": train_eval["numerai_corr"] - val_eval["numerai_corr"],
             "sanity_status": val_eval["sanity_status"],
             "validation_preds": val_preds,
@@ -1098,6 +1106,7 @@ def run_baseline(
             label=f"{baseline_name} — Walk-Forward Validation Scores",
             verbose=True,
         )
+        wf_pnl = simulate_stake_pnl(wf_eval["numerai_era_corrs"])
         wf_variant_name = f"{baseline_name} [Walk-Forward]"
         results_entries[wf_variant_name] = {
             "variant": wf_variant_name,
@@ -1122,6 +1131,12 @@ def run_baseline(
             "jarque_bera_pvalue": wf_eval["jarque_bera_pvalue"],
             "feature_exposure": wf_eval["feature_exposure"],
             "max_drawdown": wf_eval["max_drawdown"],
+            "final_stake": round(float(wf_pnl["final_stake"]), 2),
+            "net_profit": round(float(wf_pnl["net_profit"]), 2),
+            "total_return_pct": round(float(wf_pnl["total_return_pct"]), 2),
+            "max_drawdown_pct": round(float(wf_pnl["max_drawdown_pct"]), 2),
+            "max_drawdown_gbp": round(float(wf_pnl["max_drawdown_gbp"]), 2),
+            "worst_era_gbp": round(float(wf_pnl["worst_era_gbp"]), 2),
             "corr_gap": train_eval["numerai_corr"] - wf_eval["numerai_corr"],
             "sanity_status": wf_eval["sanity_status"],
             "validation_preds": wf_preds,
