@@ -755,7 +755,7 @@ def load_unity_numerai_data(
     if workspace_dir.name.lower() == "notebooks":
         workspace_dir = workspace_dir.parent
 
-    # 1. Check standard Kaggle mounts (/kaggle/input/datasets/<owner>/<slug>, /kaggle/input/<slug>, nested rglob) or local workspace folders
+    # 1. Check standard Kaggle mounts or local version-matched workspace folders (never recurse into a different version like v5.0!)
     candidate_dirs = (
         Path("/kaggle/input/datasets") / kaggle_dataset,
         Path("/kaggle/input/datasets") / kaggle_dataset / data_version,
@@ -763,9 +763,10 @@ def load_unity_numerai_data(
         Path("/kaggle/input") / f"numerai-data-{data_version.replace('.', '-')}",
         workspace_dir / data_folder / data_version,
         workspace_dir / data_folder / dataset_slug_name,
-        workspace_dir / data_folder,
     )
     data_root: Optional[Path] = next((found for cand in candidate_dirs if (found := _find_dataset_root(cand)) is not None), None)
+    if data_root is None and _has_complete_dataset(workspace_dir / data_folder):
+        data_root = workspace_dir / data_folder
     if data_root is None and Path("/kaggle/input").is_dir():
         data_root = _find_dataset_root(Path("/kaggle/input"))
 
@@ -1026,9 +1027,10 @@ def _source_files_fingerprint(
         Path("/kaggle/input") / f"numerai-data-{data_version.replace('.', '-')}",
         workspace_dir / data_folder / data_version,
         workspace_dir / data_folder / dataset_slug_name,
-        workspace_dir / data_folder,
     )
     data_root = next((found for cand in candidate_dirs if (found := _find_dataset_root(cand)) is not None), None)
+    if data_root is None and _has_complete_dataset(workspace_dir / data_folder):
+        data_root = workspace_dir / data_folder
     if data_root is None and Path("/kaggle/input").is_dir():
         data_root = _find_dataset_root(Path("/kaggle/input"))
     if data_root is None:
@@ -1173,3 +1175,191 @@ def load_unity_numerai_data_cached(
         random_state=random_state,
     )
     return train_df, validation_df, feature_columns, feature_metadata
+
+
+V6_CONTRIBUTION_KEYWORDS: Tuple[str, ...] = ("meta", "benchmark", "neutralizer", "example")
+V6_BENCHMARK_FALLBACK_ORDER: Tuple[str, ...] = (
+    "validation_benchmark_models.parquet",
+    "validation_example_preds.parquet",
+)
+
+
+def discover_and_fetch_v6_meta_or_benchmark(
+    data_version: str = "v6.0",
+    data_folder: str = "data_folder",
+    workspace_root: Optional[Any] = None,
+    auto_download: bool = True,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """List live NumerAPI datasets for `data_version`, fetch true `meta_model.parquet` if published, or fall back honestly to BMC proxy.
+
+    Honesty rules:
+    - Never invents `meta_model.parquet` and never renames a benchmark/example file to `meta_model.parquet`.
+    - If `v6.0/meta_model.parquet` exists, downloads it to `<workspace>/<data_folder>/<data_version>/meta_model.parquet`
+      and returns `basis_kind='true_mmc'`, `basis_label='True MMC / NMMC'`.
+    - Otherwise, prints a clear message that no true Meta Model is published yet, downloads the v6 benchmark/example
+      predictions Parquet (`validation_example_preds.parquet` or `validation_benchmark_models.parquet`) for BMC proxy,
+      and labels it `basis_kind='bmc_proxy'`, `basis_label='BMC proxy (benchmark, NOT true MMC)'`.
+    - If neither file is available locally or downloadable, returns `basis_kind='corr_only'`, `basis_label='CORR only'`.
+    """
+    workspace_dir = Path(workspace_root).resolve() if workspace_root is not None else Path.cwd().resolve()
+    if workspace_dir.name.lower() == "notebooks":
+        workspace_dir = workspace_dir.parent
+
+    save_dir = workspace_dir / data_folder / data_version
+    prefix = f"{data_version}/"
+
+    all_datasets: List[str] = []
+    filtered_datasets: List[str] = []
+    downloaded_files: List[Tuple[str, str]] = []
+    api_error: Optional[str] = None
+    napi = None
+
+    if NumerAPI is not None:
+        try:
+            napi = NumerAPI()
+            all_datasets = sorted([p for p in napi.list_datasets() if str(p).startswith(prefix)])
+            filtered_datasets = [
+                p for p in all_datasets if any(kw in p.lower() for kw in V6_CONTRIBUTION_KEYWORDS)
+            ]
+        except Exception as exc:
+            api_error = f"{type(exc).__name__}: {exc}"
+    else:
+        api_error = "numerapi package is not installed"
+
+    if verbose:
+        print(f"=== NumerAPI Dataset Discovery ({data_version}) ===")
+        if all_datasets:
+            print(f"All {data_version} files found ({len(all_datasets)}):")
+            for item in all_datasets:
+                print(f"  - {item}")
+            print(f"\nFiltered ({', '.join(V6_CONTRIBUTION_KEYWORDS)}) ({len(filtered_datasets)}):")
+            for item in filtered_datasets:
+                print(f"  - {item}")
+        else:
+            print(f"Could not list {data_version} datasets via NumerAPI ({api_error or 'empty response'}).")
+
+    def _find_local_file(filename: str) -> Optional[Path]:
+        candidates = [
+            save_dir / filename,
+            workspace_dir / data_folder / filename,
+        ]
+        if Path("/kaggle/input").is_dir():
+            candidates.extend(sorted(Path("/kaggle/input").rglob(filename)))
+        return next((p for p in candidates if p.is_file()), None)
+
+    # 1. Check for true Meta Model (`v6.0/meta_model.parquet`)
+    meta_remote = f"{prefix}meta_model.parquet"
+    meta_local_path = _find_local_file("meta_model.parquet")
+    if meta_local_path is None and meta_remote in all_datasets and auto_download and napi is not None:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        dest_meta = save_dir / "meta_model.parquet"
+        try:
+            napi.download_dataset(meta_remote, str(dest_meta))
+            if dest_meta.is_file():
+                meta_local_path = dest_meta
+                downloaded_files.append((meta_remote, str(dest_meta)))
+        except Exception as exc:
+            warnings.warn(f"Failed to download {meta_remote}: {exc}")
+
+    if meta_local_path is not None:
+        reason = f"True Meta Model found at {meta_local_path}. True MMC / NMMC can be computed."
+        if verbose:
+            print(f"\n[True MMC / NMMC] {reason}")
+        return {
+            "data_version": data_version,
+            "all_datasets": all_datasets,
+            "filtered_datasets": filtered_datasets,
+            "basis_kind": "true_mmc",
+            "basis_label": "True MMC / NMMC",
+            "meta_model_path": meta_local_path,
+            "benchmark_path": None,
+            "contribution_path": meta_local_path,
+            "mmc_is_proxy": False,
+            "downloaded_files": downloaded_files,
+            "reason": reason,
+        }
+
+    # True meta_model.parquet does NOT exist — never invent or rename another file!
+    no_meta_msg = (
+        f"No {data_version} meta_model.parquet published yet, so true MMC / NMMC cannot be computed in backtest."
+    )
+    if verbose:
+        print(f"\n[MMC Status] {no_meta_msg}")
+
+    # 2. Clean BMC fallback: download v6 benchmark / example predictions file if available
+    benchmark_local_path: Optional[Path] = None
+    chosen_remote: Optional[str] = None
+    for fname in V6_BENCHMARK_FALLBACK_ORDER:
+        local_hit = _find_local_file(fname)
+        if local_hit is not None:
+            benchmark_local_path = local_hit
+            chosen_remote = f"{prefix}{fname}"
+            break
+        remote_name = f"{prefix}{fname}"
+        if remote_name in all_datasets and auto_download and napi is not None:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            dest_bench = save_dir / fname
+            try:
+                if verbose:
+                    print(f"Downloading BMC proxy file: {remote_name} -> {dest_bench}")
+                napi.download_dataset(remote_name, str(dest_bench))
+                if dest_bench.is_file():
+                    benchmark_local_path = dest_bench
+                    chosen_remote = remote_name
+                    downloaded_files.append((remote_name, str(dest_bench)))
+                    break
+            except Exception as exc:
+                warnings.warn(f"Failed to download {remote_name}: {exc}")
+
+    if benchmark_local_path is not None:
+        is_actual_benchmark = "benchmark" in benchmark_local_path.name.lower()
+        if is_actual_benchmark:
+            basis_kind = "bmc_proxy"
+            basis_label = "BMC proxy (benchmark, NOT true MMC)"
+            tag = "BMC Proxy Fallback"
+        else:
+            basis_kind = "example_proxy"
+            basis_label = "Example-model proxy (NOT true MMC / NOT true BMC)"
+            tag = "Example-Model Proxy Fallback"
+        reason = (
+            f"{no_meta_msg} Falling back to {benchmark_local_path.name} (saved at {benchmark_local_path}) "
+            f"to compute {basis_label}."
+        )
+        if verbose:
+            print(f"[{tag}] Using {benchmark_local_path.name} saved at: {benchmark_local_path}")
+            print(f"  -> Basis everywhere will be labeled: {basis_label}")
+        return {
+            "data_version": data_version,
+            "all_datasets": all_datasets,
+            "filtered_datasets": filtered_datasets,
+            "basis_kind": basis_kind,
+            "basis_label": basis_label,
+            "meta_model_path": None,
+            "benchmark_path": benchmark_local_path,
+            "contribution_path": benchmark_local_path,
+            "mmc_is_proxy": True,
+            "downloaded_files": downloaded_files,
+            "chosen_remote": chosen_remote,
+            "reason": reason,
+        }
+
+    reason = (
+        f"{no_meta_msg} No local or downloadable benchmark/example predictions file was found "
+        f"({api_error or 'not available'}). Staking will use CORR only."
+    )
+    if verbose:
+        print(f"[CORR Only] {reason}")
+    return {
+        "data_version": data_version,
+        "all_datasets": all_datasets,
+        "filtered_datasets": filtered_datasets,
+        "basis_kind": "corr_only",
+        "basis_label": "CORR only",
+        "meta_model_path": None,
+        "benchmark_path": None,
+        "contribution_path": None,
+        "mmc_is_proxy": False,
+        "downloaded_files": downloaded_files,
+        "reason": reason,
+    }

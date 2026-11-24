@@ -1,3 +1,5 @@
 - Do not put functions (`def`) in any notebook.
 - Do not use `.iloc` anywhere (notebooks or Python modules).
 - Never put `import` or `from ... import ...` statements anywhere outside the top imports cell (Cell 1) of any Jupyter notebook. All imports must live at the very top of the notebook.
+- Try not to reinvent the wheel and research packages that can  be used for the task and if so how can they be used.
+- If running tests, use a small slice of data like 1%

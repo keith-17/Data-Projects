@@ -53,3 +53,4 @@ cmi_internet_use/submission.csv
 cmi_internet_use/Src/__pycache__/
 numerai/src/__pycache__/
 numerai/tests/__pycache__/
+numerai/results_numerai_v6.0_all_eras_stride4_baselines_ae_target_bayes/

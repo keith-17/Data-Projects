@@ -13,7 +13,19 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from numerai_tools.scoring import correlation_contribution, numerai_corr
+from numerai_tools.scoring import (
+    correlation_contribution,
+    numerai_corr,
+    sharpe_ratio as numerai_sharpe_ratio,
+    spearman_correlation as numerai_spearman_correlation,
+)
+
+try:
+    from numereval import numereval as _numereval_mod
+    NUMEREVAL_AVAILABLE = True
+except ImportError:
+    _numereval_mod = None
+    NUMEREVAL_AVAILABLE = False
 from scipy import stats
 from scipy.stats import spearmanr
 from sklearn.base import BaseEstimator, TransformerMixin, clone
@@ -1058,17 +1070,16 @@ NumeraiSequenceExtractor = NumeraiExtractions
 # ---------------------------------------------------------------------------
 
 def sharpe_ratio(corrs: pd.Series) -> float:
-    """Calculate the Numerai Sharpe ratio across per-era correlations (`corrs.mean() / corrs.std()`)."""
-    if len(corrs) == 0:
+    """Calculate the Numerai Sharpe ratio across per-era correlations via `numerai_tools.scoring.sharpe_ratio` (with zero-variance guard)."""
+    clean = pd.Series(corrs, dtype=np.float64).dropna()
+    if len(clean) == 0 or float(np.std(clean)) <= 1e-12:
         return 0.0
-    std_val = float(corrs.std())
-    if not np.isfinite(std_val) or std_val <= 1e-12:
-        std_val = float(corrs.std(ddof=0))
-    return float(corrs.mean() / std_val) if std_val > 1e-12 else 0.0
+    val = float(numerai_sharpe_ratio(clean))
+    return val if np.isfinite(val) else 0.0
 
 
 def compute_per_era_spearman_corr(y_true: Any, y_pred: Any, eras: Optional[Any] = None) -> pd.Series:
-    """Compute per-era Spearman rank correlation (`spearmanr(target, prediction)[0]`) matching the Numerai starter notebook."""
+    """Compute per-era Spearman rank correlation via `numerai_tools.scoring.spearman_correlation`."""
     targets = np.asarray(y_true, dtype=np.float64).ravel()
     preds = np.asarray(y_pred, dtype=np.float64).ravel()
     era_arr = np.ones(len(targets), dtype=np.int32) if eras is None else np.asarray(eras).ravel()
@@ -1085,7 +1096,7 @@ def compute_per_era_spearman_corr(y_true: Any, y_pred: Any, eras: Optional[Any] 
         if _is_constant_1d(p_arr) or _is_constant_1d(t_arr):
             era_scores[era_key] = 0.0
         else:
-            corr_val = float(spearmanr(t_arr, p_arr)[0])
+            corr_val = float(numerai_spearman_correlation(valid_df["target"], valid_df["prediction"]))
             era_scores[era_key] = corr_val if np.isfinite(corr_val) else 0.0
     return pd.Series(era_scores, dtype=np.float64)
 
@@ -2064,15 +2075,21 @@ def compute_per_era_mmc(
     meta_model_path: Optional[Union[str, Path]] = None,
     era_col: str = "era",
     target_col: str = "target",
+    *,
+    benchmark_path: Optional[Union[str, Path]] = None,
+    is_benchmark_proxy: bool = False,
 ) -> Optional[pd.Series]:
-    """Compute per-era Meta Model Contribution (MMC) via `numerai_tools.scoring.correlation_contribution`.
+    """Compute per-era MMC (against true `meta_model.parquet`) or BMC proxy (against v6 benchmark/example preds).
 
-    Merges `meta_model.parquet` onto `validation_df` by `id` (or index) and computes per-era MMC
-    with zero-variance guards. Returns `None` gracefully when `meta_model_path` is unavailable.
+    Supports joining by `id` (classic v4/v5) OR by `('date', 'numerai_ticker')` (v6.0 Unity Parquets, which
+    use `numerai_ticker` + `date` + `signal` without an `id` column). Returns `None` gracefully when no
+    reference file is available. Never relabels a BMC proxy series as true MMC.
     """
-    if meta_model_path is None:
+    active_path_raw = meta_model_path if meta_model_path is not None else benchmark_path
+    use_proxy = bool(is_benchmark_proxy or (meta_model_path is None and benchmark_path is not None))
+    if active_path_raw is None:
         return None
-    meta_path = Path(meta_model_path)
+    meta_path = Path(active_path_raw)
     if not meta_path.is_file():
         return None
     if era_col not in validation_df.columns or target_col not in validation_df.columns:
@@ -2086,65 +2103,83 @@ def compute_per_era_mmc(
     if meta_df.empty:
         return None
 
-    meta_col = (
-        "numerai_meta_model"
-        if "numerai_meta_model" in meta_df.columns
-        else next(
-            (
-                str(c)
-                for c in meta_df.columns
-                if str(c) not in ("id", era_col, "date", "data_type")
-                and pd.api.types.is_numeric_dtype(meta_df[c])
-            ),
-            None,
-        )
-    )
-    if meta_col is None:
+    meta_ignore = {"id", era_col, "date", "data_type", "numerai_ticker"}
+    numeric_candidates = [
+        str(c)
+        for c in meta_df.columns
+        if str(c) not in meta_ignore and pd.api.types.is_numeric_dtype(meta_df[c])
+    ]
+    if "numerai_meta_model" in meta_df.columns:
+        ref_series = pd.to_numeric(meta_df["numerai_meta_model"], errors="coerce")
+    elif "signal" in meta_df.columns:
+        ref_series = pd.to_numeric(meta_df["signal"], errors="coerce")
+    elif "prediction" in meta_df.columns:
+        ref_series = pd.to_numeric(meta_df["prediction"], errors="coerce")
+    elif len(numeric_candidates) == 1:
+        ref_series = pd.to_numeric(meta_df[numeric_candidates[0]], errors="coerce")
+    elif len(numeric_candidates) > 1:
+        # Multi-column benchmark Parquet (e.g. validation_benchmark_models.parquet): equal-weight mean across benchmarks
+        ref_series = meta_df[numeric_candidates].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+    else:
         return None
 
-    work_cols = [era_col, target_col] + (["id"] if "id" in validation_df.columns else [])
+    ref_col_name = "_ref_model_signal_"
+    meta_join_cols = [c for c in ("id", "date", "numerai_ticker") if c in meta_df.columns]
+    meta_slim = meta_df[meta_join_cols].copy()
+    meta_slim[ref_col_name] = ref_series.to_numpy(dtype=np.float64)
+
+    work_cols = [era_col, target_col] + [c for c in ("id", "date", "numerai_ticker") if c in validation_df.columns]
     work_df = validation_df[work_cols].copy()
     work_df["prediction"] = pred_arr
 
-    if "id" in work_df.columns and "id" in meta_df.columns:
-        merged = work_df.merge(
-            meta_df[["id", meta_col]].rename(columns={meta_col: "numerai_meta_model"}),
-            on="id",
-            how="inner",
-        )
+    if "id" in work_df.columns and "id" in meta_slim.columns:
+        merged = work_df.merge(meta_slim[["id", ref_col_name]], on="id", how="inner")
     elif "id" in work_df.columns and meta_df.index.name == "id":
-        merged = work_df.merge(
-            meta_df[[meta_col]].rename(columns={meta_col: "numerai_meta_model"}),
-            left_on="id",
-            right_index=True,
-            how="inner",
+        meta_idx_df = pd.DataFrame({ref_col_name: ref_series.to_numpy(dtype=np.float64)}, index=meta_df.index)
+        merged = work_df.merge(meta_idx_df, left_on="id", right_index=True, how="inner")
+    elif (
+        "date" in work_df.columns
+        and "numerai_ticker" in work_df.columns
+        and "date" in meta_slim.columns
+        and "numerai_ticker" in meta_slim.columns
+    ):
+        work_df["_join_date_"] = pd.to_datetime(work_df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        work_df["_join_ticker_"] = work_df["numerai_ticker"].astype(str)
+        meta_slim["_join_date_"] = pd.to_datetime(meta_slim["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        meta_slim["_join_ticker_"] = meta_slim["numerai_ticker"].astype(str)
+        meta_dedup = meta_slim[["_join_date_", "_join_ticker_", ref_col_name]].drop_duplicates(
+            subset=["_join_date_", "_join_ticker_"], keep="last"
         )
+        merged = work_df.merge(meta_dedup, on=["_join_date_", "_join_ticker_"], how="inner")
+    elif ("date" in meta_slim.columns and "numerai_ticker" in meta_slim.columns) or ("id" in meta_slim.columns):
+        # Refuse silent RangeIndex alignment across mismatched schemas (e.g. v5.0 validation_df vs v6.0 benchmark Parquet)
+        return None
     else:
-        meta_aligned = meta_df[meta_col].reindex(work_df.index)
+        meta_aligned = ref_series.reindex(work_df.index)
         merged = work_df.copy()
-        merged["numerai_meta_model"] = meta_aligned.to_numpy(dtype=np.float64)
+        merged[ref_col_name] = meta_aligned.to_numpy(dtype=np.float64)
 
-    merged = merged.dropna(subset=["prediction", "numerai_meta_model", target_col])
+    merged = merged.dropna(subset=["prediction", ref_col_name, target_col])
     if merged.empty:
         return None
 
-    def _safe_era_mmc(grp: pd.DataFrame) -> float:
+    def _safe_era_contrib(grp: pd.DataFrame) -> float:
         p = grp["prediction"].to_numpy(dtype=np.float64, copy=False)
-        m = grp["numerai_meta_model"].to_numpy(dtype=np.float64, copy=False)
+        m = grp[ref_col_name].to_numpy(dtype=np.float64, copy=False)
         t = grp[target_col].to_numpy(dtype=np.float64, copy=False)
         if len(t) < 2 or _is_constant_1d(p) or _is_constant_1d(m) or _is_constant_1d(t):
             return 0.0
         val = float(
             correlation_contribution(
                 grp[["prediction"]],
-                grp["numerai_meta_model"].rename("numerai_meta_model"),
+                grp[ref_col_name].rename("numerai_meta_model"),
                 grp[target_col],
             ).to_numpy(dtype=np.float64)[0]
         )
         return val if np.isfinite(val) else 0.0
 
-    mmc_series = merged.groupby(era_col, sort=True).apply(_safe_era_mmc, include_groups=False)
-    return mmc_series.astype(np.float64).rename("mmc")
+    contrib_series = merged.groupby(era_col, sort=True).apply(_safe_era_contrib, include_groups=False)
+    return contrib_series.astype(np.float64).rename("bmc_proxy" if use_proxy else "mmc")
 
 
 R1393_START_ERA = 1393
@@ -2194,6 +2229,7 @@ def _compute_clipped_era_returns(
     per_era_mmc: Optional[pd.Series] = None,
     per_era_ncorr: Optional[pd.Series] = None,
     per_era_nmmc: Optional[pd.Series] = None,
+    mmc_is_proxy: bool = False,
     corr_weight: Optional[float] = None,
     mmc_weight: Optional[float] = None,
     payout_factor: Union[float, pd.Series] = 1.0,
@@ -2214,11 +2250,15 @@ def _compute_clipped_era_returns(
       `min(1, 2 / (1 + exp(10 * (mean_neutral_churn - 0.1))))` after multipliers and clipping; burns stay unchanged.
       Rounds 1393–1398 have no churn penalty.
 
-    Honesty rule: never pretends CORR is NCORR and never pretends missing MMC is zero.
+    Honesty rule: never pretends CORR is NCORR, never pretends missing MMC is zero, and never labels
+    BMC proxy (computed against benchmark/example predictions) as true MMC.
     """
     use_diagnostics = per_era_ncorr is not None and len(per_era_ncorr) > 0
     primary_corr = per_era_ncorr if use_diagnostics else per_era_corr
     primary_mmc = per_era_nmmc if use_diagnostics else per_era_mmc
+    is_proxy = bool(mmc_is_proxy) or (
+        isinstance(primary_mmc, pd.Series) and str(primary_mmc.name or "").strip().lower() == "bmc_proxy"
+    )
 
     corr_series = pd.Series(primary_corr, dtype=np.float64).dropna().sort_index()
     step = max(1, int(stride))
@@ -2227,8 +2267,10 @@ def _compute_clipped_era_returns(
     if len(corr_series) == 0:
         return pd.Series(dtype=np.float64), {
             "has_mmc": False,
+            "mmc_is_proxy": False,
             "mmc_status": "missing",
-            "score_basis": "CORR only (missing MMC)",
+            "basis_short": "CORR only",
+            "score_basis": "CORR only (no True MMC / NMMC)",
             "payout_rule_summary": "none",
             "churn_status": "missing (not applied)",
             "used_diagnostics_ncorr": bool(use_diagnostics),
@@ -2289,7 +2331,14 @@ def _compute_clipped_era_returns(
         missing_mmc_eras = int(mmc_aligned.isna().sum())
         mmc_arr = mmc_aligned.fillna(0.0).to_numpy(dtype=np.float64)
         raw_score = corr_w_arr * corr_arr + mmc_w_arr * mmc_arr
-        mmc_status = "present" if missing_mmc_eras == 0 else f"partial ({missing_mmc_eras}/{n_eras} missing)"
+        if is_proxy:
+            mmc_status = (
+                "bmc_proxy (benchmark, NOT true MMC)"
+                if missing_mmc_eras == 0
+                else f"bmc_proxy partial ({missing_mmc_eras}/{n_eras} missing)"
+            )
+        else:
+            mmc_status = "present" if missing_mmc_eras == 0 else f"partial ({missing_mmc_eras}/{n_eras} missing)"
     else:
         raw_score = corr_w_arr * corr_arr
         mmc_status = "missing"
@@ -2335,28 +2384,42 @@ def _compute_clipped_era_returns(
     else:
         churn_status = "missing (not applied)" if np.any(is_r1399_mask) else "not applicable (all eras < 1399)"
 
-    # Honest score basis and payout rule summary
+    # Honest score basis and payout rule summary (never label BMC as MMC)
     if use_diagnostics:
-        score_basis = "Diagnostics NCORR + NMMC" if has_mmc else "Diagnostics NCORR only (missing NMMC)"
-    else:
-        if has_mmc:
-            score_basis = "CORR + MMC (raw, not NCORR/NMMC)"
+        if has_mmc and not is_proxy:
+            basis_short = "True MMC / NMMC"
+            score_basis = "True MMC / NMMC (Diagnostics NCORR + NMMC)"
+        elif has_mmc and is_proxy:
+            basis_short = "BMC proxy"
+            score_basis = "BMC proxy (benchmark, NOT true MMC)"
         else:
-            score_basis = "CORR only (missing MMC)"
+            basis_short = "CORR only"
+            score_basis = "CORR only (Diagnostics NCORR only — missing True NMMC)"
+    else:
+        if has_mmc and is_proxy:
+            basis_short = "BMC proxy"
+            score_basis = "BMC proxy (benchmark, NOT true MMC)"
+        elif has_mmc:
+            basis_short = "True MMC / NMMC"
+            score_basis = "True MMC / NMMC (CORR + MMC)"
+        else:
+            basis_short = "CORR only"
+            score_basis = "CORR only (no True MMC / NMMC)"
 
+    contrib_tag = "BMC_proxy" if is_proxy else ("NMMC" if use_diagnostics else "MMC")
     n_r1393 = int(is_r1393_mask.sum())
     n_pre = n_eras - n_r1393
     if n_r1393 == 0:
         payout_rule_summary = (
-            f"Pre-1393: {corr_w_arr[0]:g}xCORR + {mmc_w_arr[0]:g}xMMC, clip [{c_min_arr[0]*100:.0f}%, +{c_max_arr[0]*100:.0f}%]"
+            f"Pre-1393: {corr_w_arr[0]:g}xCORR + {mmc_w_arr[0]:g}x{contrib_tag}, clip [{c_min_arr[0]*100:.0f}%, +{c_max_arr[0]*100:.0f}%]"
             if has_mmc
-            else f"Pre-1393 (CORR only, missing MMC): {corr_w_arr[0]:g}xCORR, clip [{c_min_arr[0]*100:.0f}%, +{c_max_arr[0]*100:.0f}%]"
+            else f"Pre-1393 (CORR only): {corr_w_arr[0]:g}xCORR, clip [{c_min_arr[0]*100:.0f}%, +{c_max_arr[0]*100:.0f}%]"
         )
     elif n_pre == 0:
         payout_rule_summary = (
-            f"R1393+: {corr_w_arr[0]:g}x{'NCORR' if use_diagnostics else 'CORR'} + {mmc_w_arr[0]:g}x{'NMMC' if use_diagnostics else 'MMC'}, clip [{c_min_arr[0]*100:.0f}%, +{c_max_arr[0]*100:.0f}%]"
+            f"R1393+: {corr_w_arr[0]:g}x{'NCORR' if use_diagnostics else 'CORR'} + {mmc_w_arr[0]:g}x{contrib_tag}, clip [{c_min_arr[0]*100:.0f}%, +{c_max_arr[0]*100:.0f}%]"
             if has_mmc
-            else f"R1393+ (CORR only, missing MMC): {corr_w_arr[0]:g}x{'NCORR' if use_diagnostics else 'CORR'}, clip [{c_min_arr[0]*100:.0f}%, +{c_max_arr[0]*100:.0f}%]"
+            else f"R1393+ (CORR only): {corr_w_arr[0]:g}x{'NCORR' if use_diagnostics else 'CORR'}, clip [{c_min_arr[0]*100:.0f}%, +{c_max_arr[0]*100:.0f}%]"
         )
     else:
         payout_rule_summary = (
@@ -2365,7 +2428,9 @@ def _compute_clipped_era_returns(
 
     meta = {
         "has_mmc": bool(has_mmc),
+        "mmc_is_proxy": bool(has_mmc and is_proxy),
         "mmc_status": mmc_status,
+        "basis_short": basis_short,
         "score_basis": score_basis,
         "payout_rule_summary": payout_rule_summary,
         "churn_status": churn_status,
@@ -2478,12 +2543,129 @@ def _simulate_single_wallet_path(
     return equity_path, round_pnls, money_dd_pct, max_dd_val, worst_round, wiped_out
 
 
+def _extract_path_drawdown_markers(eq_path: np.ndarray, start_cap: float) -> Dict[str, Any]:
+    """Extract peak, worst-trough, drawdown %, and final balance markers for a single simulated wallet path."""
+    arr = np.asarray(eq_path, dtype=np.float64).ravel()
+    if len(arr) == 0:
+        return {
+            "equity_path": arr,
+            "peak_idx": 0,
+            "peak_val": float(start_cap),
+            "trough_idx": 0,
+            "trough_val": float(start_cap),
+            "max_drawdown_pct": 0.0,
+            "final_val": float(start_cap),
+        }
+    running_peak = np.maximum.accumulate(np.maximum(float(start_cap), arr))
+    dd_pct = np.where(running_peak > 0.0, ((arr - running_peak) / running_peak) * 100.0, 0.0)
+    dd_pct = np.clip(dd_pct, -100.0, 0.0)
+    trough_idx = int(np.argmin(dd_pct))
+    trough_val = float(arr[trough_idx])
+    peak_slice = arr[: trough_idx + 1]
+    if len(peak_slice) > 0 and float(np.max(peak_slice)) >= float(start_cap):
+        peak_idx = int(np.argmax(peak_slice))
+        peak_val = float(arr[peak_idx])
+    else:
+        peak_idx = 0
+        peak_val = float(start_cap)
+    return {
+        "equity_path": arr,
+        "peak_idx": peak_idx,
+        "peak_val": peak_val,
+        "trough_idx": trough_idx,
+        "trough_val": trough_val,
+        "max_drawdown_pct": float(dd_pct[trough_idx]),
+        "final_val": float(arr[-1]),
+    }
+
+
+def _build_mc_plain_english_report(
+    *,
+    title: str,
+    start_cap: float,
+    median_final: float,
+    p05_final: float,
+    p95_final: float,
+    prob_profit_pct: float,
+    prob_ruin_pct: float,
+    p95_dd_pct: float,
+    n_sims: int,
+    staking_mode: str,
+    score_basis: str,
+) -> Dict[str, str]:
+    """Build plain-English verdict, drawdown explainer, and verdict-first summary lines for Monte Carlo output."""
+    med_ret_pct = ((median_final - start_cap) / start_cap) * 100.0 if start_cap > 1e-12 else 0.0
+    prob_loss_pct = max(0.0, 100.0 - prob_profit_pct)
+    mode_label = "Compounding" if str(staking_mode).lower() == "compound" else "Constant Stake"
+    is_flat = abs(median_final - start_cap) <= 1e-6 and prob_profit_pct <= 1e-6 and abs(p95_final - start_cap) <= 1e-6
+
+    if is_flat:
+        verdict_status = "flat"
+        verdict_text = (
+            f"VERDICT: Flat / NO active signal. Median finish £{median_final:,.2f} from £{start_cap:,.0f} start (+0.0%). "
+            f"0.0% of {n_sims:,} simulated paths make money (model outputs a constant prediction)."
+        )
+    elif median_final < start_cap or prob_profit_pct < 50.0:
+        verdict_status = "loss"
+        verdict_text = (
+            f"VERDICT: Median path LOSES money. Median finish £{median_final:,.2f} from £{start_cap:,.0f} start ({med_ret_pct:+.1f}%). "
+            f"Only {prob_profit_pct:.1f}% of {n_sims:,} simulated paths finish above £{start_cap:,.0f} "
+            f"({prob_loss_pct:.1f}% lose money). This model is NOT profitable on average in simulation."
+        )
+    else:
+        verdict_status = "profit"
+        verdict_text = (
+            f"VERDICT: Median path MAKES money. Median finish £{median_final:,.2f} from £{start_cap:,.0f} start ({med_ret_pct:+.1f}%). "
+            f"{prob_profit_pct:.1f}% of {n_sims:,} simulated paths finish above £{start_cap:,.0f} "
+            f"({prob_loss_pct:.1f}% lose money)."
+        )
+
+    abs_dd = abs(p95_dd_pct)
+    drawdown_line = (
+        f"What drawdown means: 95% Worst Dip {p95_dd_pct:.2f}% means in 95% of paths the worst fall from peak was "
+        f"{abs_dd:.2f}% or less — this is NOT the final loss."
+    )
+    summary_line = (
+        f"{title} [One-Wallet MC | {score_basis} | {mode_label}] | "
+        f"P(Profit): {prob_profit_pct:.1f}% ({prob_loss_pct:.1f}% lose) | "
+        f"Median (50th): £{median_final:,.2f} ({med_ret_pct:+.1f}%) | "
+        f"5th Pct: £{p05_final:,.2f} | 95th Pct: £{p95_final:,.2f} | "
+        f"95% Worst Dip: {p95_dd_pct:.2f}% | P(Ruin): {prob_ruin_pct:.1f}%"
+    )
+    explainer_text = (
+        "How to read Drawdown vs Final Balance (Plain English):\n"
+        "  • Drawdown is the biggest peak-to-trough dip DURING the journey — NOT your final profit or loss.\n"
+        "  • Worked example (Winning path with a drawdown): Start £1,000 -> rises to £1,200 peak -> dips to £1,100 "
+        "(-8.3% drawdown from peak) -> recovers to £1,300. You still finish +£300 ABOVE £1,000 despite the dip.\n"
+        "  • Worked example (Losing path with a small drawdown): Start £1,000 -> drifts down to £955 (-4.5% dip) "
+        "and ends at £984.81. A small drawdown still finishes BELOW £1,000 if it never recovers.\n"
+        "  • Median (50th) vs 95th percentile are DIFFERENT paths: Median = typical path; 95th = lucky top 5% of paths.\n"
+        "  • One-Wallet MC: Simulates ONE continuous wallet from start to finish over the full validation period with no resets.\n"
+        "  • Within-Window MC: Simulates separate, reset windows (e.g. rolling sub-period pots) — a different test that is never mixed with One-Wallet MC.\n"
+        f"  • Sizing rule in this One-Wallet run: {mode_label}. "
+        + (
+            "Compounding resizes each round's stake as your wallet grows, so a path can climb very high, suffer a huge "
+            "peak-to-trough drawdown (e.g. -91.8% from a high peak), and STILL finish above £1,000."
+            if str(staking_mode).lower() == "compound"
+            else "Constant Stake keeps each round's stake fixed at Start / R (no compounding)."
+        )
+    )
+    return {
+        "mc_verdict_status": verdict_status,
+        "mc_verdict_text": verdict_text,
+        "mc_drawdown_explanation_line": drawdown_line,
+        "mc_summary_line": summary_line,
+        "mc_explainer_text": explainer_text,
+    }
+
+
 def simulate_stake_pnl(
     per_era_corr: pd.Series,
     per_era_mmc: Optional[pd.Series] = None,
     *,
     per_era_ncorr: Optional[pd.Series] = None,
     per_era_nmmc: Optional[pd.Series] = None,
+    mmc_is_proxy: bool = False,
     total_capital: Optional[float] = None,
     initial_stake: float = 1000.0,
     concurrent_rounds: int = CLASSIC_CONCURRENT_ROUNDS,
@@ -2525,6 +2707,7 @@ def simulate_stake_pnl(
         per_era_mmc=per_era_mmc,
         per_era_ncorr=per_era_ncorr,
         per_era_nmmc=per_era_nmmc,
+        mmc_is_proxy=mmc_is_proxy,
         corr_weight=corr_weight,
         mmc_weight=mmc_weight,
         payout_factor=payout_factor,
@@ -2669,6 +2852,7 @@ def simulate_stake_pnl_monte_carlo(
     *,
     per_era_ncorr: Optional[pd.Series] = None,
     per_era_nmmc: Optional[pd.Series] = None,
+    mmc_is_proxy: bool = False,
     total_capital: Optional[float] = None,
     initial_stake: float = 1000.0,
     concurrent_rounds: int = CLASSIC_CONCURRENT_ROUNDS,
@@ -2686,11 +2870,14 @@ def simulate_stake_pnl_monte_carlo(
     n_sims: int = 500,
     block_size: int = 4,
     random_state: int = 42,
+    title: str = "Model",
 ) -> Dict[str, Any]:
     """One-wallet block-bootstrap Monte Carlo simulator under Numerai Classic overlapping-rounds staking.
 
     Resamples blocks of per-round returns over the full validation horizon and simulates one continuous
-    wallet per path (TVL / 64 per round, no resets, no margin, equity >= 0).
+    wallet per path (TVL / 64 per round, no resets, no margin, equity >= 0). Also captures one example
+    losing path and one example winning path (with peak, trough, drawdown, and final markers) plus
+    plain-English verdict and drawdown explanations.
     """
     start_cap = max(0.0, float(total_capital if total_capital is not None else initial_stake))
     clean_mode = str(staking_mode or "compound").strip().lower()
@@ -2702,6 +2889,7 @@ def simulate_stake_pnl_monte_carlo(
         per_era_mmc=per_era_mmc,
         per_era_ncorr=per_era_ncorr,
         per_era_nmmc=per_era_nmmc,
+        mmc_is_proxy=mmc_is_proxy,
         corr_weight=corr_weight,
         mmc_weight=mmc_weight,
         payout_factor=payout_factor,
@@ -2713,6 +2901,19 @@ def simulate_stake_pnl_monte_carlo(
         stride=stride,
     )
     if len(era_returns) == 0:
+        report = _build_mc_plain_english_report(
+            title=title,
+            start_cap=start_cap,
+            median_final=start_cap,
+            p05_final=start_cap,
+            p95_final=start_cap,
+            prob_profit_pct=0.0,
+            prob_ruin_pct=0.0,
+            p95_dd_pct=0.0,
+            n_sims=int(n_sims),
+            staking_mode=clean_mode,
+            score_basis=str(meta["score_basis"]),
+        )
         return {
             "start_capital": start_cap,
             "actual_end_capital": start_cap,
@@ -2725,7 +2926,11 @@ def simulate_stake_pnl_monte_carlo(
             "mc_p95_money_drawdown_pct": 0.0,
             "final_stakes": np.empty(0, dtype=np.float64),
             "money_drawdowns_pct": np.empty(0, dtype=np.float64),
+            "staking_mode": clean_mode,
+            "example_losing_path": None,
+            "example_winning_path": None,
             **meta,
+            **report,
         }
 
     ret_arr = era_returns.to_numpy(dtype=np.float64)
@@ -2743,6 +2948,7 @@ def simulate_stake_pnl_monte_carlo(
     final_wallets = np.zeros(n_s, dtype=np.float64)
     worst_dds_pct = np.zeros(n_s, dtype=np.float64)
     ruin_flags = np.zeros(n_s, dtype=bool)
+    sim_paths = np.zeros((n_s, n_t), dtype=np.float64)
 
     for s_idx in range(n_s):
         eq_path, _, dd_pct, _, _, wiped = _simulate_single_wallet_path(
@@ -2752,6 +2958,7 @@ def simulate_stake_pnl_monte_carlo(
             concurrent_rounds=concurrent_rounds,
             settlement_rounds=settlement_rounds,
         )
+        sim_paths[s_idx] = eq_path
         final_wallets[s_idx] = float(eq_path[-1])
         worst_dds_pct[s_idx] = float(dd_pct)
         ruin_flags[s_idx] = bool(wiped)
@@ -2764,24 +2971,64 @@ def simulate_stake_pnl_monte_carlo(
         settlement_rounds=settlement_rounds,
     )
 
+    # Pick one representative losing path and one representative winning path for visual drawdown vs final balance explainer
+    losing_indices = np.flatnonzero(final_wallets < start_cap - 1e-9)
+    winning_indices = np.flatnonzero(final_wallets > start_cap + 1e-9)
+    example_losing_path: Optional[Dict[str, Any]] = None
+    example_winning_path: Optional[Dict[str, Any]] = None
+    if len(losing_indices) > 0:
+        med_loss_target = float(np.median(final_wallets[losing_indices]))
+        pick_loss = int(losing_indices[int(np.argmin(np.abs(final_wallets[losing_indices] - med_loss_target)))])
+        example_losing_path = _extract_path_drawdown_markers(sim_paths[pick_loss], start_cap)
+    if len(winning_indices) > 0:
+        med_win_target = float(np.median(final_wallets[winning_indices]))
+        pick_win = int(winning_indices[int(np.argmin(np.abs(final_wallets[winning_indices] - med_win_target)))])
+        example_winning_path = _extract_path_drawdown_markers(sim_paths[pick_win], start_cap)
+
+    p05_val = float(np.percentile(final_wallets, 5.0))
+    med_val = float(np.percentile(final_wallets, 50.0))
+    mean_val = float(np.mean(final_wallets))
+    p95_val = float(np.percentile(final_wallets, 95.0))
+    prob_profit = float(np.mean(final_wallets > start_cap) * 100.0)
+    prob_ruin = float(np.mean(ruin_flags) * 100.0)
+    p95_dd = float(np.percentile(worst_dds_pct, 5.0))
+
+    report = _build_mc_plain_english_report(
+        title=title,
+        start_cap=start_cap,
+        median_final=med_val,
+        p05_final=p05_val,
+        p95_final=p95_val,
+        prob_profit_pct=prob_profit,
+        prob_ruin_pct=prob_ruin,
+        p95_dd_pct=p95_dd,
+        n_sims=n_s,
+        staking_mode=clean_mode,
+        score_basis=str(meta["score_basis"]),
+    )
+
     return {
         "start_capital": start_cap,
         "actual_end_capital": float(actual_eq[-1]),
         "actual_money_drawdown_pct": float(actual_dd_pct),
-        "mc_p05_final_stake": float(np.percentile(final_wallets, 5.0)),
-        "mc_median_final_stake": float(np.percentile(final_wallets, 50.0)),
-        "mc_mean_final_stake": float(np.mean(final_wallets)),
-        "mc_p95_final_stake": float(np.percentile(final_wallets, 95.0)),
-        "mc_prob_profit_pct": float(np.mean(final_wallets > start_cap) * 100.0),
-        "mc_prob_ruin_pct": float(np.mean(ruin_flags) * 100.0),
-        "mc_p95_money_drawdown_pct": float(np.percentile(worst_dds_pct, 5.0)),
+        "mc_p05_final_stake": p05_val,
+        "mc_median_final_stake": med_val,
+        "mc_mean_final_stake": mean_val,
+        "mc_p95_final_stake": p95_val,
+        "mc_prob_profit_pct": prob_profit,
+        "mc_prob_ruin_pct": prob_ruin,
+        "mc_p95_money_drawdown_pct": p95_dd,
         "final_stakes": final_wallets,
         "money_drawdowns_pct": worst_dds_pct,
         "n_sims": n_s,
         "block_size": b_size,
         "concurrent_rounds": int(concurrent_rounds),
         "settlement_rounds": int(settlement_rounds),
+        "staking_mode": clean_mode,
+        "example_losing_path": example_losing_path,
+        "example_winning_path": example_winning_path,
         **meta,
+        **report,
     }
 
 
@@ -2791,6 +3038,7 @@ def plot_stake_pnl_dashboard(
     per_era_mmc: Optional[pd.Series] = None,
     per_era_ncorr: Optional[pd.Series] = None,
     per_era_nmmc: Optional[pd.Series] = None,
+    mmc_is_proxy: bool = False,
     title: str = "Model",
     total_capital: Optional[float] = None,
     initial_stake: float = 1000.0,
@@ -2810,7 +3058,7 @@ def plot_stake_pnl_dashboard(
     nmr_gbp_prices: Optional[pd.Series] = None,
     save_path: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Plot a clean ONE-WALLET staking equity curve over the full validation period (no resets, no 7-pots chart)."""
+    """Plot a clean ONE-WALLET staking equity curve over the full validation period (clearly labeled by basis & compounding mode)."""
     import matplotlib.pyplot as plt
 
     pnl = simulate_stake_pnl(
@@ -2818,6 +3066,7 @@ def plot_stake_pnl_dashboard(
         per_era_mmc=per_era_mmc,
         per_era_ncorr=per_era_ncorr,
         per_era_nmmc=per_era_nmmc,
+        mmc_is_proxy=mmc_is_proxy,
         total_capital=total_capital,
         initial_stake=initial_stake,
         concurrent_rounds=concurrent_rounds,
@@ -2844,6 +3093,7 @@ def plot_stake_pnl_dashboard(
     dd_pct = float(pnl["money_drawdown_pct"])
     dd_gbp = float(pnl["max_drawdown_gbp"])
     worst_round = float(pnl["worst_round_gbp"])
+    mode_label = "Compounding" if str(pnl["staking_mode"]).lower() == "compound" else "Constant Stake"
 
     fig, ax = plt.subplots(figsize=(14.5, 5.8), facecolor="white")
     ax.set_facecolor("white")
@@ -2852,7 +3102,7 @@ def plot_stake_pnl_dashboard(
     y_vals = eq_series.to_numpy(dtype=np.float64)
     line_color = "#059669" if end_cap >= start_cap else "#dc2626"
 
-    ax.plot(x_vals, y_vals, color=line_color, linewidth=2.2, label="One Wallet (£)")
+    ax.plot(x_vals, y_vals, color=line_color, linewidth=2.2, label=f"One Wallet ({mode_label}, £)")
     ax.axhline(start_cap, color="#64748b", linestyle="--", linewidth=1.2, alpha=0.85, label=f"Start (£{start_cap:,.0f})")
     ax.set_ylim(bottom=0.0)
     ax.set_xlabel("Time (Validation Era / Week)")
@@ -2862,20 +3112,24 @@ def plot_stake_pnl_dashboard(
     ax.spines["right"].set_visible(False)
     ax.legend(loc="upper left", frameon=True, facecolor="white", framealpha=0.92, fontsize=9.2)
 
-    # Big headline strip with ONLY the 3 core numbers + worst single round
     headline_text = (
         f"Start: £{start_cap:,.0f}     |     "
         f"End: £{end_cap:,.2f} ({pnl['total_return_pct']:+.2f}%)     |     "
-        f"Worst dip: {dd_pct:.2f}% (£{dd_gbp:,.2f})"
+        f"Worst peak-to-trough dip: {dd_pct:.2f}% (£{dd_gbp:,.2f})"
     )
-    fig.suptitle(f"One-Wallet Staking Equity Curve — {title}", fontsize=13.5, fontweight="bold", y=0.985)
+    fig.suptitle(
+        f"One-Wallet Staking ({mode_label}) — {title}  [{pnl['score_basis']}]",
+        fontsize=13.0,
+        fontweight="bold",
+        y=0.985,
+    )
     fig.text(
         0.5,
         0.925,
         headline_text,
         ha="center",
         va="top",
-        fontsize=12.5,
+        fontsize=12.0,
         fontweight="bold",
         color="#0f172a",
         bbox={"boxstyle": "round,pad=0.38", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
@@ -2883,11 +3137,12 @@ def plot_stake_pnl_dashboard(
     fig.text(
         0.5,
         0.02,
-        f"Worst single round: £{worst_round:+,.2f} | Per-round stake: TVL/{concurrent_rounds} (£{pnl['per_round_stake_initial']:.2f} initial, {settlement_rounds}-era lock) | "
-        f"{pnl['score_basis']} | {pnl['payout_rule_summary']} | FX: {pnl['fx_status']}",
+        f"Basis: {pnl['score_basis']} | Worst single round: £{worst_round:+,.2f} | "
+        f"Stake: TVL/{concurrent_rounds} (£{pnl['per_round_stake_initial']:.2f} initial, {settlement_rounds}-era lock, {mode_label}) | "
+        f"{pnl['payout_rule_summary']} | FX: {pnl['fx_status']}",
         ha="center",
         va="bottom",
-        fontsize=8.6,
+        fontsize=8.4,
         color="#475569",
     )
     plt.tight_layout(rect=(0.0, 0.055, 1.0, 0.865))
@@ -2905,6 +3160,7 @@ def plot_stake_pnl_monte_carlo(
     per_era_mmc: Optional[pd.Series] = None,
     per_era_ncorr: Optional[pd.Series] = None,
     per_era_nmmc: Optional[pd.Series] = None,
+    mmc_is_proxy: bool = False,
     title: str = "Model",
     total_capital: Optional[float] = None,
     initial_stake: float = 1000.0,
@@ -2925,7 +3181,7 @@ def plot_stake_pnl_monte_carlo(
     random_state: int = 42,
     save_path: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Plot the distribution of final ONE-WALLET values from block-bootstrap Monte Carlo simulation."""
+    """Plot a plain-English 2-panel ONE-WALLET Monte Carlo risk chart with a verdict-first banner and example paths."""
     import matplotlib.pyplot as plt
 
     mc = simulate_stake_pnl_monte_carlo(
@@ -2933,6 +3189,7 @@ def plot_stake_pnl_monte_carlo(
         per_era_mmc=per_era_mmc,
         per_era_ncorr=per_era_ncorr,
         per_era_nmmc=per_era_nmmc,
+        mmc_is_proxy=mmc_is_proxy,
         total_capital=total_capital,
         initial_stake=initial_stake,
         concurrent_rounds=concurrent_rounds,
@@ -2950,6 +3207,7 @@ def plot_stake_pnl_monte_carlo(
         n_sims=n_sims,
         block_size=block_size,
         random_state=random_state,
+        title=title,
     )
     finals = np.asarray(mc["final_stakes"], dtype=np.float64)
     if len(finals) == 0:
@@ -2957,51 +3215,164 @@ def plot_stake_pnl_monte_carlo(
 
     start_cap = float(mc["start_capital"])
     actual_end = float(mc["actual_end_capital"])
+    med_val = float(mc["mc_median_final_stake"])
+    p05_val = float(mc["mc_p05_final_stake"])
+    p95_val = float(mc["mc_p95_final_stake"])
+    prob_profit = float(mc["mc_prob_profit_pct"])
+    prob_loss = max(0.0, 100.0 - prob_profit)
+    mode_label = "Compounding" if str(mc["staking_mode"]).lower() == "compound" else "Constant Stake"
 
-    fig, ax = plt.subplots(figsize=(13.5, 5.4), facecolor="white")
-    ax.set_facecolor("white")
+    verdict_status = str(mc.get("mc_verdict_status", "flat"))
+    if verdict_status == "loss":
+        banner_bg, banner_edge, banner_fg = "#fef2f2", "#dc2626", "#991b1b"
+    elif verdict_status == "profit":
+        banner_bg, banner_edge, banner_fg = "#ecfdf5", "#059669", "#065f46"
+    else:
+        banner_bg, banner_edge, banner_fg = "#f8fafc", "#64748b", "#334155"
 
-    ax.hist(finals, bins=35, color="#059669", alpha=0.62, edgecolor="white", label=f"Simulated Final Wallet (n={mc['n_sims']:,})")
-    ax.axvline(start_cap, color="#475569", linestyle="--", linewidth=1.5, label=f"Start (£{start_cap:,.0f})")
-    ax.axvline(actual_end, color="#1d4ed8", linestyle="-", linewidth=2.0, label=f"Actual End (£{actual_end:,.2f})")
-    ax.axvline(float(mc["mc_p05_final_stake"]), color="#dc2626", linestyle=":", linewidth=1.8, label=f"5th Pct (£{mc['mc_p05_final_stake']:,.2f})")
-    ax.set_xlim(left=0.0)
-    ax.set_xlabel("Final One-Wallet Balance (£)")
-    ax.set_ylabel("Simulated Paths")
-    ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.legend(loc="upper right", frameon=True, facecolor="white", framealpha=0.92, fontsize=9.0)
-
-    summary_box = (
-        f"Start: £{start_cap:,.0f} | Actual End: £{actual_end:,.2f}\n"
-        f"MC 5th / Median / 95th: £{mc['mc_p05_final_stake']:,.2f} / £{mc['mc_median_final_stake']:,.2f} / £{mc['mc_p95_final_stake']:,.2f}\n"
-        f"P(Profit): {mc['mc_prob_profit_pct']:.1f}% | P(Ruin): {mc['mc_prob_ruin_pct']:.1f}% | 95% Worst Dip: {mc['mc_p95_money_drawdown_pct']:.2f}%"
+    fig, (ax_hist, ax_paths) = plt.subplots(
+        1, 2, figsize=(16.5, 6.8), facecolor="white", gridspec_kw={"width_ratios": [1.15, 1.0]}
     )
-    ax.text(
-        0.02,
-        0.95,
-        summary_box,
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=8.8,
+    for ax in (ax_hist, ax_paths):
+        ax.set_facecolor("white")
+        ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    # --- Left Panel: Final Balance Distribution with Red (Loss < Start) vs Green (Profit > Start) shading ---
+    f_min = float(np.min(finals))
+    f_max = float(np.max(finals))
+    span = max(f_max - f_min, start_cap * 0.04)
+    x_lo = max(0.0, min(f_min, start_cap) - 0.08 * span)
+    x_hi = max(f_max, start_cap) + 0.08 * span
+
+    ax_hist.axvspan(x_lo, start_cap, color="#fee2e2", alpha=0.35, zorder=0, label=f"Losing zone (< £{start_cap:,.0f}: {prob_loss:.1f}%)")
+    ax_hist.axvspan(start_cap, x_hi, color="#dcfce7", alpha=0.35, zorder=0, label=f"Winning zone (> £{start_cap:,.0f}: {prob_profit:.1f}%)")
+
+    if f_max - f_min <= 1e-6:
+        ax_hist.bar([start_cap], [len(finals)], width=max(10.0, start_cap * 0.02), color="#64748b", alpha=0.8, edgecolor="white")
+    else:
+        counts, bin_edges = np.histogram(finals, bins=32)
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        bin_widths = np.diff(bin_edges)
+        bar_colors = ["#dc2626" if c < start_cap else "#059669" for c in bin_centers]
+        ax_hist.bar(bin_centers, counts, width=bin_widths * 0.92, color=bar_colors, alpha=0.78, edgecolor="white", zorder=2)
+
+    ax_hist.axvline(start_cap, color="#0f172a", linestyle="--", linewidth=1.8, zorder=4, label=f"Start (£{start_cap:,.0f})")
+    ax_hist.axvline(med_val, color="#b91c1c" if med_val < start_cap else "#047857", linestyle="-", linewidth=2.3, zorder=5, label=f"Median / 50th (£{med_val:,.2f})")
+    ax_hist.axvline(p05_val, color="#991b1b", linestyle=":", linewidth=1.6, zorder=4, label=f"5th Pct (£{p05_val:,.2f})")
+    ax_hist.axvline(p95_val, color="#15803d", linestyle=":", linewidth=1.6, zorder=4, label=f"95th Pct (£{p95_val:,.2f})")
+    ax_hist.axvline(actual_end, color="#1d4ed8", linestyle="-.", linewidth=1.5, zorder=4, label=f"Actual Path End (£{actual_end:,.2f})")
+
+    ax_hist.set_xlim(x_lo, x_hi)
+    ax_hist.set_xlabel("Final One-Wallet Balance (£)")
+    ax_hist.set_ylabel(f"Number of Simulated Paths (out of {mc['n_sims']:,})")
+    ax_hist.set_title(f"Final Wallet Distribution — {prob_profit:.1f}% Win / {prob_loss:.1f}% Lose", fontsize=11.5, fontweight="bold", pad=8)
+    ax_hist.legend(loc="upper right", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.3)
+
+    # --- Right Panel: Example Losing Path vs Example Winning Path (Peak, Drawdown Dip, Final) ---
+    lose_ex = mc.get("example_losing_path")
+    win_ex = mc.get("example_winning_path")
+    ax_paths.axhline(start_cap, color="#0f172a", linestyle="--", linewidth=1.4, label=f"Start (£{start_cap:,.0f})")
+
+    def _plot_example_path(ex: Dict[str, Any], color: str, tag: str) -> None:
+        arr = np.asarray(ex["equity_path"], dtype=np.float64)
+        steps = np.arange(len(arr))
+        pk_i, pk_v = int(ex["peak_idx"]), float(ex["peak_val"])
+        tr_i, tr_v = int(ex["trough_idx"]), float(ex["trough_val"])
+        fn_v = float(ex["final_val"])
+        dd_v = float(ex["max_drawdown_pct"])
+        ax_paths.plot(steps, arr, color=color, linewidth=1.9, alpha=0.9, label=f"{tag}: End £{fn_v:,.0f} (Max Dip {dd_v:.1f}%)")
+        ax_paths.scatter([pk_i], [pk_v], color=color, marker="^", s=65, zorder=5)
+        ax_paths.scatter([tr_i], [tr_v], color=color, marker="v", s=65, zorder=5)
+        ax_paths.scatter([len(arr) - 1], [fn_v], color=color, marker="o", s=55, zorder=5)
+        if tr_i > pk_i and pk_v > tr_v:
+            ax_paths.plot([pk_i, tr_i], [pk_v, tr_v], color=color, linestyle=":", linewidth=1.3, alpha=0.85)
+        ax_paths.annotate(
+            f"Peak £{pk_v:,.0f}",
+            xy=(pk_i, pk_v),
+            xytext=(0, 8),
+            textcoords="offset points",
+            ha="center",
+            fontsize=7.8,
+            fontweight="bold",
+            color=color,
+        )
+        ax_paths.annotate(
+            f"Dip {dd_v:.1f}%\n(£{tr_v:,.0f})",
+            xy=(tr_i, tr_v),
+            xytext=(0, -20),
+            textcoords="offset points",
+            ha="center",
+            fontsize=7.6,
+            color=color,
+        )
+        ax_paths.annotate(
+            f"Final £{fn_v:,.0f}",
+            xy=(len(arr) - 1, fn_v),
+            xytext=(-6, 6),
+            textcoords="offset points",
+            ha="right",
+            fontsize=7.8,
+            fontweight="bold",
+            color=color,
+        )
+
+    if lose_ex is not None:
+        _plot_example_path(lose_ex, "#dc2626", "Example Losing Path")
+    if win_ex is not None:
+        _plot_example_path(win_ex, "#059669", "Example Winning Path")
+    if lose_ex is None and win_ex is None:
+        ax_paths.text(
+            0.5,
+            0.5,
+            f"All {mc['n_sims']:,} simulated paths stayed flat at £{start_cap:,.2f}\n(constant prediction — zero active signal).",
+            transform=ax_paths.transAxes,
+            ha="center",
+            va="center",
+            fontsize=10.0,
+            color="#475569",
+            bbox={"boxstyle": "round,pad=0.5", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
+        )
+
+    ax_paths.set_xlabel("Simulated Week (Era Step)")
+    ax_paths.set_ylabel("One-Wallet Balance (£)")
+    ax_paths.set_title("Drawdown (Mid-Path Dip) vs Final Balance — Example Paths", fontsize=11.5, fontweight="bold", pad=8)
+    ax_paths.legend(loc="best", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.3)
+
+    # --- Top Suptitle, Plain-English Verdict Banner, & Bottom Drawdown Footnote ---
+    import textwrap
+
+    wrapped_verdict = textwrap.fill(str(mc["mc_verdict_text"]), width=110)
+    fig.suptitle(
+        f"One-Wallet Monte Carlo — {title}  [{mc['score_basis']}]",
+        fontsize=13.0,
         fontweight="bold",
-        bbox={"boxstyle": "round,pad=0.42", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
+        y=0.985,
     )
-
-    fig.suptitle(f"One-Wallet Monte Carlo Final Balance Distribution — {title}", fontsize=13.2, fontweight="bold", y=0.985)
     fig.text(
         0.5,
-        0.92,
-        f"Full-horizon single wallet (TVL/{concurrent_rounds}, {settlement_rounds}-era lock, no resets) | "
-        f"{mc['score_basis']} | {mc['payout_rule_summary']} | block_size={mc['block_size']}",
+        0.935,
+        wrapped_verdict,
         ha="center",
         va="top",
-        fontsize=8.8,
-        color="#475569",
+        fontsize=9.6,
+        fontweight="bold",
+        color=banner_fg,
+        bbox={"boxstyle": "round,pad=0.45", "facecolor": banner_bg, "edgecolor": banner_edge, "linewidth": 1.6},
     )
-    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.89))
+    fig.text(
+        0.5,
+        0.015,
+        f"{mc['mc_drawdown_explanation_line']}  |  "
+        f"One-Wallet MC (continuous wallet, no resets; {mode_label} sizing TVL/{concurrent_rounds}, {settlement_rounds}-era lock, block_size={mc['block_size']})  |  "
+        f"Basis: {mc['score_basis']}",
+        ha="center",
+        va="bottom",
+        fontsize=8.2,
+        color="#334155",
+    )
+    plt.tight_layout(rect=(0.0, 0.055, 1.0, 0.835))
     if save_path is not None:
         out_path = Path(save_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3665,3 +4036,43 @@ def plot_error_bin_waterfall(
         target_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(target_path, dpi=140)
     plt.show()
+
+
+def run_numereval_diagnostics(
+    y_true: Any,
+    y_pred: Any,
+    eras: Any,
+    *,
+    variant_name: str = "Model",
+    plot: bool = False,
+    verbose: bool = True,
+) -> Optional[pd.DataFrame]:
+    """Optional side-by-side community `numereval` (Council of Elders) diagnostics companion.
+
+    Note: `numereval` uses classic Spearman rank correlation and is NOT the official v6.0 Unity
+    `numerai_corr` / `NMMC` / staking metric. It runs alongside `numerai_tools` when installed
+    and returns `None` gracefully when `numereval` is unavailable (e.g. default Kaggle runtime).
+    """
+    if not NUMEREVAL_AVAILABLE or _numereval_mod is None:
+        if verbose:
+            print(
+                "[numereval companion] Not installed in this environment (optional). "
+                "Install with: pip install --no-deps git+https://github.com/councilofelders/numereval.git"
+            )
+        return None
+
+    eval_df = pd.DataFrame({
+        "era": np.asarray(eras).ravel(),
+        "target": np.asarray(y_true, dtype=np.float64).ravel(),
+        "prediction": np.asarray(y_pred, dtype=np.float64).ravel(),
+    }).dropna(subset=["era", "target", "prediction"])
+    if eval_df.empty:
+        return None
+
+    metrics_df = _numereval_mod.evaluate(eval_df, plot=plot, feature_exposure=False)
+    if verbose:
+        print(
+            f"[numereval companion — {variant_name}] Community Spearman diagnostics "
+            "(informational alongside official numerai_tools v6.0 metrics; NOT official v6.0 NCORR/NMMC):"
+        )
+    return metrics_df
