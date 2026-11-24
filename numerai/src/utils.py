@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -1233,9 +1234,9 @@ def evaluate_numerai_predictions(
             np.maximum.accumulate(np.insert(cumulative_corr.to_numpy(), 0, 0.0))[1:],
             index=cumulative_corr.index,
         )
-        max_drawdown = float(np.round((running_peak - cumulative_corr).max(), 4))
+        corr_drawdown = float(np.round((running_peak - cumulative_corr).max(), 4))
     else:
-        max_drawdown = 0.0
+        corr_drawdown = 0.0
 
     feature_exposure = (
         compute_feature_exposure(features_df, preds, feature_columns=feature_columns)
@@ -1273,6 +1274,7 @@ def evaluate_numerai_predictions(
         print(f"Spearman Correlation: {spearman_mean:.4f}")
         print(f"Average Payout: {payout_mean:.4f}")
         print(f"Sharpe Ratio (Numerai / Spearman): {numerai_sharpe:.4f} / {spearman_sharpe:.4f}")
+        print(f"Cumulative CORR Drawdown (CORR pts): {corr_drawdown:.4f}")
         print(f"Mean Absolute Error (MAE): {mae_val:.4f}")
         print(f"Forecast Bias (mean(y - y_hat)): {forecast_bias:.4f}")
         print(f"Directional Hit Rate (vs 0.5): {directional_hit_rate:.4f} ({directional_accuracy_pct:.1f}%)")
@@ -1307,7 +1309,7 @@ def evaluate_numerai_predictions(
         "era_corr_skew": era_corr_skew,
         "era_corr_kurtosis": era_corr_kurtosis,
         "jarque_bera_pvalue": jarque_bera_pvalue,
-        "max_drawdown": max_drawdown,
+        "corr_drawdown": corr_drawdown,
         "feature_exposure": feature_exposure,
         "sanity_status": sanity_status,
         "numerai_era_corrs": numerai_era_corrs,
@@ -1507,6 +1509,7 @@ def infer_target_horizon_eras(target_col: str) -> int:
 
 
 VALID_DOWNSAMPLE_MODES = (None, "within_era", "recent", "earliest", "uniform", "random_eras")
+VALID_SCORE_VERSIONS = ("v0_default", "v1_skepta", "v2_skepta_mmc")
 
 
 def build_experiment_setup(
@@ -1517,6 +1520,7 @@ def build_experiment_setup(
     model_tag: str = "baselines_ae",
     baseline_mode: Optional[str] = None,
     search_mode: str = "bayes",
+    score_version: str = "v0_default",
     eval_mode: str = "both",
     n_splits: int = 1,
     cv_split: float = 0.8,
@@ -1559,6 +1563,7 @@ def build_experiment_setup(
 ) -> Dict[str, Any]:
     """Validate experiment knobs, auto-infer horizon/embargo, configure binning & caches, and return full Setup namespace."""
     clean_search = str(search_mode).strip().lower()
+    clean_score_version = str(score_version or "v0_default").strip().lower()
     clean_cv = str(cv_strategy).strip().lower()
     clean_eval = str(eval_mode).strip().lower()
     clean_wf_win = str(walk_forward_window).strip().lower()
@@ -1576,6 +1581,8 @@ def build_experiment_setup(
         raise ValueError("baseline_mode must be 'baseline_a', 'baseline_e', 'persistence', 'both', or 'all'")
     if clean_search not in ("grid", "bayes"):
         raise ValueError("search_mode must be 'grid' or 'bayes'")
+    if clean_score_version not in VALID_SCORE_VERSIONS:
+        raise ValueError(f"score_version must be one of {VALID_SCORE_VERSIONS}, got {score_version!r}")
     if clean_cv != "timeseries":
         raise ValueError("cv_strategy must be 'timeseries' (non-chronological CV strategies removed to prevent regime leakage)")
     if not (0.0 < cv_split_val < 1.0):
@@ -1654,6 +1661,7 @@ def build_experiment_setup(
         "data_folder": data_folder,
         "kaggle_dataset": kaggle_dataset,
         "search_mode": clean_search,
+        "score_version": clean_score_version,
         "cv_strategy": clean_cv,
         "n_splits": int(n_splits),
         "cv_split": cv_split_val,
@@ -1837,11 +1845,71 @@ def reset_cv_metric_log() -> None:
     _CV_FOLD_METRIC_LOG.clear()
 
 
-def candidate_score(estimator: Any, X: pd.DataFrame, y: Any) -> float:
-    """Official per-era `numerai_corr` scorer for `GridSearchCV` / `BayesSearchCV`, logging extended fold metrics for `build_quick_results_df`.
+def compute_versioned_candidate_score(
+    era_corrs: Union[pd.Series, np.ndarray, Sequence[float]],
+    era_mmcs: Optional[Union[pd.Series, np.ndarray, Sequence[float]]] = None,
+    score_version: str = "v0_default",
+) -> Tuple[float, str, bool]:
+    """Compute a versioned CV selection score from per-era CORR and optional per-era MMC.
 
-    When `estimator__walk_forward_step_eras` is set to a positive integer, evaluates the CV fold using
-    leak-free `walk_forward_predict` respecting `target_horizon_eras` settlement lag; otherwise scores statically.
+    Versions:
+    - `v0_default`: `mean(era_corrs)` (legacy behavior)
+    - `v1_skepta`: `mean(era_corrs) - 0.5 * std(era_corrs)` (rewards mean + stability)
+    - `v2_skepta_mmc`: `mean(era_corrs) + 2.0 * mean(era_mmcs) - 0.5 * std(era_corrs)`
+      Only used when real `era_mmcs` is available; if MMC is missing, falls back to `v1_skepta`
+      and sets `mmc_missing_fallback=True`.
+
+    Returns `(score_value, effective_score_version, mmc_missing_fallback)`.
+    """
+    req_version = str(score_version or "v0_default").strip().lower()
+    if req_version not in VALID_SCORE_VERSIONS:
+        raise ValueError(f"Unsupported score_version {score_version!r}; expected one of {VALID_SCORE_VERSIONS}.")
+
+    corr_s = pd.Series(era_corrs, dtype=np.float64).dropna()
+    if len(corr_s) == 0:
+        eff_ver = "v1_skepta" if req_version == "v2_skepta_mmc" and era_mmcs is None else req_version
+        return 0.0, eff_ver, bool(req_version == "v2_skepta_mmc" and era_mmcs is None)
+
+    mean_corr = float(corr_s.mean())
+    if not np.isfinite(mean_corr):
+        mean_corr = 0.0
+    std_corr = float(corr_s.std(ddof=1)) if len(corr_s) >= 2 else 0.0
+    if not np.isfinite(std_corr):
+        std_corr = 0.0
+
+    if req_version == "v0_default":
+        return mean_corr, "v0_default", False
+
+    if req_version == "v1_skepta":
+        return float(mean_corr - 0.5 * std_corr), "v1_skepta", False
+
+    # v2_skepta_mmc
+    mmc_s = pd.Series(era_mmcs, dtype=np.float64).dropna() if era_mmcs is not None else pd.Series(dtype=np.float64)
+    if len(mmc_s) == 0:
+        print("  [Score Warning] score_version='v2_skepta_mmc' requested but MMC is missing; falling back to 'v1_skepta'.")
+        return float(mean_corr - 0.5 * std_corr), "v1_skepta", True
+
+    mean_mmc = float(mmc_s.mean())
+    if not np.isfinite(mean_mmc):
+        print("  [Score Warning] score_version='v2_skepta_mmc' requested but MMC is non-finite; falling back to 'v1_skepta'.")
+        return float(mean_corr - 0.5 * std_corr), "v1_skepta", True
+
+    return float(mean_corr + 2.0 * mean_mmc - 0.5 * std_corr), "v2_skepta_mmc", False
+
+
+def candidate_score(
+    estimator: Any,
+    X: pd.DataFrame,
+    y: Any,
+    *,
+    score_version: str = "v0_default",
+    era_mmcs: Optional[pd.Series] = None,
+) -> float:
+    """Versioned per-era scorer for `GridSearchCV` / `BayesSearchCV`, logging extended fold metrics for `build_quick_results_df`.
+
+    Defaults to `score_version='v0_default'` (`mean(era_corrs)`) for backwards compatibility.
+    Supports `'v1_skepta'` (`mean_corr - 0.5 * std_corr`) and `'v2_skepta_mmc'`
+    (`mean_corr + 2 * mean_mmc - 0.5 * std_corr`, falling back to `'v1_skepta'` when MMC is missing).
     """
     targets = np.asarray(y, dtype=np.float64).ravel()
     eras = X["era"].to_numpy() if isinstance(X, pd.DataFrame) and "era" in X.columns else None
@@ -1885,8 +1953,22 @@ def candidate_score(estimator: Any, X: pd.DataFrame, y: Any) -> float:
     era_corrs = compute_per_era_numerai_corr(targets, preds, eras=eras)
     spearman_era_corrs = compute_per_era_spearman_corr(targets, preds, eras=eras)
 
+    fold_mmcs: Optional[pd.Series] = None
+    if era_mmcs is not None and len(era_mmcs) > 0:
+        fold_mmcs = pd.Series(era_mmcs, dtype=np.float64).reindex(era_corrs.index).dropna()
+        if len(fold_mmcs) == 0:
+            fold_mmcs = None
+
+    score_val, effective_version, mmc_fallback = compute_versioned_candidate_score(
+        era_corrs,
+        era_mmcs=fold_mmcs,
+        score_version=score_version,
+    )
+
     mean_corr = float(era_corrs.mean()) if len(era_corrs) else 0.0
     mean_corr = mean_corr if np.isfinite(mean_corr) else 0.0
+    std_corr = float(era_corrs.std(ddof=1)) if len(era_corrs) >= 2 else 0.0
+    std_corr = std_corr if np.isfinite(std_corr) else 0.0
     spearman_mean = float(spearman_era_corrs.mean()) if len(spearman_era_corrs) else 0.0
     spearman_mean = spearman_mean if np.isfinite(spearman_mean) else 0.0
     sharpe_val = float(sharpe_ratio(era_corrs))
@@ -1913,31 +1995,51 @@ def candidate_score(estimator: Any, X: pd.DataFrame, y: Any) -> float:
             np.maximum.accumulate(np.insert(cumulative_corr.to_numpy(), 0, 0.0))[1:],
             index=cumulative_corr.index,
         )
-        max_dd = float((running_peak - cumulative_corr).max())
+        corr_dd = float((running_peak - cumulative_corr).max())
     else:
-        max_dd = 0.0
+        corr_dd = 0.0
 
     bin_shares = compute_error_bin_shares(targets, preds)
 
     _CV_FOLD_METRIC_LOG.append({
+        "score_version": effective_version,
+        "requested_score_version": str(score_version or "v0_default").strip().lower(),
+        "mmc_missing_fallback": bool(mmc_fallback),
+        "score_value": float(score_val),
         "numerai_corr": mean_corr,
+        "era_corr_std": std_corr,
         "positive_era_pct": pos_era_pct,
         "directional_accuracy_pct": dir_acc_pct,
         "sharpe": sharpe_val,
         "spearman": spearman_mean,
         "mae": mae_val,
         "forecast_bias": bias_val,
-        "max_drawdown": max_dd,
+        "corr_drawdown": corr_dd,
         "era_corrs": era_corrs,
         **bin_shares,
     })
 
     print(
-        f"  [Fold Score] Numerai CORR: {mean_corr * 100.0:+.2f}% ({mean_corr:.4f}) | "
-        f"Sharpe: {sharpe_val:.2f} | Positive Eras: {pos_era_pct:.1f}% | "
-        f"Dir Acc: {dir_acc_pct:.1f}% | Accurate Bin: {bin_shares['accurate_pct']:.1f}% | MAE: {mae_val:.4f}"
+        f"  [Fold Score | {effective_version}] Score: {score_val:.4f} | "
+        f"Numerai CORR: {mean_corr * 100.0:+.2f}% ({mean_corr:.4f}, std={std_corr:.4f}) | "
+        f"Sharpe: {sharpe_val:.2f} | CORR DD: {corr_dd:.4f} | Positive Eras: {pos_era_pct:.1f}% | "
+        f"Dir Acc: {dir_acc_pct:.1f}% | MAE: {mae_val:.4f}"
     )
-    return mean_corr
+    return float(score_val)
+
+
+def make_candidate_scorer(
+    score_version: str = "v0_default",
+    *,
+    era_mmcs: Optional[pd.Series] = None,
+) -> Any:
+    """Create a picklable `GridSearchCV`/`BayesSearchCV` scorer bound to `score_version`."""
+    clean_ver = str(score_version or "v0_default").strip().lower()
+    if clean_ver not in VALID_SCORE_VERSIONS:
+        raise ValueError(f"Unsupported score_version {score_version!r}; expected one of {VALID_SCORE_VERSIONS}.")
+    if clean_ver == "v0_default" and era_mmcs is None:
+        return candidate_score
+    return partial(candidate_score, score_version=clean_ver, era_mmcs=era_mmcs)
 
 
 def _infer_non_overlapping_stride(era_index: pd.Index, default_stride: int = 4) -> int:
@@ -2045,204 +2147,434 @@ def compute_per_era_mmc(
     return mmc_series.astype(np.float64).rename("mmc")
 
 
+R1393_START_ERA = 1393
+R1399_START_ERA = 1399
+CLASSIC_CONCURRENT_ROUNDS = 64
+CLASSIC_SETTLEMENT_ROUNDS = 12
+
+
+def _parse_era_numbers(era_index: pd.Index) -> np.ndarray:
+    """Parse era labels (integers or `'era1234'` strings) into float64 era numbers (NaN if unparseable)."""
+    raw = pd.Index(era_index)
+    numeric = pd.to_numeric(raw, errors="coerce")
+    if not numeric.isna().any():
+        return numeric.to_numpy(dtype=np.float64)
+    cleaned = [str(v).strip().lower().removeprefix("era") for v in raw]
+    return pd.to_numeric(pd.Index(cleaned), errors="coerce").to_numpy(dtype=np.float64)
+
+
+def compute_r1399_churn_retention(
+    mean_neutral_churn: Union[float, np.ndarray, pd.Series],
+) -> Union[float, np.ndarray, pd.Series]:
+    """Official Numerai R1399+ neutral-churn retained payout fraction.
+
+    Formula: `min(1.0, 2.0 / (1.0 + exp(10.0 * (mean_neutral_churn - 0.1))))`.
+    Applied only to positive payouts after multipliers and clipping, starting at round 1399.
+    """
+    if isinstance(mean_neutral_churn, pd.Series):
+        vals = pd.to_numeric(mean_neutral_churn, errors="coerce").to_numpy(dtype=np.float64)
+        clipped_exp = np.exp(np.clip(10.0 * (vals - 0.1), -60.0, 60.0))
+        ret = np.minimum(1.0, 2.0 / (1.0 + clipped_exp))
+        ret = np.where(np.isfinite(vals), ret, 1.0)
+        return pd.Series(ret, index=mean_neutral_churn.index, dtype=np.float64)
+    if isinstance(mean_neutral_churn, np.ndarray):
+        vals = np.asarray(mean_neutral_churn, dtype=np.float64)
+        clipped_exp = np.exp(np.clip(10.0 * (vals - 0.1), -60.0, 60.0))
+        ret = np.minimum(1.0, 2.0 / (1.0 + clipped_exp))
+        return np.where(np.isfinite(vals), ret, 1.0)
+    val = float(mean_neutral_churn)
+    if not np.isfinite(val):
+        return 1.0
+    return float(min(1.0, 2.0 / (1.0 + np.exp(np.clip(10.0 * (val - 0.1), -60.0, 60.0)))))
+
+
 def _compute_clipped_era_returns(
     per_era_corr: pd.Series,
     *,
     per_era_mmc: Optional[pd.Series] = None,
-    corr_weight: float = 8.0,
-    mmc_weight: float = 32.0,
+    per_era_ncorr: Optional[pd.Series] = None,
+    per_era_nmmc: Optional[pd.Series] = None,
+    corr_weight: Optional[float] = None,
+    mmc_weight: Optional[float] = None,
     payout_factor: Union[float, pd.Series] = 1.0,
-    clip_min: float = -0.25,
-    clip_max: float = 0.25,
+    clip_min: Optional[float] = None,
+    clip_max: Optional[float] = None,
+    neutral_churn: Optional[Union[float, pd.Series]] = None,
     churn_penalty: Optional[Union[float, pd.Series]] = None,
-    stride: int = 4,
+    payout_rule: str = "auto",
+    stride: int = 1,
     corr_multiplier: Optional[float] = None,
-) -> Tuple[pd.Series, bool]:
-    """Compute chronologically sorted Numerai Round 1393+ payout returns per non-overlapping round.
+) -> Tuple[pd.Series, Dict[str, Any]]:
+    """Compute chronologically sorted per-round Numerai Classic payout returns using era-accurate rules.
 
-    Official Classic R1393+ formula:
-        weighted_score_t = corr_weight * NCORR_t + mmc_weight * NMMC_t   (8 * NCORR + 32 * NMMC)
-        return_t = clip(payout_factor_t * weighted_score_t, clip_min=-1.0, clip_max=+2.0)
-    Optional R1399+ neutral-churn penalty reduces positive payouts only after clipping.
+    Official rules (`payout_rule='auto'`):
+    - Pre-round 1393 (`era < 1393`): `clip(3 * CORR60 + 15 * MMC60, -1.0, +1.0)`.
+    - Round 1393+ (`era >= 1393`): `clip(payout_factor * (8 * NCORR + 32 * NMMC), -1.0, +2.0)` with `payout_factor=1.0`.
+    - Round 1399+ (`era >= 1399`): if `neutral_churn` is provided, positive payouts are multiplied by
+      `min(1, 2 / (1 + exp(10 * (mean_neutral_churn - 0.1))))` after multipliers and clipping; burns stay unchanged.
+      Rounds 1393–1398 have no churn penalty.
+
+    Honesty rule: never pretends CORR is NCORR and never pretends missing MMC is zero.
     """
-    corr_series = pd.Series(per_era_corr, dtype=np.float64).dropna().sort_index()
+    use_diagnostics = per_era_ncorr is not None and len(per_era_ncorr) > 0
+    primary_corr = per_era_ncorr if use_diagnostics else per_era_corr
+    primary_mmc = per_era_nmmc if use_diagnostics else per_era_mmc
+
+    corr_series = pd.Series(primary_corr, dtype=np.float64).dropna().sort_index()
     step = max(1, int(stride))
     if step > 1 and len(corr_series) > 0:
         corr_series = corr_series.loc[corr_series.index[::step]]
     if len(corr_series) == 0:
-        return pd.Series(dtype=np.float64), False
+        return pd.Series(dtype=np.float64), {
+            "has_mmc": False,
+            "mmc_status": "missing",
+            "score_basis": "CORR only (missing MMC)",
+            "payout_rule_summary": "none",
+            "churn_status": "missing (not applied)",
+            "used_diagnostics_ncorr": bool(use_diagnostics),
+        }
 
-    eff_corr_w = float(corr_multiplier) if corr_multiplier is not None else float(corr_weight)
-    has_mmc = per_era_mmc is not None and len(per_era_mmc) > 0
+    idx = corr_series.index
+    n_eras = len(idx)
+    era_nums = _parse_era_numbers(idx)
+    clean_rule = str(payout_rule or "auto").strip().lower()
+    if clean_rule not in ("auto", "pre_1393", "r1393"):
+        raise ValueError(f"payout_rule must be 'auto', 'pre_1393', or 'r1393', got {payout_rule!r}")
+
+    if clean_rule == "pre_1393":
+        is_r1393_mask = np.zeros(n_eras, dtype=bool)
+    elif clean_rule == "r1393":
+        is_r1393_mask = np.ones(n_eras, dtype=bool)
+    else:
+        is_r1393_mask = np.isfinite(era_nums) & (era_nums >= float(R1393_START_ERA))
+
+    is_r1399_mask = np.isfinite(era_nums) & (era_nums >= float(R1399_START_ERA))
+
+    # Multipliers and official clips per era
+    eff_corr_override = float(corr_multiplier) if corr_multiplier is not None else (
+        float(corr_weight) if corr_weight is not None else None
+    )
+    eff_mmc_override = float(mmc_weight) if mmc_weight is not None else None
+
+    corr_w_arr = (
+        np.full(n_eras, eff_corr_override, dtype=np.float64)
+        if eff_corr_override is not None
+        else np.where(is_r1393_mask, 8.0, 3.0)
+    )
+    mmc_w_arr = (
+        np.full(n_eras, eff_mmc_override, dtype=np.float64)
+        if eff_mmc_override is not None
+        else np.where(is_r1393_mask, 32.0, 15.0)
+    )
+    c_min_arr = (
+        np.full(n_eras, float(clip_min), dtype=np.float64)
+        if clip_min is not None
+        else np.full(n_eras, -1.0, dtype=np.float64)
+    )
+    c_max_arr = (
+        np.full(n_eras, float(clip_max), dtype=np.float64)
+        if clip_max is not None
+        else np.where(is_r1393_mask, 2.0, 1.0)
+    )
+
+    has_mmc = primary_mmc is not None and len(pd.Series(primary_mmc).dropna()) > 0
+    corr_arr = corr_series.to_numpy(dtype=np.float64)
     if has_mmc:
-        mmc_series = (
-            pd.Series(per_era_mmc, dtype=np.float64)
+        mmc_aligned = (
+            pd.Series(primary_mmc, dtype=np.float64)
             .dropna()
             .sort_index()
-            .reindex(corr_series.index)
-            .fillna(0.0)
+            .reindex(idx)
         )
-        raw_score = eff_corr_w * corr_series + float(mmc_weight) * mmc_series
+        missing_mmc_eras = int(mmc_aligned.isna().sum())
+        mmc_arr = mmc_aligned.fillna(0.0).to_numpy(dtype=np.float64)
+        raw_score = corr_w_arr * corr_arr + mmc_w_arr * mmc_arr
+        mmc_status = "present" if missing_mmc_eras == 0 else f"partial ({missing_mmc_eras}/{n_eras} missing)"
     else:
-        raw_score = eff_corr_w * corr_series
+        raw_score = corr_w_arr * corr_arr
+        mmc_status = "missing"
 
     if isinstance(payout_factor, pd.Series):
-        pf_aligned = (
+        pf_arr = (
             pd.Series(payout_factor, dtype=np.float64)
             .dropna()
             .sort_index()
-            .reindex(corr_series.index)
+            .reindex(idx)
             .ffill()
             .bfill()
             .fillna(1.0)
+            .to_numpy(dtype=np.float64)
         )
-        era_returns = (raw_score * pf_aligned).clip(float(clip_min), float(clip_max))
     else:
-        era_returns = (raw_score * float(payout_factor)).clip(float(clip_min), float(clip_max))
+        pf_arr = np.full(n_eras, float(payout_factor), dtype=np.float64)
 
-    if churn_penalty is not None:
-        if isinstance(churn_penalty, pd.Series):
-            cp = (
-                pd.Series(churn_penalty, dtype=np.float64)
-                .dropna()
-                .sort_index()
-                .reindex(era_returns.index)
-                .ffill()
-                .bfill()
-                .fillna(0.0)
-                .clip(0.0, 1.0)
-            )
-            era_returns = pd.Series(
-                np.where(era_returns > 0.0, era_returns * (1.0 - cp), era_returns),
-                index=era_returns.index,
-                dtype=np.float64,
-            )
+    # Apply payout_factor and official per-era clips
+    scaled_score = raw_score * pf_arr
+    clipped_arr = np.clip(scaled_score, c_min_arr, c_max_arr)
+
+    # R1399+ neutral churn penalty: positive payouts only, after multipliers and clipping; R1393-1398 unaffected
+    churn_input = neutral_churn if neutral_churn is not None else churn_penalty
+    if churn_input is not None:
+        if np.any(is_r1399_mask):
+            if isinstance(churn_input, pd.Series):
+                ch_aligned = (
+                    pd.Series(churn_input, dtype=np.float64)
+                    .dropna()
+                    .sort_index()
+                    .reindex(idx)
+                )
+                ch_vals = ch_aligned.to_numpy(dtype=np.float64)
+                retention = compute_r1399_churn_retention(ch_vals)
+            else:
+                retention = np.full(n_eras, float(compute_r1399_churn_retention(float(churn_input))), dtype=np.float64)
+            apply_churn = is_r1399_mask & (clipped_arr > 0.0)
+            clipped_arr = np.where(apply_churn, clipped_arr * retention, clipped_arr)
+            churn_status = f"applied on {int(is_r1399_mask.sum())} R1399+ era(s) (positive payouts only)"
         else:
-            cp_val = float(np.clip(float(churn_penalty), 0.0, 1.0))
-            era_returns = pd.Series(
-                np.where(era_returns > 0.0, era_returns * (1.0 - cp_val), era_returns),
-                index=era_returns.index,
-                dtype=np.float64,
-            )
-
-    return era_returns.astype(np.float64), has_mmc
-
-
-def _simulate_single_window_path(
-    ret_arr: np.ndarray,
-    initial_stake: float,
-    staking_mode: str,
-) -> Tuple[np.ndarray, float, float, float]:
-    """Simulate a single independent Atomic-staking window starting at `initial_stake` (zero cross-window compounding)."""
-    init_stake = float(initial_stake)
-    if len(ret_arr) == 0:
-        return np.empty(0, dtype=np.float64), 0.0, 0.0, 0.0
-
-    if staking_mode == "constant":
-        # Atomic Constant staking: fixed `initial_stake` staked per settled round, excess profits swept idle,
-        # downside bounded at 0 (cannot lose more than available capital).
-        cum_pnl = np.cumsum(init_stake * ret_arr)
-        eq = np.maximum(0.0, init_stake + cum_pnl)
-        # Once wiped out (eq == 0), stay at 0
-        wiped = np.maximum.accumulate(eq <= 0.0)
-        eq = np.where(wiped, 0.0, eq)
+            churn_status = "not applicable (all eras < 1399)"
     else:
-        # Atomic Compound staking: settled round balance rolls into next round
-        eq = init_stake * np.cumprod(np.maximum(0.0, 1.0 + ret_arr))
+        churn_status = "missing (not applied)" if np.any(is_r1399_mask) else "not applicable (all eras < 1399)"
 
-    running_peak = np.maximum.accumulate(np.maximum(init_stake, eq))
-    dd_gbp = eq - running_peak
-    dd_pct = np.where(running_peak > 0.0, (dd_gbp / running_peak) * 100.0, 0.0)
-    prev_eq = np.concatenate(([init_stake], eq[:-1]))
-    round_pnl_gbp = eq - prev_eq
-    return eq, float(dd_pct.min()), float(dd_gbp.min()), float(round_pnl_gbp.min())
+    # Honest score basis and payout rule summary
+    if use_diagnostics:
+        score_basis = "Diagnostics NCORR + NMMC" if has_mmc else "Diagnostics NCORR only (missing NMMC)"
+    else:
+        if has_mmc:
+            score_basis = "CORR + MMC (raw, not NCORR/NMMC)"
+        else:
+            score_basis = "CORR only (missing MMC)"
+
+    n_r1393 = int(is_r1393_mask.sum())
+    n_pre = n_eras - n_r1393
+    if n_r1393 == 0:
+        payout_rule_summary = (
+            f"Pre-1393: {corr_w_arr[0]:g}xCORR + {mmc_w_arr[0]:g}xMMC, clip [{c_min_arr[0]*100:.0f}%, +{c_max_arr[0]*100:.0f}%]"
+            if has_mmc
+            else f"Pre-1393 (CORR only, missing MMC): {corr_w_arr[0]:g}xCORR, clip [{c_min_arr[0]*100:.0f}%, +{c_max_arr[0]*100:.0f}%]"
+        )
+    elif n_pre == 0:
+        payout_rule_summary = (
+            f"R1393+: {corr_w_arr[0]:g}x{'NCORR' if use_diagnostics else 'CORR'} + {mmc_w_arr[0]:g}x{'NMMC' if use_diagnostics else 'MMC'}, clip [{c_min_arr[0]*100:.0f}%, +{c_max_arr[0]*100:.0f}%]"
+            if has_mmc
+            else f"R1393+ (CORR only, missing MMC): {corr_w_arr[0]:g}x{'NCORR' if use_diagnostics else 'CORR'}, clip [{c_min_arr[0]*100:.0f}%, +{c_max_arr[0]*100:.0f}%]"
+        )
+    else:
+        payout_rule_summary = (
+            f"Era-aware ({n_pre} pre-1393 [3x/15x, -100%..+100%] + {n_r1393} R1393+ [8x/32x, -100%..+200%])"
+        )
+
+    meta = {
+        "has_mmc": bool(has_mmc),
+        "mmc_status": mmc_status,
+        "score_basis": score_basis,
+        "payout_rule_summary": payout_rule_summary,
+        "churn_status": churn_status,
+        "used_diagnostics_ncorr": bool(use_diagnostics),
+        "n_pre_1393_eras": int(n_pre),
+        "n_r1393_eras": int(n_r1393),
+        "n_r1399_eras": int(is_r1399_mask.sum()),
+    }
+    return pd.Series(clipped_arr, index=idx, dtype=np.float64), meta
 
 
-def _partition_window_slices(n_rounds: int, window_rounds: int) -> List[Tuple[int, int]]:
-    """Split `n_rounds` non-overlapping rounds into independent chronological windows."""
-    if n_rounds <= 0:
-        return []
-    w_len = max(1, int(window_rounds))
-    if n_rounds <= w_len:
-        return [(0, n_rounds)]
-    n_windows = max(1, n_rounds // w_len)
-    edges = np.linspace(0, n_rounds, num=n_windows + 1, dtype=np.int64)
-    return [(int(edges[i]), int(edges[i + 1])) for i in range(n_windows) if edges[i + 1] > edges[i]]
+def _simulate_single_wallet_path(
+    ret_arr: np.ndarray,
+    start_capital: float,
+    staking_mode: str = "compound",
+    *,
+    concurrent_rounds: int = CLASSIC_CONCURRENT_ROUNDS,
+    settlement_rounds: int = CLASSIC_SETTLEMENT_ROUNDS,
+) -> Tuple[np.ndarray, np.ndarray, float, float, float, bool]:
+    """Simulate ONE continuous wallet with overlapping rounds (no resets, no margin, equity >= 0).
+
+    Per-round stake = `TVL / R` (`R = 64` for Classic). Each opened round stays locked for
+    `settlement_rounds` weeks until it settles; locked capital cannot be reused. Once equity
+    hits zero, the wallet stays at zero permanently.
+
+    Returns `(equity_curve, round_pnls, money_drawdown_pct, max_drawdown_val, worst_round, wiped_out)`.
+    """
+    init_cap = max(0.0, float(start_capital))
+    n = len(ret_arr)
+    if n == 0 or init_cap <= 0.0:
+        empty = np.zeros(n, dtype=np.float64)
+        return empty, empty, 0.0, 0.0, 0.0, bool(init_cap <= 0.0)
+
+    R = max(1, int(concurrent_rounds))
+    settle_lag = max(1, int(settlement_rounds))
+    clean_mode = str(staking_mode or "compound").strip().lower()
+    if clean_mode not in ("compound", "constant"):
+        raise ValueError(f"staking_mode must be 'compound' or 'constant', got {staking_mode!r}")
+
+    free_cash = init_cap
+    # Each entry: (settle_step, open_step, stake_amount, round_return)
+    open_positions: List[Tuple[int, int, float, float]] = []
+    equity_path = np.zeros(n, dtype=np.float64)
+    round_pnls = np.zeros(n, dtype=np.float64)
+    wiped_out = False
+
+    for t in range(n):
+        # 1. Settle any positions maturing at week t
+        if open_positions:
+            still_open: List[Tuple[int, int, float, float]] = []
+            for s_step, o_step, pos_stake, pos_ret in open_positions:
+                if s_step <= t:
+                    payout = max(0.0, pos_stake * (1.0 + pos_ret))
+                    free_cash += payout
+                    round_pnls[o_step] = payout - pos_stake
+                else:
+                    still_open.append((s_step, o_step, pos_stake, pos_ret))
+            open_positions = still_open
+
+        locked_cap = sum(pos[2] for pos in open_positions)
+        curr_eq = max(0.0, free_cash + locked_cap)
+        if curr_eq <= 1e-12:
+            wiped_out = True
+            free_cash = 0.0
+            open_positions.clear()
+            curr_eq = 0.0
+
+        # 2. Open new position for week t using only unlocked free_cash
+        if not wiped_out:
+            target_stake = (init_cap / float(R)) if clean_mode == "constant" else (curr_eq / float(R))
+            actual_stake = min(max(0.0, target_stake), max(0.0, free_cash))
+            if actual_stake > 1e-15:
+                free_cash -= actual_stake
+                open_positions.append((t + settle_lag, t, actual_stake, float(ret_arr[t])))
+
+        locked_after = sum(pos[2] for pos in open_positions)
+        equity_path[t] = 0.0 if wiped_out else max(0.0, free_cash + locked_after)
+
+    # 3. Settle all remaining open positions chronologically so final balance reflects all opened rounds
+    if not wiped_out and open_positions:
+        open_positions.sort(key=lambda item: item[0])
+        for _, o_step, pos_stake, pos_ret in open_positions:
+            payout = max(0.0, pos_stake * (1.0 + pos_ret))
+            free_cash += payout
+            round_pnls[o_step] = payout - pos_stake
+        open_positions.clear()
+        final_eq = max(0.0, free_cash)
+        if final_eq <= 1e-12:
+            wiped_out = True
+            final_eq = 0.0
+        equity_path[-1] = final_eq
+    elif wiped_out:
+        equity_path[-1] = 0.0
+
+    # Enforce strict non-negativity and permanent zero after ruin
+    equity_path = np.maximum(0.0, equity_path)
+    ruin_mask = np.maximum.accumulate(equity_path <= 1e-12)
+    equity_path = np.where(ruin_mask, 0.0, equity_path)
+    wiped_out = bool(wiped_out or bool(ruin_mask[-1]))
+
+    # Money drawdown: (lowest - peak) / peak * 100, always in [-100, 0]
+    running_peak = np.maximum.accumulate(np.maximum(init_cap, equity_path))
+    dd_val = equity_path - running_peak
+    dd_pct = np.where(running_peak > 0.0, (dd_val / running_peak) * 100.0, 0.0)
+    dd_pct = np.clip(dd_pct, -100.0, 0.0)
+
+    money_dd_pct = float(dd_pct.min())
+    max_dd_val = float(dd_val.min())
+    worst_round = float(round_pnls.min())
+    return equity_path, round_pnls, money_dd_pct, max_dd_val, worst_round, wiped_out
 
 
 def simulate_stake_pnl(
     per_era_corr: pd.Series,
     per_era_mmc: Optional[pd.Series] = None,
+    *,
+    per_era_ncorr: Optional[pd.Series] = None,
+    per_era_nmmc: Optional[pd.Series] = None,
+    total_capital: Optional[float] = None,
     initial_stake: float = 1000.0,
-    corr_weight: float = 8.0,
-    mmc_weight: float = 32.0,
+    concurrent_rounds: int = CLASSIC_CONCURRENT_ROUNDS,
+    settlement_rounds: int = CLASSIC_SETTLEMENT_ROUNDS,
+    corr_weight: Optional[float] = None,
+    mmc_weight: Optional[float] = None,
     payout_factor: Union[float, pd.Series] = 1.0,
-    clip_min: float = -0.25,
-    clip_max: float = 0.25,
+    clip_min: Optional[float] = None,
+    clip_max: Optional[float] = None,
+    neutral_churn: Optional[Union[float, pd.Series]] = None,
     churn_penalty: Optional[Union[float, pd.Series]] = None,
+    payout_rule: str = "auto",
     staking_mode: str = "compound",
-    stride: int = 4,
-    window_rounds: int = 13,
-    score_basis: str = "corr_mmc_proxy",
+    stride: int = 1,
+    nmr_gbp_rate: Optional[float] = None,
     nmr_gbp_prices: Optional[pd.Series] = None,
     corr_multiplier: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Numerai Classic Round 1393+ Atomic Staking P&L simulator (£) across independent validation windows.
+    """One-wallet Numerai Classic overlapping-rounds staking simulator (no window resets, no margin).
 
-    Uses the official R1393+ payout formula (`8 * NCORR + 32 * NMMC`, clipped to `[-100%, +200%]`,
-    `payout_factor=1.0`, optional R1399+ neutral-churn penalty, NO arbitrary live-decay haircut).
-    Partitions non-overlapping settled rounds (`stride=4` -> 13 rounds ≈ 1 year per window) into
-    financially **independent** validation windows each starting fresh at `initial_stake` (£1,000),
-    eliminating artificial compounding across unrelated historical regimes.
+    - Starts with one wallet at `total_capital` (default £1,000, or `initial_stake` alias).
+    - Sizes each weekly round at `TVL / R` (`R = 64` concurrent rounds for Classic); locked capital
+      stays locked for `settlement_rounds` (~60 trading days = 12 weekly eras) and cannot be reused.
+    - Uses era-accurate Numerai Classic rules (`payout_rule='auto'`):
+        * Pre-1393: `3 * CORR60 + 15 * MMC60`, clipped `[-100%, +100%]`.
+        * R1393+: `8 * NCORR + 32 * NMMC`, clipped `[-100%, +200%]`, `payout_factor=1.0`.
+        * R1399+: neutral churn retention `min(1, 2 / (1 + exp(10 * (churn - 0.1))))` on positive payouts only.
+    - Keeps NMR and GBP separate: simulates staking in NMR, then converts to GBP via `nmr_gbp_prices`
+      or `nmr_gbp_rate` (or labels constant-FX GBP-equivalent if no FX series/rate is supplied).
+    - Equity can never go below 0; `money_drawdown_pct` is always in `[-100, 0]`.
     """
-    init_stake = float(initial_stake)
+    start_cap_gbp = max(0.0, float(total_capital if total_capital is not None else initial_stake))
     clean_mode = str(staking_mode or "compound").strip().lower()
     if clean_mode not in ("compound", "constant"):
         raise ValueError(f"staking_mode must be 'compound' or 'constant', got {staking_mode!r}")
 
-    era_returns, has_mmc = _compute_clipped_era_returns(
+    era_returns, meta = _compute_clipped_era_returns(
         per_era_corr,
         per_era_mmc=per_era_mmc,
+        per_era_ncorr=per_era_ncorr,
+        per_era_nmmc=per_era_nmmc,
         corr_weight=corr_weight,
         mmc_weight=mmc_weight,
         payout_factor=payout_factor,
         clip_min=clip_min,
         clip_max=clip_max,
+        neutral_churn=neutral_churn,
         churn_penalty=churn_penalty,
+        payout_rule=payout_rule,
         stride=stride,
         corr_multiplier=corr_multiplier,
     )
+
     if len(era_returns) == 0:
         empty_series = pd.Series(dtype=np.float64)
         return {
-            "mean_ending_capital": init_stake,
-            "median_ending_capital": init_stake,
-            "mean_profit": 0.0,
-            "median_profit": 0.0,
-            "mean_return_pct": 0.0,
-            "std_profit": 0.0,
-            "profitable_windows_pct": 0.0,
-            "worst_window_ending_capital": init_stake,
-            "worst_window_profit": 0.0,
-            "best_window_ending_capital": init_stake,
-            "best_window_profit": 0.0,
-            "final_stake": init_stake,
-            "net_profit": 0.0,
+            "start_capital": start_cap_gbp,
+            "end_capital": start_cap_gbp,
+            "total_profit": 0.0,
             "total_return_pct": 0.0,
-            "max_drawdown_pct": 0.0,
+            "worst_round": 0.0,
+            "worst_round_gbp": 0.0,
+            "money_drawdown_pct": 0.0,
             "max_drawdown_gbp": 0.0,
+            "start_nmr": start_cap_gbp,
+            "end_nmr": start_cap_gbp,
+            "profit_nmr": 0.0,
+            "max_drawdown_nmr": 0.0,
+            "worst_round_nmr": 0.0,
+            "fx_status": "no eras",
+            "final_stake": start_cap_gbp,
+            "net_profit": 0.0,
             "worst_era_gbp": 0.0,
-            "n_windows": 0,
-            "score_basis": str(score_basis),
-            "has_mmc": False,
-            "window_outcomes_df": pd.DataFrame(),
+            "committed_capital": start_cap_gbp,
+            "concurrent_rounds": int(concurrent_rounds),
+            "settlement_rounds": int(settlement_rounds),
+            "per_round_stake_initial": start_cap_gbp / float(max(1, int(concurrent_rounds))),
+            "staking_mode": clean_mode,
+            "wiped_out": False,
+            **meta,
             "round_returns": empty_series,
+            "round_pnls_gbp": empty_series,
             "equity_curve": empty_series,
+            "equity_curve_nmr": empty_series,
             "drawdown_pct_series": empty_series,
         }
 
     ret_arr = era_returns.to_numpy(dtype=np.float64)
     idx = era_returns.index
+
+    # Separate NMR staking from GBP conversion
     fx_arr: Optional[np.ndarray] = None
     if nmr_gbp_prices is not None and len(nmr_gbp_prices) > 0:
         fx_aligned = (
@@ -2253,212 +2585,203 @@ def simulate_stake_pnl(
             .ffill()
             .bfill()
         )
-        if len(fx_aligned) == len(idx) and not fx_aligned.isna().any():
+        if len(fx_aligned) == len(idx) and not fx_aligned.isna().any() and float(fx_aligned.to_numpy()[0]) > 0.0:
             fx_arr = fx_aligned.to_numpy(dtype=np.float64)
 
-    slices = _partition_window_slices(len(ret_arr), window_rounds=window_rounds)
-    window_rows: List[Dict[str, Any]] = []
-    window_curves: Dict[str, pd.Series] = {}
+    if fx_arr is not None:
+        start_fx = float(fx_arr[0])
+        start_nmr = start_cap_gbp / start_fx
+        fx_status = f"live NMR/GBP series (start £{start_fx:.2f}/NMR, end £{float(fx_arr[-1]):.2f}/NMR)"
+    elif nmr_gbp_rate is not None and float(nmr_gbp_rate) > 0.0:
+        fixed_fx = float(nmr_gbp_rate)
+        start_nmr = start_cap_gbp / fixed_fx
+        fx_arr = np.full(len(idx), fixed_fx, dtype=np.float64)
+        fx_status = f"fixed FX (£{fixed_fx:.2f}/NMR; converted at end)"
+    else:
+        start_nmr = start_cap_gbp
+        fx_arr = np.ones(len(idx), dtype=np.float64)
+        fx_status = "no NMR/GBP FX series provided (constant-FX GBP-equivalent)"
 
-    for w_i, (s, e) in enumerate(slices, start=1):
-        w_ret = ret_arr[s:e]
-        w_idx = idx[s:e]
-        w_eq, w_dd_pct, w_dd_gbp, w_worst_round = _simulate_single_window_path(w_ret, init_stake, clean_mode)
-        if fx_arr is not None and fx_arr[s] > 0.0:
-            w_eq = w_eq * (fx_arr[s:e] / fx_arr[s])
-            w_peak = np.maximum.accumulate(np.maximum(init_stake, w_eq))
-            w_dd_gbp_arr = w_eq - w_peak
-            w_dd_pct = float(np.where(w_peak > 0.0, (w_dd_gbp_arr / w_peak) * 100.0, 0.0).min())
-            w_dd_gbp = float(w_dd_gbp_arr.min())
-            w_prev = np.concatenate(([init_stake], w_eq[:-1]))
-            w_worst_round = float((w_eq - w_prev).min())
+    eq_nmr, round_pnls_nmr, _, max_dd_nmr, worst_round_nmr, wiped_out = _simulate_single_wallet_path(
+        ret_arr,
+        start_nmr,
+        staking_mode=clean_mode,
+        concurrent_rounds=concurrent_rounds,
+        settlement_rounds=settlement_rounds,
+    )
 
-        end_cap = float(w_eq[-1])
-        profit = end_cap - init_stake
-        ret_pct = (profit / init_stake) * 100.0 if abs(init_stake) > 1e-12 else 0.0
-        w_label = f"W{w_i} ({w_idx[0]}–{w_idx[-1]})"
-        window_curves[w_label] = pd.Series(w_eq, index=w_idx, dtype=np.float64, name=w_label)
-        window_rows.append({
-            "window": w_label,
-            "start_era": w_idx[0],
-            "end_era": w_idx[-1],
-            "n_rounds": int(len(w_ret)),
-            "ending_capital": round(end_cap, 2),
-            "profit_gbp": round(profit, 2),
-            "return_pct": round(ret_pct, 2),
-            "max_drawdown_pct": round(w_dd_pct, 2),
-            "max_drawdown_gbp": round(w_dd_gbp, 2),
-            "worst_round_gbp": round(w_worst_round, 2),
-            "profitable": bool(profit > 0.0),
-        })
+    eq_gbp = np.maximum(0.0, eq_nmr * fx_arr)
+    round_pnls_gbp = round_pnls_nmr * fx_arr
 
-    win_df = pd.DataFrame(window_rows)
-    end_caps = win_df["ending_capital"].to_numpy(dtype=np.float64)
-    profits = win_df["profit_gbp"].to_numpy(dtype=np.float64)
-    ret_pcts = win_df["return_pct"].to_numpy(dtype=np.float64)
+    # Wallet drawdown in GBP (always in [-100, 0])
+    running_peak_gbp = np.maximum.accumulate(np.maximum(start_cap_gbp, eq_gbp))
+    dd_gbp_arr = eq_gbp - running_peak_gbp
+    dd_pct_arr = np.where(running_peak_gbp > 0.0, (dd_gbp_arr / running_peak_gbp) * 100.0, 0.0)
+    dd_pct_arr = np.clip(dd_pct_arr, -100.0, 0.0)
 
-    mean_end = float(np.mean(end_caps))
-    median_end = float(np.median(end_caps))
-    mean_prof = float(np.mean(profits))
-    median_prof = float(np.median(profits))
-    mean_ret = float(np.mean(ret_pcts))
-    std_prof = float(np.std(profits, ddof=0))
-    prof_pct = float(np.mean(profits > 0.0) * 100.0)
-    worst_end = float(np.min(end_caps))
-    worst_prof = float(np.min(profits))
-    best_end = float(np.max(end_caps))
-    best_prof = float(np.max(profits))
-    worst_dd_pct = float(win_df["max_drawdown_pct"].min())
-    worst_dd_gbp = float(win_df["max_drawdown_gbp"].min())
-    worst_era_gbp = float(win_df["worst_round_gbp"].min())
+    end_cap_gbp = float(eq_gbp[-1])
+    total_profit_gbp = end_cap_gbp - start_cap_gbp
+    total_return_pct = (total_profit_gbp / start_cap_gbp) * 100.0 if start_cap_gbp > 1e-12 else 0.0
+    money_dd_pct = float(dd_pct_arr.min())
+    max_dd_gbp = float(dd_gbp_arr.min())
+    worst_round_gbp = float(round_pnls_gbp.min())
 
-    # Independent per-round (£1,000 per single round) equity & drawdown series
-    single_round_eq = pd.Series(init_stake * (1.0 + ret_arr), index=idx, dtype=np.float64, name="independent_round_gbp")
-    single_round_dd_pct = pd.Series(np.minimum(0.0, ret_arr) * 100.0, index=idx, dtype=np.float64, name="round_burn_pct")
+    end_nmr = float(eq_nmr[-1])
+    profit_nmr = end_nmr - start_nmr
 
     return {
-        "mean_ending_capital": mean_end,
-        "median_ending_capital": median_end,
-        "mean_profit": mean_prof,
-        "median_profit": median_prof,
-        "mean_return_pct": mean_ret,
-        "std_profit": std_prof,
-        "profitable_windows_pct": prof_pct,
-        "worst_window_ending_capital": worst_end,
-        "worst_window_profit": worst_prof,
-        "best_window_ending_capital": best_end,
-        "best_window_profit": best_prof,
-        # Scalar summary keys aligned with CV/comparison tables (mean across independent windows)
-        "final_stake": mean_end,
-        "net_profit": mean_prof,
-        "total_return_pct": mean_ret,
-        "max_drawdown_pct": worst_dd_pct,
-        "max_drawdown_gbp": worst_dd_gbp,
-        "worst_era_gbp": worst_era_gbp,
-        "n_windows": int(len(win_df)),
-        "score_basis": str(score_basis),
-        "has_mmc": bool(has_mmc),
-        "window_outcomes_df": win_df,
-        "window_curves": window_curves,
+        "start_capital": start_cap_gbp,
+        "end_capital": end_cap_gbp,
+        "total_profit": total_profit_gbp,
+        "total_return_pct": total_return_pct,
+        "worst_round": worst_round_gbp,
+        "worst_round_gbp": worst_round_gbp,
+        "money_drawdown_pct": money_dd_pct,
+        "max_drawdown_gbp": max_dd_gbp,
+        "start_nmr": start_nmr,
+        "end_nmr": end_nmr,
+        "profit_nmr": profit_nmr,
+        "max_drawdown_nmr": float(max_dd_nmr),
+        "worst_round_nmr": float(worst_round_nmr),
+        "fx_status": fx_status,
+        # Backwards-compatible scalar keys (strictly one-wallet values)
+        "final_stake": end_cap_gbp,
+        "net_profit": total_profit_gbp,
+        "worst_era_gbp": worst_round_gbp,
+        "committed_capital": start_cap_gbp,
+        "concurrent_rounds": int(concurrent_rounds),
+        "settlement_rounds": int(settlement_rounds),
+        "per_round_stake_initial": start_cap_gbp / float(max(1, int(concurrent_rounds))),
+        "staking_mode": clean_mode,
+        "wiped_out": bool(wiped_out),
+        **meta,
         "round_returns": era_returns,
-        "equity_curve": single_round_eq,
-        "drawdown_pct_series": single_round_dd_pct,
+        "round_pnls_gbp": pd.Series(round_pnls_gbp, index=idx, dtype=np.float64, name="round_pnl_gbp"),
+        "equity_curve": pd.Series(eq_gbp, index=idx, dtype=np.float64, name="wallet_gbp"),
+        "equity_curve_nmr": pd.Series(eq_nmr, index=idx, dtype=np.float64, name="wallet_nmr"),
+        "drawdown_pct_series": pd.Series(dd_pct_arr, index=idx, dtype=np.float64, name="money_drawdown_pct"),
     }
 
 
 def simulate_stake_pnl_monte_carlo(
     per_era_corr: pd.Series,
     per_era_mmc: Optional[pd.Series] = None,
+    *,
+    per_era_ncorr: Optional[pd.Series] = None,
+    per_era_nmmc: Optional[pd.Series] = None,
+    total_capital: Optional[float] = None,
     initial_stake: float = 1000.0,
-    corr_weight: float = 8.0,
-    mmc_weight: float = 32.0,
+    concurrent_rounds: int = CLASSIC_CONCURRENT_ROUNDS,
+    settlement_rounds: int = CLASSIC_SETTLEMENT_ROUNDS,
+    corr_weight: Optional[float] = None,
+    mmc_weight: Optional[float] = None,
     payout_factor: Union[float, pd.Series] = 1.0,
-    clip_min: float = -0.25,
-    clip_max: float = 0.25,
+    clip_min: Optional[float] = None,
+    clip_max: Optional[float] = None,
+    neutral_churn: Optional[Union[float, pd.Series]] = None,
     churn_penalty: Optional[Union[float, pd.Series]] = None,
+    payout_rule: str = "auto",
     staking_mode: str = "compound",
-    stride: int = 4,
-    window_rounds: int = 13,
-    n_sims: int = 1000,
-    block_size: int = 3,
+    stride: int = 1,
+    n_sims: int = 500,
+    block_size: int = 4,
     random_state: int = 42,
 ) -> Dict[str, Any]:
-    """Within-window block-bootstrap Monte Carlo simulator under Numerai Classic R1393+ Atomic Staking.
+    """One-wallet block-bootstrap Monte Carlo simulator under Numerai Classic overlapping-rounds staking.
 
-    Resamples actual per-round returns *inside each independent validation window* (each starting at
-    `initial_stake`), then aggregates the terminal capital and max-drawdown distributions across all windows.
+    Resamples blocks of per-round returns over the full validation horizon and simulates one continuous
+    wallet per path (TVL / 64 per round, no resets, no margin, equity >= 0).
     """
-    init_stake = float(initial_stake)
+    start_cap = max(0.0, float(total_capital if total_capital is not None else initial_stake))
     clean_mode = str(staking_mode or "compound").strip().lower()
     if clean_mode not in ("compound", "constant"):
         raise ValueError(f"staking_mode must be 'compound' or 'constant', got {staking_mode!r}")
 
-    era_returns, _ = _compute_clipped_era_returns(
+    era_returns, meta = _compute_clipped_era_returns(
         per_era_corr,
         per_era_mmc=per_era_mmc,
+        per_era_ncorr=per_era_ncorr,
+        per_era_nmmc=per_era_nmmc,
         corr_weight=corr_weight,
         mmc_weight=mmc_weight,
         payout_factor=payout_factor,
         clip_min=clip_min,
         clip_max=clip_max,
+        neutral_churn=neutral_churn,
         churn_penalty=churn_penalty,
+        payout_rule=payout_rule,
         stride=stride,
     )
     if len(era_returns) == 0:
         return {
-            "mc_p05_final_stake": init_stake,
-            "mc_median_final_stake": init_stake,
-            "mc_mean_final_stake": init_stake,
-            "mc_p95_final_stake": init_stake,
+            "start_capital": start_cap,
+            "actual_end_capital": start_cap,
+            "mc_p05_final_stake": start_cap,
+            "mc_median_final_stake": start_cap,
+            "mc_mean_final_stake": start_cap,
+            "mc_p95_final_stake": start_cap,
             "mc_prob_profit_pct": 0.0,
-            "mc_p95_max_drawdown_pct": 0.0,
-            "window_mc_df": pd.DataFrame(),
+            "mc_prob_ruin_pct": 0.0,
+            "mc_p95_money_drawdown_pct": 0.0,
             "final_stakes": np.empty(0, dtype=np.float64),
-            "max_drawdowns_pct": np.empty(0, dtype=np.float64),
+            "money_drawdowns_pct": np.empty(0, dtype=np.float64),
+            **meta,
         }
 
     ret_arr = era_returns.to_numpy(dtype=np.float64)
-    idx = era_returns.index
-    slices = _partition_window_slices(len(ret_arr), window_rounds=window_rounds)
+    n_t = len(ret_arr)
     n_s = max(10, int(n_sims))
+    b_size = min(max(1, int(block_size)), n_t)
+    n_blocks = int(np.ceil(float(n_t) / float(b_size)))
     rng = np.random.default_rng(int(random_state))
 
-    all_final_stakes: List[np.ndarray] = []
-    all_max_dds: List[np.ndarray] = []
-    win_mc_rows: List[Dict[str, Any]] = []
+    starts = rng.integers(0, max(1, n_t - b_size + 1), size=(n_s, n_blocks))
+    offsets = np.arange(b_size, dtype=np.int64)[None, None, :]
+    boot_idx = (starts[:, :, None] + offsets).reshape(n_s, -1)[:, :n_t]
+    sim_rets = ret_arr[boot_idx]
 
-    for w_i, (s, e) in enumerate(slices, start=1):
-        w_ret = ret_arr[s:e]
-        w_idx = idx[s:e]
-        n_t = len(w_ret)
-        b_size = min(max(1, int(block_size)), n_t)
-        n_blocks = int(np.ceil(float(n_t) / float(b_size)))
+    final_wallets = np.zeros(n_s, dtype=np.float64)
+    worst_dds_pct = np.zeros(n_s, dtype=np.float64)
+    ruin_flags = np.zeros(n_s, dtype=bool)
 
-        starts = rng.integers(0, max(1, n_t - b_size + 1), size=(n_s, n_blocks))
-        offsets = np.arange(b_size, dtype=np.int64)[None, None, :]
-        boot_idx = (starts[:, :, None] + offsets).reshape(n_s, -1)[:, :n_t]
-        sim_ret = w_ret[boot_idx]  # (n_sims, n_t)
+    for s_idx in range(n_s):
+        eq_path, _, dd_pct, _, _, wiped = _simulate_single_wallet_path(
+            sim_rets[s_idx],
+            start_cap,
+            staking_mode=clean_mode,
+            concurrent_rounds=concurrent_rounds,
+            settlement_rounds=settlement_rounds,
+        )
+        final_wallets[s_idx] = float(eq_path[-1])
+        worst_dds_pct[s_idx] = float(dd_pct)
+        ruin_flags[s_idx] = bool(wiped)
 
-        if clean_mode == "constant":
-            sim_eq = np.maximum(0.0, init_stake + np.cumsum(init_stake * sim_ret, axis=1))
-            wiped = np.maximum.accumulate(sim_eq <= 0.0, axis=1)
-            sim_eq = np.where(wiped, 0.0, sim_eq)
-        else:
-            sim_eq = init_stake * np.cumprod(np.maximum(0.0, 1.0 + sim_ret), axis=1)
-
-        running_peak = np.maximum.accumulate(np.maximum(init_stake, sim_eq), axis=1)
-        sim_dd_pct = np.where(running_peak > 0.0, (sim_eq - running_peak) / running_peak, 0.0) * 100.0
-        w_max_dd = sim_dd_pct.min(axis=1)
-        w_finals = sim_eq[:, -1]
-
-        hist_eq, _, _, _ = _simulate_single_window_path(w_ret, init_stake, clean_mode)
-        all_final_stakes.append(w_finals)
-        all_max_dds.append(w_max_dd)
-        win_mc_rows.append({
-            "window": f"W{w_i} ({w_idx[0]}–{w_idx[-1]})",
-            "actual_ending_capital": float(hist_eq[-1]),
-            "p05": float(np.percentile(w_finals, 5.0)),
-            "p25": float(np.percentile(w_finals, 25.0)),
-            "p50": float(np.percentile(w_finals, 50.0)),
-            "p75": float(np.percentile(w_finals, 75.0)),
-            "p95": float(np.percentile(w_finals, 95.0)),
-            "prob_profit_pct": float(np.mean(w_finals > init_stake) * 100.0),
-            "p95_worst_dd_pct": float(np.percentile(w_max_dd, 5.0)),
-        })
-
-    agg_finals = np.concatenate(all_final_stakes)
-    agg_dds = np.concatenate(all_max_dds)
+    actual_eq, _, actual_dd_pct, _, _, _ = _simulate_single_wallet_path(
+        ret_arr,
+        start_cap,
+        staking_mode=clean_mode,
+        concurrent_rounds=concurrent_rounds,
+        settlement_rounds=settlement_rounds,
+    )
 
     return {
-        "mc_p05_final_stake": float(np.percentile(agg_finals, 5.0)),
-        "mc_median_final_stake": float(np.percentile(agg_finals, 50.0)),
-        "mc_mean_final_stake": float(np.mean(agg_finals)),
-        "mc_p95_final_stake": float(np.percentile(agg_finals, 95.0)),
-        "mc_prob_profit_pct": float(np.mean(agg_finals > init_stake) * 100.0),
-        "mc_p95_max_drawdown_pct": float(np.percentile(agg_dds, 5.0)),
-        "window_mc_df": pd.DataFrame(win_mc_rows),
-        "final_stakes": agg_finals,
-        "max_drawdowns_pct": agg_dds,
+        "start_capital": start_cap,
+        "actual_end_capital": float(actual_eq[-1]),
+        "actual_money_drawdown_pct": float(actual_dd_pct),
+        "mc_p05_final_stake": float(np.percentile(final_wallets, 5.0)),
+        "mc_median_final_stake": float(np.percentile(final_wallets, 50.0)),
+        "mc_mean_final_stake": float(np.mean(final_wallets)),
+        "mc_p95_final_stake": float(np.percentile(final_wallets, 95.0)),
+        "mc_prob_profit_pct": float(np.mean(final_wallets > start_cap) * 100.0),
+        "mc_prob_ruin_pct": float(np.mean(ruin_flags) * 100.0),
+        "mc_p95_money_drawdown_pct": float(np.percentile(worst_dds_pct, 5.0)),
+        "final_stakes": final_wallets,
+        "money_drawdowns_pct": worst_dds_pct,
+        "n_sims": n_s,
+        "block_size": b_size,
+        "concurrent_rounds": int(concurrent_rounds),
+        "settlement_rounds": int(settlement_rounds),
+        **meta,
     }
 
 
@@ -2466,316 +2789,246 @@ def plot_stake_pnl_dashboard(
     per_era_corr: pd.Series,
     *,
     per_era_mmc: Optional[pd.Series] = None,
-    title: str = "Best Model",
+    per_era_ncorr: Optional[pd.Series] = None,
+    per_era_nmmc: Optional[pd.Series] = None,
+    title: str = "Model",
+    total_capital: Optional[float] = None,
     initial_stake: float = 1000.0,
-    corr_weight: float = 8.0,
-    mmc_weight: float = 32.0,
+    concurrent_rounds: int = CLASSIC_CONCURRENT_ROUNDS,
+    settlement_rounds: int = CLASSIC_SETTLEMENT_ROUNDS,
+    corr_weight: Optional[float] = None,
+    mmc_weight: Optional[float] = None,
     payout_factor: Union[float, pd.Series] = 1.0,
-    clip_min: float = -0.25,
-    clip_max: float = 0.25,
+    clip_min: Optional[float] = None,
+    clip_max: Optional[float] = None,
+    neutral_churn: Optional[Union[float, pd.Series]] = None,
     churn_penalty: Optional[Union[float, pd.Series]] = None,
-    stride: int = 4,
-    window_rounds: int = 13,
-    score_basis: str = "corr_mmc_proxy",
+    payout_rule: str = "auto",
+    staking_mode: str = "compound",
+    stride: int = 1,
+    nmr_gbp_rate: Optional[float] = None,
     nmr_gbp_prices: Optional[pd.Series] = None,
     save_path: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Plot a 2-panel Independent-Window Numerai R1393+ Atomic Staking Dashboard (Constant vs Compound + Downside Stress)."""
+    """Plot a clean ONE-WALLET staking equity curve over the full validation period (no resets, no 7-pots chart)."""
     import matplotlib.pyplot as plt
 
-    comp_pnl = simulate_stake_pnl(
+    pnl = simulate_stake_pnl(
         per_era_corr,
         per_era_mmc=per_era_mmc,
+        per_era_ncorr=per_era_ncorr,
+        per_era_nmmc=per_era_nmmc,
+        total_capital=total_capital,
         initial_stake=initial_stake,
+        concurrent_rounds=concurrent_rounds,
+        settlement_rounds=settlement_rounds,
         corr_weight=corr_weight,
         mmc_weight=mmc_weight,
         payout_factor=payout_factor,
         clip_min=clip_min,
         clip_max=clip_max,
+        neutral_churn=neutral_churn,
         churn_penalty=churn_penalty,
-        staking_mode="compound",
+        payout_rule=payout_rule,
+        staking_mode=staking_mode,
         stride=stride,
-        window_rounds=window_rounds,
-        score_basis=score_basis,
+        nmr_gbp_rate=nmr_gbp_rate,
         nmr_gbp_prices=nmr_gbp_prices,
     )
-    const_pnl = simulate_stake_pnl(
-        per_era_corr,
-        per_era_mmc=per_era_mmc,
-        initial_stake=initial_stake,
-        corr_weight=corr_weight,
-        mmc_weight=mmc_weight,
-        payout_factor=payout_factor,
-        clip_min=clip_min,
-        clip_max=clip_max,
-        churn_penalty=churn_penalty,
-        staking_mode="constant",
-        stride=stride,
-        window_rounds=window_rounds,
-        score_basis=score_basis,
-        nmr_gbp_prices=nmr_gbp_prices,
+    eq_series = pnl["equity_curve"]
+    if not isinstance(eq_series, pd.Series) or len(eq_series) == 0:
+        return pnl
+
+    start_cap = float(pnl["start_capital"])
+    end_cap = float(pnl["end_capital"])
+    dd_pct = float(pnl["money_drawdown_pct"])
+    dd_gbp = float(pnl["max_drawdown_gbp"])
+    worst_round = float(pnl["worst_round_gbp"])
+
+    fig, ax = plt.subplots(figsize=(14.5, 5.8), facecolor="white")
+    ax.set_facecolor("white")
+
+    x_vals = eq_series.index.to_numpy()
+    y_vals = eq_series.to_numpy(dtype=np.float64)
+    line_color = "#059669" if end_cap >= start_cap else "#dc2626"
+
+    ax.plot(x_vals, y_vals, color=line_color, linewidth=2.2, label="One Wallet (£)")
+    ax.axhline(start_cap, color="#64748b", linestyle="--", linewidth=1.2, alpha=0.85, label=f"Start (£{start_cap:,.0f})")
+    ax.set_ylim(bottom=0.0)
+    ax.set_xlabel("Time (Validation Era / Week)")
+    ax.set_ylabel("Wallet Balance (£)")
+    ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(loc="upper left", frameon=True, facecolor="white", framealpha=0.92, fontsize=9.2)
+
+    # Big headline strip with ONLY the 3 core numbers + worst single round
+    headline_text = (
+        f"Start: £{start_cap:,.0f}     |     "
+        f"End: £{end_cap:,.2f} ({pnl['total_return_pct']:+.2f}%)     |     "
+        f"Worst dip: {dd_pct:.2f}% (£{dd_gbp:,.2f})"
     )
-    comp_df = comp_pnl["window_outcomes_df"]
-    const_df = const_pnl["window_outcomes_df"]
-    if not isinstance(comp_df, pd.DataFrame) or comp_df.empty:
-        return comp_pnl
-
-    x_pos = np.arange(len(comp_df))
-    w_labels = comp_df["window"].astype(str).tolist()
-    bar_w = 0.36
-
-    fig, (ax_cap, ax_dd) = plt.subplots(
-        2, 1, figsize=(15.5, 8.0), sharex=True, gridspec_kw={"height_ratios": [1.85, 1.0]}
-    )
-    fig.patch.set_facecolor("white")
-
-    # --- Top Subplot: Independent Window Ending Capital (Constant vs Compound) ---
-    comp_caps = comp_df["ending_capital"].to_numpy(dtype=np.float64)
-    const_caps = const_df["ending_capital"].to_numpy(dtype=np.float64)
-    ax_cap.bar(x_pos - bar_w / 2.0, const_caps, width=bar_w, color="#7c3aed", alpha=0.84, label=f"Constant (Mean £{const_pnl['mean_ending_capital']:,.0f} | Med £{const_pnl['median_ending_capital']:,.0f})")
-    ax_cap.bar(x_pos + bar_w / 2.0, comp_caps, width=bar_w, color="#059669", alpha=0.86, label=f"Compound (Mean £{comp_pnl['mean_ending_capital']:,.0f} | Med £{comp_pnl['median_ending_capital']:,.0f})")
-    ax_cap.axhline(float(initial_stake), color="#475569", linestyle="--", linewidth=1.3, label=f"Initial Capital (£{initial_stake:,.0f})")
-    ax_cap.axhline(float(comp_pnl["mean_ending_capital"]), color="#059669", linestyle=":", linewidth=1.2, alpha=0.8)
-    ax_cap.axhline(float(const_pnl["mean_ending_capital"]), color="#7c3aed", linestyle=":", linewidth=1.2, alpha=0.8)
-    ax_cap.set_ylabel("Independent Window Ending Capital (£)")
-    ax_cap.grid(axis="y", color="#e2e8f0", linewidth=0.8)
-    ax_cap.legend(loc="upper left", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.8)
-
-    summary_box = (
-        f"Compound — Mean: £{comp_pnl['mean_ending_capital']:,.0f} | Median: £{comp_pnl['median_ending_capital']:,.0f}\n"
-        f"  Mean P&L: £{comp_pnl['mean_profit']:+,.0f} (±£{comp_pnl['std_profit']:,.0f}) | Profitable: {comp_pnl['profitable_windows_pct']:.0f}%\n"
-        f"  Worst Window: £{comp_pnl['worst_window_ending_capital']:,.0f} | Best: £{comp_pnl['best_window_ending_capital']:,.0f}\n"
-        f"Constant — Mean: £{const_pnl['mean_ending_capital']:,.0f} | Worst: £{const_pnl['worst_window_ending_capital']:,.0f}"
-    )
-    ax_cap.text(
-        0.99,
-        0.95,
-        summary_box,
-        transform=ax_cap.transAxes,
-        ha="right",
-        va="top",
-        fontsize=8.6,
-        fontweight="bold",
-        bbox={"boxstyle": "round,pad=0.45", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
-    )
-
-    # --- Bottom Subplot: Within-Window Max Drawdown (%) ---
-    comp_dds = comp_df["max_drawdown_pct"].to_numpy(dtype=np.float64)
-    const_dds = const_df["max_drawdown_pct"].to_numpy(dtype=np.float64)
-    ax_dd.bar(x_pos - bar_w / 2.0, const_dds, width=bar_w, color="#f97316", alpha=0.80, label="Constant Max DD (%)")
-    ax_dd.bar(x_pos + bar_w / 2.0, comp_dds, width=bar_w, color="#dc2626", alpha=0.82, label="Compound Max DD (%)")
-    ax_dd.axhline(0.0, color="#475569", linewidth=1.0)
-    min_dd = min(-5.0, float(min(comp_dds.min(), const_dds.min())) * 1.18)
-    ax_dd.set_ylim(min_dd, 2.0)
-    ax_dd.set_ylabel("Within-Window Max DD (%)")
-    ax_dd.set_xlabel("Independent Chronological Validation Windows (Each Starting Fresh at £1,000)")
-    ax_dd.set_xticks(x_pos)
-    ax_dd.set_xticklabels(w_labels, rotation=32, ha="right", fontsize=8.5)
-    ax_dd.grid(axis="y", color="#e2e8f0", linewidth=0.8)
-    ax_dd.legend(loc="lower left", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.8)
-
-    basis_tag = (
-        "Official NCORR/NMMC"
-        if str(score_basis).strip().lower() == "ncorr_nmmc"
-        else "PROXY (CORR/MMC on R1393+ Formula)"
-    )
-    mmc_tag = f"{corr_weight:g}×CORR + {mmc_weight:g}×MMC" if comp_pnl["has_mmc"] else f"{corr_weight:g}×CORR only (no meta_model.parquet)"
-    pf_label = "Series" if isinstance(payout_factor, pd.Series) else f"{float(payout_factor):.2f}"
-    fig.suptitle(f"Numerai Classic R1393+ Independent-Window Staking P&L — {title}", fontsize=13.2, fontweight="bold", y=0.985)
+    fig.suptitle(f"One-Wallet Staking Equity Curve — {title}", fontsize=13.5, fontweight="bold", y=0.985)
     fig.text(
         0.5,
-        0.938,
-        f"{basis_tag} | {mmc_tag} | clip=[{clip_min * 100:.0f}%, +{clip_max * 100:.0f}%] | PF={pf_label} | stride={stride} | no cross-window compounding",
+        0.925,
+        headline_text,
         ha="center",
         va="top",
-        fontsize=9.2,
+        fontsize=12.5,
+        fontweight="bold",
+        color="#0f172a",
+        bbox={"boxstyle": "round,pad=0.38", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
+    )
+    fig.text(
+        0.5,
+        0.02,
+        f"Worst single round: £{worst_round:+,.2f} | Per-round stake: TVL/{concurrent_rounds} (£{pnl['per_round_stake_initial']:.2f} initial, {settlement_rounds}-era lock) | "
+        f"{pnl['score_basis']} | {pnl['payout_rule_summary']} | FX: {pnl['fx_status']}",
+        ha="center",
+        va="bottom",
+        fontsize=8.6,
         color="#475569",
     )
-    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
+    plt.tight_layout(rect=(0.0, 0.055, 1.0, 0.865))
     if save_path is not None:
         out_path = Path(save_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(out_path, dpi=140)
     plt.show()
-    comp_pnl["constant_summary"] = {
-        "mean_ending_capital": const_pnl["mean_ending_capital"],
-        "median_ending_capital": const_pnl["median_ending_capital"],
-        "mean_profit": const_pnl["mean_profit"],
-        "worst_window_ending_capital": const_pnl["worst_window_ending_capital"],
-        "profitable_windows_pct": const_pnl["profitable_windows_pct"],
-    }
-    return comp_pnl
+    return pnl
 
 
 def plot_stake_pnl_monte_carlo(
     per_era_corr: pd.Series,
     *,
     per_era_mmc: Optional[pd.Series] = None,
-    title: str = "Best Model",
+    per_era_ncorr: Optional[pd.Series] = None,
+    per_era_nmmc: Optional[pd.Series] = None,
+    title: str = "Model",
+    total_capital: Optional[float] = None,
     initial_stake: float = 1000.0,
-    corr_weight: float = 8.0,
-    mmc_weight: float = 32.0,
+    concurrent_rounds: int = CLASSIC_CONCURRENT_ROUNDS,
+    settlement_rounds: int = CLASSIC_SETTLEMENT_ROUNDS,
+    corr_weight: Optional[float] = None,
+    mmc_weight: Optional[float] = None,
     payout_factor: Union[float, pd.Series] = 1.0,
-    clip_min: float = -0.25,
-    clip_max: float = 0.25,
+    clip_min: Optional[float] = None,
+    clip_max: Optional[float] = None,
+    neutral_churn: Optional[Union[float, pd.Series]] = None,
     churn_penalty: Optional[Union[float, pd.Series]] = None,
-    stride: int = 4,
-    window_rounds: int = 13,
-    score_basis: str = "corr_mmc_proxy",
-    n_sims: int = 1000,
-    block_size: int = 3,
+    payout_rule: str = "auto",
+    staking_mode: str = "compound",
+    stride: int = 1,
+    n_sims: int = 500,
+    block_size: int = 4,
     random_state: int = 42,
     save_path: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Plot a separate 2-panel Within-Window Block-Bootstrap Monte Carlo Dashboard (Aggregated Distribution + Per-Window Uncertainty)."""
+    """Plot the distribution of final ONE-WALLET values from block-bootstrap Monte Carlo simulation."""
     import matplotlib.pyplot as plt
 
-    mc_comp = simulate_stake_pnl_monte_carlo(
+    mc = simulate_stake_pnl_monte_carlo(
         per_era_corr,
         per_era_mmc=per_era_mmc,
+        per_era_ncorr=per_era_ncorr,
+        per_era_nmmc=per_era_nmmc,
+        total_capital=total_capital,
         initial_stake=initial_stake,
+        concurrent_rounds=concurrent_rounds,
+        settlement_rounds=settlement_rounds,
         corr_weight=corr_weight,
         mmc_weight=mmc_weight,
         payout_factor=payout_factor,
         clip_min=clip_min,
         clip_max=clip_max,
+        neutral_churn=neutral_churn,
         churn_penalty=churn_penalty,
-        staking_mode="compound",
+        payout_rule=payout_rule,
+        staking_mode=staking_mode,
         stride=stride,
-        window_rounds=window_rounds,
         n_sims=n_sims,
         block_size=block_size,
         random_state=random_state,
     )
-    mc_const = simulate_stake_pnl_monte_carlo(
-        per_era_corr,
-        per_era_mmc=per_era_mmc,
-        initial_stake=initial_stake,
-        corr_weight=corr_weight,
-        mmc_weight=mmc_weight,
-        payout_factor=payout_factor,
-        clip_min=clip_min,
-        clip_max=clip_max,
-        churn_penalty=churn_penalty,
-        staking_mode="constant",
-        stride=stride,
-        window_rounds=window_rounds,
-        n_sims=n_sims,
-        block_size=block_size,
-        random_state=random_state,
+    finals = np.asarray(mc["final_stakes"], dtype=np.float64)
+    if len(finals) == 0:
+        return mc
+
+    start_cap = float(mc["start_capital"])
+    actual_end = float(mc["actual_end_capital"])
+
+    fig, ax = plt.subplots(figsize=(13.5, 5.4), facecolor="white")
+    ax.set_facecolor("white")
+
+    ax.hist(finals, bins=35, color="#059669", alpha=0.62, edgecolor="white", label=f"Simulated Final Wallet (n={mc['n_sims']:,})")
+    ax.axvline(start_cap, color="#475569", linestyle="--", linewidth=1.5, label=f"Start (£{start_cap:,.0f})")
+    ax.axvline(actual_end, color="#1d4ed8", linestyle="-", linewidth=2.0, label=f"Actual End (£{actual_end:,.2f})")
+    ax.axvline(float(mc["mc_p05_final_stake"]), color="#dc2626", linestyle=":", linewidth=1.8, label=f"5th Pct (£{mc['mc_p05_final_stake']:,.2f})")
+    ax.set_xlim(left=0.0)
+    ax.set_xlabel("Final One-Wallet Balance (£)")
+    ax.set_ylabel("Simulated Paths")
+    ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(loc="upper right", frameon=True, facecolor="white", framealpha=0.92, fontsize=9.0)
+
+    summary_box = (
+        f"Start: £{start_cap:,.0f} | Actual End: £{actual_end:,.2f}\n"
+        f"MC 5th / Median / 95th: £{mc['mc_p05_final_stake']:,.2f} / £{mc['mc_median_final_stake']:,.2f} / £{mc['mc_p95_final_stake']:,.2f}\n"
+        f"P(Profit): {mc['mc_prob_profit_pct']:.1f}% | P(Ruin): {mc['mc_prob_ruin_pct']:.1f}% | 95% Worst Dip: {mc['mc_p95_money_drawdown_pct']:.2f}%"
     )
-    win_mc_df = mc_comp["window_mc_df"]
-    if not isinstance(win_mc_df, pd.DataFrame) or win_mc_df.empty:
-        return mc_comp
-
-    fig, (ax_dist, ax_win) = plt.subplots(
-        1, 2, figsize=(17, 5.8), gridspec_kw={"width_ratios": [1.15, 1.35]}
-    )
-    fig.patch.set_facecolor("white")
-
-    # --- Left Panel: Aggregated Terminal Capital Distribution (Constant vs Compound) ---
-    comp_f = np.asarray(mc_comp["final_stakes"], dtype=np.float64)
-    const_f = np.asarray(mc_const["final_stakes"], dtype=np.float64)
-    p99 = float(np.percentile(np.concatenate([comp_f, const_f]), 99.0))
-    comp_plot = np.clip(comp_f, 0.0, max(initial_stake * 1.5, p99))
-    const_plot = np.clip(const_f, 0.0, max(initial_stake * 1.5, p99))
-
-    ax_dist.hist(const_plot, bins=35, color="#7c3aed", alpha=0.45, edgecolor="white", label=f"Constant (Med £{mc_const['mc_median_final_stake']:,.0f})")
-    ax_dist.hist(comp_plot, bins=35, color="#059669", alpha=0.50, edgecolor="white", label=f"Compound (Med £{mc_comp['mc_median_final_stake']:,.0f})")
-    ax_dist.axvline(float(initial_stake), color="#475569", linestyle="--", linewidth=1.4, label=f"Initial (£{initial_stake:,.0f})")
-    ax_dist.axvline(float(mc_comp["mc_p05_final_stake"]), color="#dc2626", linestyle=":", linewidth=1.6, label=f"Comp 5th Pct (£{mc_comp['mc_p05_final_stake']:,.0f})")
-    ax_dist.set_xlabel("Terminal Window Capital (£, clipped at 99th pct for display)")
-    ax_dist.set_ylabel("Simulated Paths (Aggregated Across Windows)")
-    ax_dist.set_title("Aggregated Within-Window Terminal Capital", fontsize=11.8, fontweight="bold")
-    ax_dist.grid(axis="y", color="#e2e8f0", linewidth=0.8)
-    ax_dist.legend(loc="upper right", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.5)
-
-    risk_box = (
-        f"Compound MC — P(Profit): {mc_comp['mc_prob_profit_pct']:.1f}%\n"
-        f"  5th / 50th / 95th: £{mc_comp['mc_p05_final_stake']:,.0f} / £{mc_comp['mc_median_final_stake']:,.0f} / £{mc_comp['mc_p95_final_stake']:,.0f}\n"
-        f"  95% Worst DD: {mc_comp['mc_p95_max_drawdown_pct']:.1f}%\n"
-        f"Constant MC — P(Profit): {mc_const['mc_prob_profit_pct']:.1f}% | 5th: £{mc_const['mc_p05_final_stake']:,.0f}"
-    )
-    ax_dist.text(
-        0.03,
+    ax.text(
+        0.02,
         0.95,
-        risk_box,
-        transform=ax_dist.transAxes,
+        summary_box,
+        transform=ax.transAxes,
         ha="left",
         va="top",
-        fontsize=8.3,
+        fontsize=8.8,
         fontweight="bold",
-        bbox={"boxstyle": "round,pad=0.4", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
+        bbox={"boxstyle": "round,pad=0.42", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
     )
 
-    # --- Right Panel: Per-Window Monte Carlo Uncertainty Intervals (Compound) ---
-    wx = np.arange(len(win_mc_df))
-    p05 = win_mc_df["p05"].to_numpy(dtype=np.float64)
-    p25 = win_mc_df["p25"].to_numpy(dtype=np.float64)
-    p50 = win_mc_df["p50"].to_numpy(dtype=np.float64)
-    p75 = win_mc_df["p75"].to_numpy(dtype=np.float64)
-    p95 = win_mc_df["p95"].to_numpy(dtype=np.float64)
-    actual = win_mc_df["actual_ending_capital"].to_numpy(dtype=np.float64)
-
-    ax_win.vlines(wx, p05, p95, color="#3b82f6", linewidth=2.0, alpha=0.55, label="5th–95th Pct Range")
-    ax_win.vlines(wx, p25, p75, color="#1d4ed8", linewidth=6.5, alpha=0.75, label="25th–75th IQR")
-    ax_win.scatter(wx, p50, color="#1e3a8a", s=38, zorder=5, label="MC Median")
-    ax_win.scatter(wx, actual, color="#059669", marker="D", s=42, zorder=6, label="Actual Window Outcome")
-    ax_win.axhline(float(initial_stake), color="#475569", linestyle="--", linewidth=1.3, label=f"Initial (£{initial_stake:,.0f})")
-    ax_win.set_xticks(wx)
-    ax_win.set_xticklabels(win_mc_df["window"].astype(str).tolist(), rotation=32, ha="right", fontsize=8.5)
-    ax_win.set_ylabel("Window Ending Capital (£)")
-    ax_win.set_xlabel("Independent Validation Window")
-    ax_win.set_title("Per-Window Monte Carlo Uncertainty (Compound)", fontsize=11.8, fontweight="bold")
-    ax_win.grid(axis="y", color="#e2e8f0", linewidth=0.8)
-    ax_win.legend(loc="upper left", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.5)
-
-    basis_tag = (
-        "Official NCORR/NMMC"
-        if str(score_basis).strip().lower() == "ncorr_nmmc"
-        else "PROXY (CORR/MMC on R1393+ Formula)"
-    )
-    fig.suptitle(f"Within-Window Monte Carlo Block-Bootstrap Risk — {title}", fontsize=13.2, fontweight="bold", y=0.99)
+    fig.suptitle(f"One-Wallet Monte Carlo Final Balance Distribution — {title}", fontsize=13.2, fontweight="bold", y=0.985)
     fig.text(
         0.5,
-        0.925,
-        f"{basis_tag} | n_sims={n_sims:,}/window | block_size={block_size} rounds | each window starts fresh at £{initial_stake:,.0f}",
+        0.92,
+        f"Full-horizon single wallet (TVL/{concurrent_rounds}, {settlement_rounds}-era lock, no resets) | "
+        f"{mc['score_basis']} | {mc['payout_rule_summary']} | block_size={mc['block_size']}",
         ha="center",
         va="top",
-        fontsize=9.2,
+        fontsize=8.8,
         color="#475569",
     )
-    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.90))
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.89))
     if save_path is not None:
         out_path = Path(save_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(out_path, dpi=140)
     plt.show()
-    mc_comp["constant_mc"] = {
-        "mc_p05_final_stake": mc_const["mc_p05_final_stake"],
-        "mc_median_final_stake": mc_const["mc_median_final_stake"],
-        "mc_prob_profit_pct": mc_const["mc_prob_profit_pct"],
-    }
-    return mc_comp
+    return mc
 
 
 def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
-    """Build a flat candidate results table with percentage score, extended CV metrics, OOF staking P&L scalars, and every hyperparameter expanded into its own column."""
+    """Build a flat candidate results table with score_version, extended CV metrics, one-wallet OOF staking P&L scalars, and hyperparameters."""
     cv_res = getattr(search_or_results, "cv_results_", search_or_results)
     if not cv_res:
         _CV_FOLD_METRIC_LOG.clear()
         return pd.DataFrame()
     df = pd.DataFrame(cv_res)
     if "mean_test_score" in df.columns:
-        df["mean_test_corr_pct"] = (df["mean_test_score"].astype(float) * 100.0).round(2)
+        df["mean_test_score_pct"] = (df["mean_test_score"].astype(float) * 100.0).round(2)
 
-    # Attach per-candidate extended metrics & OOF staking P&L scalars logged by `candidate_score`
+    # Attach per-candidate extended metrics & one-wallet OOF staking P&L scalars logged by `candidate_score`
     split_cols = sorted(
         [col for col in df.columns if col.startswith("split") and col.endswith("_test_score")],
         key=lambda c: int(c[len("split") : c.index("_test_score")]),
     )
     if _CV_FOLD_METRIC_LOG and split_cols:
         metric_specs = (
+            ("mean_numerai_corr", "numerai_corr", 4),
+            ("mean_era_corr_std", "era_corr_std", 4),
             ("mean_positive_era_pct", "positive_era_pct", 2),
             ("mean_directional_accuracy_pct", "directional_accuracy_pct", 2),
             ("mean_accurate_pct", "accurate_pct", 2),
@@ -2787,17 +3040,19 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
             ("mean_spearman", "spearman", 4),
             ("mean_mae", "mae", 4),
             ("mean_forecast_bias", "forecast_bias", 4),
-            ("mean_max_drawdown", "max_drawdown", 4),
+            ("mean_corr_drawdown", "corr_drawdown", 4),
         )
         pnl_scalar_keys = (
-            "final_stake",
-            "net_profit",
+            "start_capital",
+            "end_capital",
+            "total_profit",
             "total_return_pct",
-            "max_drawdown_pct",
+            "money_drawdown_pct",
             "max_drawdown_gbp",
-            "worst_era_gbp",
+            "worst_round_gbp",
         )
         used_mask = [False] * len(_CV_FOLD_METRIC_LOG)
+        score_versions_col: List[str] = []
         agg_cols: Dict[str, List[float]] = {out_col: [] for out_col, _, _ in metric_specs}
         pnl_cols: Dict[str, List[float]] = {k: [] for k in pnl_scalar_keys}
         for row_idx in range(len(df)):
@@ -2807,13 +3062,18 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
                 if not np.isfinite(score_val):
                     continue
                 for log_idx, rec in enumerate(_CV_FOLD_METRIC_LOG):
-                    if not used_mask[log_idx] and abs(float(rec["numerai_corr"]) - score_val) <= 1e-12:
+                    logged_score = float(rec.get("score_value", rec["numerai_corr"]))
+                    if not used_mask[log_idx] and abs(logged_score - score_val) <= 1e-12:
                         used_mask[log_idx] = True
                         matched_records.append(rec)
                         break
+            if matched_records:
+                score_versions_col.append(str(matched_records[0].get("score_version", "v0_default")))
+            else:
+                score_versions_col.append("unknown")
             for out_col, src_key, decimals in metric_specs:
                 if matched_records:
-                    val = float(np.mean([float(rec[src_key]) for rec in matched_records]))
+                    val = float(np.mean([float(rec.get(src_key, np.nan)) for rec in matched_records]))
                     agg_cols[out_col].append(round(val, decimals))
                 else:
                     agg_cols[out_col].append(np.nan)
@@ -2825,13 +3085,13 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
             if fold_era_corrs:
                 stitched_oof = pd.concat(fold_era_corrs).sort_index()
                 stitched_oof = stitched_oof.loc[~stitched_oof.index.duplicated(keep="last")]
-                oof_stride = _infer_non_overlapping_stride(stitched_oof.index, default_stride=4)
-                oof_pnl = simulate_stake_pnl(stitched_oof, stride=oof_stride)
+                oof_pnl = simulate_stake_pnl(stitched_oof)
                 for k in pnl_scalar_keys:
                     pnl_cols[k].append(round(float(oof_pnl[k]), 2))
             else:
                 for k in pnl_scalar_keys:
                     pnl_cols[k].append(np.nan)
+        df["score_version"] = score_versions_col
         for out_col, vals in agg_cols.items():
             df[out_col] = vals
         for k, vals in pnl_cols.items():

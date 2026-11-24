@@ -1021,6 +1021,7 @@ def run_baseline(
     feature_columns: List[str],
     *,
     search_mode: str = "bayes",
+    score_version: str = "v0_default",
     eval_mode: str = "both",
     cv_object: Any = None,
     n_iter: int = 37,
@@ -1044,10 +1045,10 @@ def run_baseline(
     from utils import (
         build_conditional_bayesian_spaces,
         build_quick_results_df,
-        candidate_score,
         configure_error_binning,
         deduplicate_param_grid,
         evaluate_numerai_predictions,
+        make_candidate_scorer,
         prepare_tuned_pipeline,
         reset_cv_metric_log,
         simulate_stake_pnl,
@@ -1114,13 +1115,15 @@ def run_baseline(
             "era_corr_kurtosis": val_eval["era_corr_kurtosis"],
             "jarque_bera_pvalue": val_eval["jarque_bera_pvalue"],
             "feature_exposure": val_eval["feature_exposure"],
-            "max_drawdown": val_eval["max_drawdown"],
-            "final_stake": round(float(val_pnl["final_stake"]), 2),
-            "net_profit": round(float(val_pnl["net_profit"]), 2),
+            "corr_drawdown": val_eval["corr_drawdown"],
+            "start_capital": round(float(val_pnl["start_capital"]), 2),
+            "end_capital": round(float(val_pnl["end_capital"]), 2),
+            "total_profit": round(float(val_pnl["total_profit"]), 2),
             "total_return_pct": round(float(val_pnl["total_return_pct"]), 2),
-            "max_drawdown_pct": round(float(val_pnl["max_drawdown_pct"]), 2),
+            "money_drawdown_pct": round(float(val_pnl["money_drawdown_pct"]), 2),
             "max_drawdown_gbp": round(float(val_pnl["max_drawdown_gbp"]), 2),
-            "worst_era_gbp": round(float(val_pnl["worst_era_gbp"]), 2),
+            "worst_round_gbp": round(float(val_pnl["worst_round_gbp"]), 2),
+            "score_version": str(score_version),
             "corr_gap": train_eval["numerai_corr"] - val_eval["numerai_corr"],
             "sanity_status": val_eval["sanity_status"],
             "validation_preds": val_preds,
@@ -1175,13 +1178,15 @@ def run_baseline(
             "era_corr_kurtosis": wf_eval["era_corr_kurtosis"],
             "jarque_bera_pvalue": wf_eval["jarque_bera_pvalue"],
             "feature_exposure": wf_eval["feature_exposure"],
-            "max_drawdown": wf_eval["max_drawdown"],
-            "final_stake": round(float(wf_pnl["final_stake"]), 2),
-            "net_profit": round(float(wf_pnl["net_profit"]), 2),
+            "corr_drawdown": wf_eval["corr_drawdown"],
+            "start_capital": round(float(wf_pnl["start_capital"]), 2),
+            "end_capital": round(float(wf_pnl["end_capital"]), 2),
+            "total_profit": round(float(wf_pnl["total_profit"]), 2),
             "total_return_pct": round(float(wf_pnl["total_return_pct"]), 2),
-            "max_drawdown_pct": round(float(wf_pnl["max_drawdown_pct"]), 2),
+            "money_drawdown_pct": round(float(wf_pnl["money_drawdown_pct"]), 2),
             "max_drawdown_gbp": round(float(wf_pnl["max_drawdown_gbp"]), 2),
-            "worst_era_gbp": round(float(wf_pnl["worst_era_gbp"]), 2),
+            "worst_round_gbp": round(float(wf_pnl["worst_round_gbp"]), 2),
+            "score_version": str(score_version),
             "corr_gap": train_eval["numerai_corr"] - wf_eval["numerai_corr"],
             "sanity_status": wf_eval["sanity_status"],
             "validation_preds": wf_preds,
@@ -1189,6 +1194,7 @@ def run_baseline(
             "params": default_model.named_steps["estimator"].get_params(),
         }
 
+    cv_scorer = make_candidate_scorer(score_version=score_version)
     if search_mode == "bayes":
         if BayesSearchCV is None:
             raise ImportError("scikit-optimize is required for Bayesian search")
@@ -1206,7 +1212,7 @@ def run_baseline(
                 "acq_func": "EI",
                 "n_initial_points": min(4, max(1, n_iter // 3)),
             },
-            scoring=candidate_score,
+            scoring=cv_scorer,
             cv=cv_object,
             refit=False,
             random_state=random_state,
@@ -1219,7 +1225,7 @@ def run_baseline(
         search = GridSearchCV(
             estimator=pipeline,
             param_grid=deduped_grid,
-            scoring=candidate_score,
+            scoring=cv_scorer,
             cv=cv_object,
             refit=False,
             verbose=verbose,
@@ -1231,11 +1237,20 @@ def run_baseline(
     search.fit(X_train, y_train, groups=train_eras)
     cv_results_df = build_quick_results_df(search)
     best_params = dict(search.best_params_)
+    effective_ver = (
+        str(cv_results_df.loc[0, "score_version"])
+        if ("score_version" in cv_results_df.columns and len(cv_results_df) > 0)
+        else str(score_version)
+    )
     search_summary_row = {
         "baseline": baseline_name,
         "search_mode": search_mode,
-        "best_cv_corr": float(search.best_score_),
-        "best_cv_corr_pct": round(float(search.best_score_) * 100.0, 2),
+        "score_version": effective_ver,
+        "best_cv_score": float(search.best_score_),
+        "best_cv_corr": float(cv_results_df.loc[0, "mean_numerai_corr"])
+        if ("mean_numerai_corr" in cv_results_df.columns and len(cv_results_df) > 0)
+        else float(search.best_score_),
+        "best_cv_score_pct": round(float(search.best_score_) * 100.0, 2),
         "best_params": best_params,
     }
 
@@ -1289,13 +1304,15 @@ def run_baseline(
             "era_corr_kurtosis": tuned_val_eval["era_corr_kurtosis"],
             "jarque_bera_pvalue": tuned_val_eval["jarque_bera_pvalue"],
             "feature_exposure": tuned_val_eval["feature_exposure"],
-            "max_drawdown": tuned_val_eval["max_drawdown"],
-            "final_stake": round(float(tuned_val_pnl["final_stake"]), 2),
-            "net_profit": round(float(tuned_val_pnl["net_profit"]), 2),
+            "corr_drawdown": tuned_val_eval["corr_drawdown"],
+            "start_capital": round(float(tuned_val_pnl["start_capital"]), 2),
+            "end_capital": round(float(tuned_val_pnl["end_capital"]), 2),
+            "total_profit": round(float(tuned_val_pnl["total_profit"]), 2),
             "total_return_pct": round(float(tuned_val_pnl["total_return_pct"]), 2),
-            "max_drawdown_pct": round(float(tuned_val_pnl["max_drawdown_pct"]), 2),
+            "money_drawdown_pct": round(float(tuned_val_pnl["money_drawdown_pct"]), 2),
             "max_drawdown_gbp": round(float(tuned_val_pnl["max_drawdown_gbp"]), 2),
-            "worst_era_gbp": round(float(tuned_val_pnl["worst_era_gbp"]), 2),
+            "worst_round_gbp": round(float(tuned_val_pnl["worst_round_gbp"]), 2),
+            "score_version": effective_ver,
             "corr_gap": tuned_train_eval["numerai_corr"] - tuned_val_eval["numerai_corr"],
             "sanity_status": tuned_val_eval["sanity_status"],
             "validation_preds": tuned_val_preds,
@@ -1350,13 +1367,15 @@ def run_baseline(
             "era_corr_kurtosis": tuned_wf_eval["era_corr_kurtosis"],
             "jarque_bera_pvalue": tuned_wf_eval["jarque_bera_pvalue"],
             "feature_exposure": tuned_wf_eval["feature_exposure"],
-            "max_drawdown": tuned_wf_eval["max_drawdown"],
-            "final_stake": round(float(tuned_wf_pnl["final_stake"]), 2),
-            "net_profit": round(float(tuned_wf_pnl["net_profit"]), 2),
+            "corr_drawdown": tuned_wf_eval["corr_drawdown"],
+            "start_capital": round(float(tuned_wf_pnl["start_capital"]), 2),
+            "end_capital": round(float(tuned_wf_pnl["end_capital"]), 2),
+            "total_profit": round(float(tuned_wf_pnl["total_profit"]), 2),
             "total_return_pct": round(float(tuned_wf_pnl["total_return_pct"]), 2),
-            "max_drawdown_pct": round(float(tuned_wf_pnl["max_drawdown_pct"]), 2),
+            "money_drawdown_pct": round(float(tuned_wf_pnl["money_drawdown_pct"]), 2),
             "max_drawdown_gbp": round(float(tuned_wf_pnl["max_drawdown_gbp"]), 2),
-            "worst_era_gbp": round(float(tuned_wf_pnl["worst_era_gbp"]), 2),
+            "worst_round_gbp": round(float(tuned_wf_pnl["worst_round_gbp"]), 2),
+            "score_version": effective_ver,
             "corr_gap": tuned_train_eval["numerai_corr"] - tuned_wf_eval["numerai_corr"],
             "sanity_status": tuned_wf_eval["sanity_status"],
             "validation_preds": tuned_wf_preds,
