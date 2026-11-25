@@ -681,14 +681,16 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
             compute_era_error_envelope(y_true, y_pred[:-1], eras)
 
     def test_plot_residual_diagnostics_summary_and_exports(self) -> None:
-        eras = np.repeat(np.arange(1, 7, dtype=np.int32), 25)
+        # Test on 100 data points across discrete Numerai targets (including exact 0.0) and optional era_window
+        eras = np.repeat(np.arange(1, 11, dtype=np.int32), 10)
         rng = np.random.default_rng(77)
-        y_true = rng.choice([0.0, 0.25, 0.5, 0.75, 1.0], size=len(eras))
-        preds_a = np.clip(y_true * 0.2 + 0.4 + rng.normal(0.0, 0.03, size=len(eras)), 0.0, 1.0)
-        preds_b = np.clip(y_true * 0.1 + 0.45 + rng.normal(0.0, 0.05, size=len(eras)), 0.0, 1.0)
+        y_true = rng.choice([0.0, 0.25, 0.5, 0.75, 1.0], size=100)
+        y_true[0] = 0.0
+        preds_a = np.clip(y_true * 0.2 + 0.4 + rng.normal(0.0, 0.03, size=100), 0.0, 1.0)
+        preds_b = np.clip(y_true * 0.1 + 0.45 + rng.normal(0.0, 0.05, size=100), 0.0, 1.0)
 
         with tempfile.TemporaryDirectory() as tmp:
-            prefix = Path(tmp) / "residual_diag"
+            prefix = Path(tmp) / "residual_diag_discrete"
             summary_df = utils.plot_residual_diagnostics(
                 y_true,
                 {"Model A [Tuned]": {"validation_preds": preds_a}, "Model B [Tuned]": preds_b},
@@ -701,6 +703,7 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
             )
             self.assertEqual(len(summary_df), 2)
             self.assertEqual(summary_df.loc[0, "variant"], "[BEST] Model A [Tuned]")
+            self.assertEqual(int(summary_df.loc[0, "n_valid"]), 100)
             self.assertSetEqual(
                 set(summary_df.columns),
                 {
@@ -715,10 +718,81 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
             )
             self.assertTrue((Path(f"{prefix}_residuals_vs_actual.png")).is_file())
             self.assertTrue((Path(f"{prefix}_actual_vs_predicted_by_era.png")).is_file())
-            self.assertFalse((Path(f"{prefix}_pct_error_vs_actual.png")).exists())
+            self.assertTrue((Path(f"{prefix}_pct_error_vs_actual.png")).is_file())
+
+            # Continuous targets with default era_window=None (all validation eras)
+            y_cont = rng.normal(0.5, 0.2, size=100)
+            p_cont_a = y_cont + rng.normal(0.0, 0.05, size=100)
+            p_cont_b = y_cont + rng.normal(-0.02, 0.08, size=100)
+            prefix_cont = Path(tmp) / "residual_diag_continuous"
+            cont_df = utils.plot_residual_diagnostics(
+                y_cont,
+                {"Cont A": p_cont_a, "Cont B": p_cont_b},
+                eras,
+                best_variant_name="Cont A",
+                era_window=None,
+                random_state=77,
+                save_prefix=prefix_cont,
+            )
+            self.assertEqual(len(cont_df), 2)
+            self.assertEqual(int(cont_df.loc[0, "n_valid"]), 100)
+            self.assertTrue((Path(f"{prefix_cont}_residuals_vs_actual.png")).is_file())
+            self.assertTrue((Path(f"{prefix_cont}_actual_vs_predicted_by_era.png")).is_file())
+            self.assertTrue((Path(f"{prefix_cont}_pct_error_vs_actual.png")).is_file())
+
+            # All-zero targets edge case must still render all 3 figures without zero-division error
+            prefix_zero = Path(tmp) / "residual_diag_zeros"
+            zero_df = utils.plot_residual_diagnostics(
+                np.zeros(100, dtype=np.float64),
+                {"ZeroModel": preds_a},
+                eras,
+                save_prefix=prefix_zero,
+            )
+            self.assertEqual(len(zero_df), 1)
+            self.assertTrue((Path(f"{prefix_zero}_pct_error_vs_actual.png")).is_file())
 
         with self.assertRaises(ValueError):
             utils.plot_residual_diagnostics(y_true, {"Bad": preds_a[:-1]}, eras)
+
+    def test_memory_cleanup_and_lightweight_afml_and_mc_helpers(self) -> None:
+        rng = np.random.default_rng(19)
+        era_corrs = pd.Series(rng.normal(0.01, 0.02, size=20), index=np.arange(1, 21, dtype=np.int32))
+        results_map = {
+            "Baseline P (Persistence) [Default]": {
+                "validation_preds": np.full(100, 0.5, dtype=np.float64),
+                "validation_era_corrs": era_corrs,
+                "validation_sharpe": float(sharpe_ratio(era_corrs)),
+                "validation_fnc": 0.008,
+                "validation_fnc_sharpe": 0.45,
+            },
+            "Baseline P (Persistence) [Tuned]": {
+                "validation_preds": np.full(100, 0.51, dtype=np.float64),
+                "validation_era_corrs": era_corrs + 0.002,
+                "validation_sharpe": float(sharpe_ratio(era_corrs + 0.002)),
+                "validation_fnc": np.nan,
+                "validation_fnc_sharpe": np.nan,
+            },
+        }
+        removed = utils.strip_validation_predictions(results_map)
+        self.assertEqual(removed, 2)
+        for entry in results_map.values():
+            self.assertNotIn("validation_preds", entry)
+
+        afml_df = utils.build_afml_diagnostics_df(
+            results_map,
+            cv_trial_stats_by_baseline={"Baseline P (Persistence)": {"trial_srs": np.array([0.4, 0.6]), "trials_era_corrs_df": None}},
+            random_state=42,
+        )
+        self.assertEqual(len(afml_df), 2)
+        self.assertAlmostEqual(float(afml_df.loc[0, "fnc_mean"]), 0.008, places=4)
+
+        mc_light = utils.simulate_stake_pnl_monte_carlo(era_corrs, n_sims=30, block_size=4, retain_paths=False)
+        self.assertEqual(mc_light["sim_equity_paths"].shape, (0, 0))
+        self.assertEqual(len(mc_light["final_stakes"]), 30)
+
+        mc_plot_light = utils.plot_stake_pnl_monte_carlo(era_corrs, n_sims=30, block_size=4, retain_paths=False)
+        self.assertEqual(mc_plot_light["sim_equity_paths"].shape, (0, 0))
+        self.assertEqual(len(mc_plot_light["final_stakes"]), 30)
 
     def test_candidate_score_and_build_quick_results_df(self) -> None:
         df, _ = make_synthetic_numerai_panel(n_eras=6, n_tickers=15, n_features=4, seed=44)

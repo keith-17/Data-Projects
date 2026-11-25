@@ -10,7 +10,8 @@ import gc
 import hashlib
 import json
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -46,9 +47,12 @@ def configure_extraction_cache(enabled: bool = True, max_entries: int = 4) -> Di
     return dict(_EXTRACTION_CACHE_CONFIG)
 
 
-def clear_extraction_cache() -> None:
-    """Clear all entries from the per-process extraction cache."""
+def clear_extraction_cache() -> int:
+    """Clear all entries from the per-process extraction cache, run GC, and return cleared count."""
+    cleared = len(_EXTRACTION_CACHE)
     _EXTRACTION_CACHE.clear()
+    gc.collect()
+    return cleared
 
 
 def _build_extraction_cache_key(
@@ -1339,6 +1343,7 @@ def run_baseline(
         label=f"{baseline_name} — Final Validation Scores",
         verbose=True,
     )
+    del default_model, train_preds
 
     if eval_mode in ("static", "both"):
         default_variant_name = f"{baseline_name} [Default]"
@@ -1426,6 +1431,7 @@ def run_baseline(
         "best_cv_score_pct": round(float(search.best_score_) * 100.0, 2),
         "best_params": best_params,
     }
+    del search
 
     tuned_pipeline = prepare_tuned_pipeline(pipeline, best_params)
     tuned_model = clone(tuned_pipeline).fit(X_train_static, y_train_static)
@@ -1523,4 +1529,189 @@ def run_baseline(
             estimator_params=tuned_params,
         )
 
+    del X_train_static, y_train_static, train_eras_static, tuned_train_preds
+    gc.collect()
     return baseline_name, results_entries, cv_results_df, search_summary_row, tuned_model
+
+
+def extract_baseline_interpretability(
+    fitted_models: Mapping[str, Any],
+    *,
+    top_n: int = 20,
+) -> Dict[str, Any]:
+    """Extract compact interpretability tables and scalars so heavy fitted baseline models can be deleted."""
+    artifacts: Dict[str, Any] = {}
+    cap = max(1, int(top_n))
+
+    if "Baseline A (Bin-Snapping)" in fitted_models:
+        est_a = fitted_models["Baseline A (Bin-Snapping)"].named_steps["estimator"]
+        lookup_df = pd.DataFrame(est_a.lookup_table_).T
+        lookup_df.columns = [f"bin_{bin_index}" for bin_index in lookup_df.columns]
+        lookup_df["train_corr"] = est_a.selected_corrs_
+        artifacts["Baseline A (Bin-Snapping)"] = {
+            "total_features": int(len(lookup_df)),
+            "lookup_table_df": lookup_df.head(cap).copy(),
+        }
+
+    if "Baseline E (Lag-Reversal)" in fitted_models:
+        est_e = fitted_models["Baseline E (Lag-Reversal)"].named_steps["estimator"]
+        artifacts["Baseline E (Lag-Reversal)"] = {
+            "n_kept_signals": int((est_e.inversion_signs_ > 0).sum()),
+            "n_inverted_signals": int((est_e.inversion_signs_ < 0).sum()),
+            "rule_summary_df": est_e.rule_summary_.head(cap).copy(),
+        }
+
+    if "Baseline P (Persistence)" in fitted_models:
+        est_p = fitted_models["Baseline P (Persistence)"].named_steps["estimator"]
+        artifacts["Baseline P (Persistence)"] = {
+            "persistence_mode": est_p.persistence_mode,
+            "persistence_lag": est_p.persistence_lag,
+            "global_mean": float(est_p.global_mean_),
+            "tracked_tickers": int(len(est_p.ticker_lookup_)),
+            "persistence_table_df": est_p.persistence_table_.head(min(15, cap)).copy(),
+        }
+
+    return artifacts
+
+
+def display_baseline_interpretability(
+    interpretability: Mapping[str, Any],
+    *,
+    results_dir: Optional[Any] = None,
+    timestamp: str = "",
+    experiment_name: str = "",
+    save_results: bool = False,
+) -> None:
+    """Display and plot compact baseline interpretability artifacts extracted prior to model cleanup."""
+    from utils import display_compact_dataframe
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        plt = None
+
+    if "Baseline A (Bin-Snapping)" in interpretability:
+        info_a = interpretability["Baseline A (Bin-Snapping)"]
+        lookup_table_df = info_a["lookup_table_df"]
+        display_compact_dataframe(
+            lookup_table_df.head(15),
+            title=f"Baseline A Learned Lookup Table (top {info_a['total_features']} features):",
+        )
+
+    if "Baseline E (Lag-Reversal)" in interpretability:
+        info_e = interpretability["Baseline E (Lag-Reversal)"]
+        print(
+            f"Baseline E Signal Rules | kept (+1)={info_e['n_kept_signals']} | "
+            f"inverted (-1)={info_e['n_inverted_signals']}"
+        )
+        display_compact_dataframe(info_e["rule_summary_df"].head(20))
+
+    if "Baseline P (Persistence)" in interpretability:
+        info_p = interpretability["Baseline P (Persistence)"]
+        print(
+            f"Baseline P (Persistence) | mode={info_p['persistence_mode']} | "
+            f"lag={info_p['persistence_lag']} | global_mean={info_p['global_mean']:.4f} | "
+            f"tracked_tickers={info_p['tracked_tickers']}"
+        )
+        display_compact_dataframe(info_p["persistence_table_df"].head(15))
+
+    if plt is not None:
+        out_dir = Path(results_dir) if results_dir is not None else None
+        if "Baseline E (Lag-Reversal)" in interpretability:
+            top_rule_df = interpretability["Baseline E (Lag-Reversal)"]["rule_summary_df"].head(20).copy()
+            top_rule_df["abs_weight"] = top_rule_df["effective_weight"].abs()
+            plot_rule_df = top_rule_df.sort_values("abs_weight", ascending=True)
+            fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
+            bar_colors = ["#10b981" if w >= 0 else "#ef4444" for w in plot_rule_df["effective_weight"]]
+            ax_imp.barh(plot_rule_df["feature"], plot_rule_df["effective_weight"], color=bar_colors, alpha=0.85)
+            ax_imp.axvline(0.0, color="#64748b", linewidth=0.9)
+            ax_imp.set_xlabel("Effective Signed Weight")
+            ax_imp.set_title("Top 20 Baseline E Features by Effective Weight")
+            fig_imp.tight_layout()
+            if save_results and out_dir is not None:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                fig_imp.savefig(out_dir / f"{timestamp}_{experiment_name}_baseline_e_weights.png", dpi=140)
+            plt.show()
+            plt.close(fig_imp)
+        elif "Baseline A (Bin-Snapping)" in interpretability:
+            top_bin_df = interpretability["Baseline A (Bin-Snapping)"]["lookup_table_df"].head(20).copy()
+            top_bin_df["abs_corr"] = top_bin_df["train_corr"].abs()
+            plot_bin_df = top_bin_df.sort_values("abs_corr", ascending=True)
+            fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
+            bar_colors = ["#2563eb" if c >= 0 else "#ef4444" for c in plot_bin_df["train_corr"]]
+            ax_imp.barh(plot_bin_df.index, plot_bin_df["train_corr"], color=bar_colors, alpha=0.85)
+            ax_imp.axvline(0.0, color="#64748b", linewidth=0.9)
+            ax_imp.set_xlabel("Training Target Correlation")
+            ax_imp.set_title("Top 20 Baseline A Features by Training Correlation")
+            fig_imp.tight_layout()
+            if save_results and out_dir is not None:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                fig_imp.savefig(out_dir / f"{timestamp}_{experiment_name}_baseline_a_corrs.png", dpi=140)
+            plt.show()
+            plt.close(fig_imp)
+
+
+def extract_cv_analysis_artifacts(
+    cv_results_by_baseline: Mapping[str, pd.DataFrame],
+    *,
+    top_n: int = 10,
+    results_dir: Optional[Any] = None,
+    timestamp: str = "",
+    experiment_name: str = "",
+    search_mode: str = "bayes",
+    save_results: bool = False,
+    include_model_slug: bool = True,
+) -> Dict[str, Any]:
+    """Export full CV CSVs (if requested) and retain only lightweight top-N tables + trial stats for AFML."""
+    top_candidates: Dict[str, pd.DataFrame] = {}
+    trial_stats: Dict[str, Dict[str, Any]] = {}
+    saved_csv_paths: Dict[str, Path] = {}
+    out_dir = Path(results_dir) if results_dir is not None else None
+    cap = max(1, int(top_n))
+
+    for baseline_name, cv_df in cv_results_by_baseline.items():
+        top_df = cv_df.head(cap).copy()
+        top_df.attrs = {}
+        top_candidates[str(baseline_name)] = top_df
+        trial_srs = (
+            cv_df["mean_sharpe"].dropna().to_numpy(dtype=np.float64)
+            if ("mean_sharpe" in cv_df.columns and len(cv_df) > 0)
+            else np.empty(0, dtype=np.float64)
+        )
+        trial_stats[str(baseline_name)] = {
+            "trial_srs": trial_srs,
+            "trials_era_corrs_df": cv_df.attrs.get("trials_era_corrs_df"),
+        }
+        if save_results and out_dir is not None:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if include_model_slug:
+                baseline_slug = (
+                    "baseline_a"
+                    if "Baseline A" in str(baseline_name)
+                    else ("baseline_e" if "Baseline E" in str(baseline_name) else "persistence")
+                )
+                cv_filename = f"{timestamp}_{experiment_name}_{baseline_slug}_{search_mode}_cv.csv"
+            else:
+                cv_filename = f"{timestamp}_{experiment_name}_{search_mode}_cv.csv"
+            cv_results_path = out_dir / cv_filename
+            cv_df.to_csv(cv_results_path, index=False)
+            saved_csv_paths[str(baseline_name)] = cv_results_path
+
+    return {
+        "top_candidates": top_candidates,
+        "trial_stats": trial_stats,
+        "saved_csv_paths": saved_csv_paths,
+    }
+
+
+def display_top_cv_candidates(cv_analysis_artifacts: Mapping[str, Any]) -> None:
+    """Display pre-extracted top CV candidates per baseline and print saved CSV paths."""
+    from utils import display_compact_dataframe
+
+    top_candidates = cv_analysis_artifacts.get("top_candidates", {})
+    saved_csv_paths = cv_analysis_artifacts.get("saved_csv_paths", {})
+    for baseline_name, top_df in top_candidates.items():
+        display_compact_dataframe(top_df, title=f"Top CV candidates for {baseline_name}:")
+        csv_path = saved_csv_paths.get(baseline_name)
+        if csv_path is not None:
+            print("Saved CV results CSV:", csv_path)

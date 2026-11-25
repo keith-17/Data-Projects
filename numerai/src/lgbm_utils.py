@@ -11,7 +11,8 @@ import gc
 import hashlib
 import json
 from collections import OrderedDict
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import lightgbm as lgb
 import numpy as np
@@ -25,9 +26,12 @@ _LGB_DATASET_CACHE: "OrderedDict[str, lgb.Dataset]" = OrderedDict()
 _LGB_DATASET_CACHE_MAX = 8
 
 
-def clear_lgb_dataset_cache() -> None:
-    """Clear the cached binned LightGBM training datasets."""
+def clear_lgb_dataset_cache() -> int:
+    """Clear the cached binned LightGBM training datasets, run GC, and return cleared count."""
+    cleared = len(_LGB_DATASET_CACHE)
     _LGB_DATASET_CACHE.clear()
+    gc.collect()
+    return cleared
 
 
 def make_shared_lgb_datasets(
@@ -409,3 +413,65 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
 
 
 LightGBMEstimator = LightGBMNumeraiEstimator
+
+
+def extract_lgbm_interpretability(
+    fitted_models: Mapping[str, Any],
+    *,
+    model_name: str = "LightGBM Regressor",
+    top_n: int = 20,
+) -> Dict[str, Any]:
+    """Extract compact LightGBM importance summary so heavy fitted boosters can be deleted immediately."""
+    if model_name not in fitted_models:
+        return {}
+    fitted_lgbm = fitted_models[model_name].named_steps["estimator"]
+    cap = max(1, int(top_n))
+    return {
+        "model_name": str(model_name),
+        "num_trees": int(fitted_lgbm.model_.booster_.num_trees()),
+        "selected_features": int(len(fitted_lgbm.selected_feature_names_)),
+        "boosting_type": fitted_lgbm.boosting_type,
+        "objective": fitted_lgbm.objective,
+        "top_importance_df": fitted_lgbm.feature_importance_df_.head(cap).copy(),
+    }
+
+
+def display_lgbm_interpretability(
+    interpretability: Mapping[str, Any],
+    *,
+    results_dir: Optional[Any] = None,
+    timestamp: str = "",
+    experiment_name: str = "",
+    save_results: bool = False,
+) -> None:
+    """Display and plot compact LightGBM feature-importance artifacts extracted prior to model cleanup."""
+    from utils import display_compact_dataframe
+
+    if not interpretability:
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        plt = None
+
+    top_imp_df = interpretability["top_importance_df"]
+    print(
+        f"LightGBM Fitted Summary | trees={interpretability['num_trees']} | "
+        f"selected_features={interpretability['selected_features']} | "
+        f"boosting_type={interpretability['boosting_type']} | objective={interpretability['objective']}"
+    )
+    display_compact_dataframe(top_imp_df)
+
+    if plt is not None and len(top_imp_df):
+        plot_imp_df = top_imp_df.sort_values("gain_importance", ascending=True)
+        fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
+        ax_imp.barh(plot_imp_df["feature"], plot_imp_df["gain_importance"], color="#2563eb", alpha=0.85)
+        ax_imp.set_xlabel("Gain Importance")
+        ax_imp.set_title("Top 20 LightGBM Features by Gain Importance")
+        fig_imp.tight_layout()
+        if save_results and results_dir is not None:
+            out_dir = Path(results_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fig_imp.savefig(out_dir / f"{timestamp}_{experiment_name}_feature_importance.png", dpi=140)
+        plt.show()
+        plt.close(fig_imp)

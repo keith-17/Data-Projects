@@ -3307,6 +3307,7 @@ def simulate_stake_pnl_monte_carlo(
     random_state: int = 42,
     title: str = "Model",
     era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
+    retain_paths: bool = True,
 ) -> Dict[str, Any]:
     """One-wallet circular block-bootstrap Monte Carlo simulator under Numerai Classic overlapping-rounds staking.
 
@@ -3387,7 +3388,7 @@ def simulate_stake_pnl_monte_carlo(
     final_wallets = np.zeros(n_s, dtype=np.float64)
     worst_dds_pct = np.zeros(n_s, dtype=np.float64)
     ruin_flags = np.zeros(n_s, dtype=bool)
-    sim_paths = np.zeros((n_s, n_t), dtype=np.float64)
+    sim_paths = np.zeros((n_s, n_t), dtype=np.float64) if retain_paths else np.empty((0, 0), dtype=np.float64)
 
     for s_idx in range(n_s):
         eq_path, _, dd_pct, _, _, wiped = _simulate_single_wallet_path(
@@ -3397,7 +3398,8 @@ def simulate_stake_pnl_monte_carlo(
             concurrent_rounds=concurrent_rounds,
             settlement_rounds=settlement_rounds,
         )
-        sim_paths[s_idx] = eq_path
+        if retain_paths:
+            sim_paths[s_idx] = eq_path
         final_wallets[s_idx] = float(eq_path[-1])
         worst_dds_pct[s_idx] = float(dd_pct)
         ruin_flags[s_idx] = bool(wiped)
@@ -3418,11 +3420,34 @@ def simulate_stake_pnl_monte_carlo(
     if len(losing_indices) > 0:
         med_loss_target = float(np.median(final_wallets[losing_indices]))
         pick_loss = int(losing_indices[int(np.argmin(np.abs(final_wallets[losing_indices] - med_loss_target)))])
-        example_losing_path = _extract_path_drawdown_markers(sim_paths[pick_loss], start_cap)
+        if retain_paths:
+            loss_eq = sim_paths[pick_loss]
+        else:
+            loss_eq, _, _, _, _, _ = _simulate_single_wallet_path(
+                sim_rets[pick_loss],
+                start_cap,
+                staking_mode=clean_mode,
+                concurrent_rounds=concurrent_rounds,
+                settlement_rounds=settlement_rounds,
+            )
+        example_losing_path = _extract_path_drawdown_markers(loss_eq, start_cap)
     if len(winning_indices) > 0:
         med_win_target = float(np.median(final_wallets[winning_indices]))
         pick_win = int(winning_indices[int(np.argmin(np.abs(final_wallets[winning_indices] - med_win_target)))])
-        example_winning_path = _extract_path_drawdown_markers(sim_paths[pick_win], start_cap)
+        if retain_paths:
+            win_eq = sim_paths[pick_win]
+        else:
+            win_eq, _, _, _, _, _ = _simulate_single_wallet_path(
+                sim_rets[pick_win],
+                start_cap,
+                staking_mode=clean_mode,
+                concurrent_rounds=concurrent_rounds,
+                settlement_rounds=settlement_rounds,
+            )
+        example_winning_path = _extract_path_drawdown_markers(win_eq, start_cap)
+
+    del starts, offsets, boot_idx, sim_rets
+    gc.collect()
 
     p05_val = float(np.percentile(final_wallets, 5.0))
     med_val = float(np.percentile(final_wallets, 50.0))
@@ -3657,6 +3682,7 @@ def plot_stake_pnl_monte_carlo(
     random_state: int = 42,
     era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
     save_path: Optional[Any] = None,
+    retain_paths: bool = True,
 ) -> Dict[str, Any]:
     """Plot a plain-English 2-panel ONE-WALLET Monte Carlo risk chart with a verdict-first banner and example paths."""
     import matplotlib.pyplot as plt
@@ -3686,6 +3712,7 @@ def plot_stake_pnl_monte_carlo(
         random_state=random_state,
         title=title,
         era_dates=era_dates,
+        retain_paths=True,
     )
     finals = np.asarray(mc["final_stakes"], dtype=np.float64)
     if len(finals) == 0:
@@ -3853,6 +3880,7 @@ def plot_stake_pnl_monte_carlo(
             pad=8,
         )
         ax_fan.legend(loc="upper left", ncol=3, frameon=True, facecolor="white", framealpha=0.92, fontsize=8.3)
+        del pnl_paths
 
     # --- Top Suptitle, Plain-English Verdict Banner, & Bottom Drawdown Footnote ---
     import textwrap
@@ -3892,6 +3920,11 @@ def plot_stake_pnl_monte_carlo(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(out_path, dpi=140)
     plt.show()
+    plt.close(fig)
+    if not retain_paths:
+        mc["sim_equity_paths"] = np.empty((0, 0), dtype=np.float64)
+    del sim_eq_paths
+    gc.collect()
     return mc
 
 
@@ -4833,12 +4866,129 @@ def plot_error_bin_waterfall(
     plt.show()
 
 
+def _format_pct_tick(value: float, _tick_pos: Any) -> str:
+    """Format a percentage axis tick as `{value:g}%`."""
+    return f"{value:g}%"
+
+
 def _apply_clean_residual_axes_style(ax: Any) -> None:
-    """Apply faint horizontal grey gridlines and hide top/right spines on a residual axis."""
+    """Apply CAVU flight-deck horizontal grey gridlines and clean top/right spine removal."""
     ax.yaxis.grid(True, color="grey", alpha=0.25)
     ax.set_axisbelow(True)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    try:
+        import seaborn as sns
+
+        sns.despine(ax=ax)
+    except ImportError:
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+
+def _order_residual_variants(
+    predictions_by_model: Mapping[str, Any],
+    *,
+    best_variant_name: Optional[str] = None,
+    variant_order: Optional[Sequence[str]] = None,
+    max_models: int = 4,
+) -> List[str]:
+    """Order model variants with `best_variant_name` first, then `variant_order`, then insertion order."""
+    ordered: List[str] = []
+    if best_variant_name is not None and best_variant_name in predictions_by_model:
+        ordered.append(str(best_variant_name))
+    candidates = list(variant_order) if variant_order is not None else list(predictions_by_model.keys())
+    for name in candidates:
+        name_str = str(name)
+        if name_str in predictions_by_model and name_str not in ordered:
+            ordered.append(name_str)
+    for name in predictions_by_model:
+        name_str = str(name)
+        if name_str not in ordered:
+            ordered.append(name_str)
+    return ordered[: max(1, int(max_models))]
+
+
+def _subsample_scatter_pair(
+    x_vals: np.ndarray,
+    y_vals: np.ndarray,
+    *,
+    max_scatter_points: int,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Deterministically subsample paired 1D arrays only when row count exceeds `max_scatter_points`."""
+    cap = max(1, int(max_scatter_points))
+    if len(x_vals) > cap:
+        pick = rng.choice(len(x_vals), size=cap, replace=False)
+        return x_vals[pick], y_vals[pick]
+    return x_vals, y_vals
+
+
+def _normalize_eras_for_grouping(eras: Any) -> Tuple[np.ndarray, str]:
+    """Normalize era labels (int, float, `'era1234'`, ISO date/Timestamp, or string) for safe grouping and plotting."""
+    raw_series = pd.Series(np.asarray(eras).ravel())
+    if len(raw_series) == 0:
+        return np.empty(0, dtype=np.int64), "int"
+    if pd.api.types.is_datetime64_any_dtype(raw_series.dtype):
+        return pd.to_datetime(raw_series).to_numpy(), "datetime"
+    if raw_series.dtype == object and isinstance(raw_series.dropna().head(1).to_numpy().tolist()[0], (pd.Timestamp, datetime)) if raw_series.notna().any() else False:
+        return pd.to_datetime(raw_series).to_numpy(), "datetime"
+
+    parsed_nums = _parse_era_numbers(pd.Index(raw_series))
+    if np.all(np.isfinite(parsed_nums)):
+        if np.all(np.abs(parsed_nums - np.rint(parsed_nums)) <= 1e-9):
+            return np.rint(parsed_nums).astype(np.int64), "int"
+        return parsed_nums.astype(np.float64, copy=False), "float"
+
+    parsed_dates = pd.to_datetime(raw_series, errors="coerce")
+    if not parsed_dates.isna().any():
+        return parsed_dates.to_numpy(), "datetime"
+
+    return raw_series.astype(str).to_numpy(), "str"
+
+
+def _coerce_era_window_bound(bound: Any, *, era_kind: str) -> Any:
+    """Coerce one `era_window` boundary value to match `era_kind` (`'int'`, `'float'`, `'datetime'`, `'str'`)."""
+    if bound is None:
+        return None
+    if era_kind in ("int", "float"):
+        parsed = _parse_era_numbers(pd.Index([bound]))
+        if len(parsed) == 1 and np.isfinite(parsed[0]):
+            return int(round(float(parsed[0]))) if era_kind == "int" else float(parsed[0])
+        return None
+    if era_kind == "datetime":
+        ts = pd.to_datetime(bound, errors="coerce")
+        return None if pd.isna(ts) else ts
+    return str(bound)
+
+
+def _slice_era_window(
+    ts_df: pd.DataFrame,
+    era_window: Optional[Tuple[Any, Any]],
+    *,
+    era_kind: str,
+) -> pd.DataFrame:
+    """Safely slice a sorted era-indexed DataFrame using boolean bounds across numeric, datetime, or string eras."""
+    if ts_df.empty or era_window is None or len(era_window) != 2:
+        return ts_df
+    lo = _coerce_era_window_bound(era_window[0], era_kind=era_kind)
+    hi = _coerce_era_window_bound(era_window[1], era_kind=era_kind)
+    if lo is not None and hi is not None and lo > hi:
+        lo, hi = hi, lo
+
+    idx = ts_df.index
+    mask = np.ones(len(ts_df), dtype=bool)
+    if lo is not None:
+        mask &= np.asarray(idx >= lo, dtype=bool)
+    if hi is not None:
+        mask &= np.asarray(idx <= hi, dtype=bool)
+
+    sliced = ts_df.loc[mask]
+    if sliced.empty:
+        print(
+            f"[plot_residual_diagnostics] era_window={era_window!r} matched 0 eras; "
+            f"showing all {len(ts_df)} available era(s)."
+        )
+        return ts_df
+    return sliced
 
 
 def plot_residual_diagnostics(
@@ -4847,27 +4997,29 @@ def plot_residual_diagnostics(
     eras: Any,
     *,
     best_variant_name: Optional[str] = None,
+    variant_order: Optional[Sequence[str]] = None,
     max_models: int = 4,
     max_scatter_points: int = 5000,
     jitter_discrete: bool = False,
-    era_window: Optional[Tuple[int, int]] = None,
+    era_window: Optional[Tuple[Any, Any]] = None,
     random_state: int = 42,
     save_prefix: Optional[Any] = None,
 ) -> pd.DataFrame:
-    """Plot residual diagnostics across one or more models.
+    """Plot CAVU flight-deck style residual diagnostics adapted to Numerai targets and eras.
 
-    Generates two figures:
+    Generates three clean diagnostic figures:
       1. Residuals vs Actual Target (`Predicted - Actual`, below 0 = under-predicting), side-by-side per model.
-      2. Actual vs Predicted Target by Era (era-mean trend) stacked above Per-Era Residual (`Predicted - Actual`).
+      2. Actual vs Predicted Target by Era (era-mean trend across all eras or an optional `era_window`).
+      3. Percentage Error vs Actual Target (`(Predicted - Actual) / Actual * 100%` on non-zero actual targets).
 
-    Subsamples scatter points deterministically when validation rows exceed `max_scatter_points` so
-    multi-million-row Numerai panels render quickly, while computing summary metrics and per-era means
-    on all finite rows.
+    Subsamples scatter points deterministically only when row count exceeds `max_scatter_points` so
+    large Numerai validation sets render smoothly, while computing era means and summary metrics on all finite rows.
     """
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
 
     actual_all = np.asarray(y_true, dtype=np.float64).ravel()
-    era_all = np.asarray(eras, dtype=np.int32).ravel()
+    era_all, era_kind = _normalize_eras_for_grouping(eras)
     if len(actual_all) == 0 or len(actual_all) != len(era_all):
         raise ValueError(
             f"y_true ({len(actual_all)}) and eras ({len(era_all)}) must be non-empty and equal length."
@@ -4875,21 +5027,16 @@ def plot_residual_diagnostics(
     if not predictions_by_model:
         raise ValueError("predictions_by_model must contain at least one model entry.")
 
-    # Order models with best_variant_name first, preserving insertion order for remaining models
-    ordered_names: List[str] = []
-    if best_variant_name is not None and best_variant_name in predictions_by_model:
-        ordered_names.append(str(best_variant_name))
-    for name in predictions_by_model:
-        name_str = str(name)
-        if name_str not in ordered_names:
-            ordered_names.append(name_str)
-    ordered_names = ordered_names[: max(1, int(max_models))]
+    ordered_names = _order_residual_variants(
+        predictions_by_model,
+        best_variant_name=best_variant_name,
+        variant_order=variant_order,
+        max_models=max_models,
+    )
 
     extracted_preds: Dict[str, np.ndarray] = {}
     for name in ordered_names:
-        raw_entry = predictions_by_model[name]
-        raw_vals = raw_entry["validation_preds"] if isinstance(raw_entry, Mapping) and "validation_preds" in raw_entry else raw_entry
-        pred_arr = np.asarray(raw_vals, dtype=np.float64).ravel()
+        pred_arr = _extract_variant_predictions(predictions_by_model[name])
         if len(pred_arr) != len(actual_all):
             raise ValueError(
                 f"Prediction length mismatch for {name!r}: expected {len(actual_all)}, got {len(pred_arr)}."
@@ -4904,7 +5051,6 @@ def plot_residual_diagnostics(
         for name in extracted_preds
     }
 
-    # Build per-model valid masks and summary metrics on ALL finite rows
     finite_actual = np.isfinite(actual_all)
     valid_masks: Dict[str, np.ndarray] = {}
     summary_rows: List[Dict[str, Any]] = []
@@ -4927,19 +5073,8 @@ def plot_residual_diagnostics(
         })
 
     n_models = len(extracted_preds)
-    if n_models <= 3:
-        n_rows, n_cols = 1, n_models
-        fig1_size = (6.8 * n_cols, 4.8)
-    elif n_models == 4:
-        n_rows, n_cols = 2, 2
-        fig1_size = (14.0, 9.0)
-    else:
-        n_cols = 3
-        n_rows = int(np.ceil(float(n_models) / float(n_cols)))
-        fig1_size = (6.4 * n_cols, 4.6 * n_rows)
-
     rng = np.random.default_rng(int(random_state))
-    cap_pts = max(100, int(max_scatter_points))
+    cap_pts = max(1, int(max_scatter_points))
 
     unique_actuals = np.sort(np.unique(actual_all[finite_actual]))
     is_discrete_target = 2 <= len(unique_actuals) <= 10
@@ -4953,9 +5088,9 @@ def plot_residual_diagnostics(
     # 1. Residuals vs Actual Target (Predicted - Actual; < 0 = under-predicting)
     # ------------------------------------------------------------------
     fig1, axes1 = plt.subplots(
-        n_rows,
-        n_cols,
-        figsize=fig1_size,
+        1,
+        n_models,
+        figsize=(7 * n_models, 5),
         sharex=True,
         sharey=True,
         squeeze=False,
@@ -4965,121 +5100,137 @@ def plot_residual_diagnostics(
         ax = flat_axes1[idx]
         mask = valid_masks[name]
         a_v = actual_all[mask]
-        r_v = pred_arr[mask] - a_v
-        if len(a_v) > cap_pts:
-            pick = rng.choice(len(a_v), size=cap_pts, replace=False)
-            a_s, r_s = a_v[pick], r_v[pick]
-        else:
-            a_s, r_s = a_v, r_v
+        p_v = pred_arr[mask]
+        a_s, p_s = _subsample_scatter_pair(a_v, p_v, max_scatter_points=cap_pts, rng=rng)
         x_plot = (
             a_s + rng.uniform(-jitter_half, jitter_half, size=len(a_s))
             if (jitter_discrete and is_discrete_target and jitter_half > 0.0)
             else a_s
         )
-        ax.scatter(x_plot, r_s, alpha=0.55, s=24, color=model_colors[name], edgecolors="none", zorder=2)
-        ax.axhline(0.0, color="black", linestyle="--", linewidth=1.2, zorder=3)
-        ax.set_title(f"{display_labels[name]}: Residuals vs Actual", fontsize=10.5)
-        if idx + n_cols >= n_models:
-            ax.set_xlabel("Actual Target")
+        ax.scatter(x_plot, p_s - a_s, alpha=0.55, s=24, color=model_colors[name])
+        ax.axhline(0.0, color="black", linestyle="--")
+        ax.set_title(f"{display_labels[name]}: Residuals vs Actual")
+        ax.set_xlabel("Actual Target")
         ax.set_ylabel("Residual: Predicted - Actual")
-        if is_discrete_target and not jitter_discrete:
-            ax.set_xticks(unique_actuals)
         _apply_clean_residual_axes_style(ax)
 
-    for extra_ax in flat_axes1[n_models:]:
-        extra_ax.set_visible(False)
-
-    fig1.suptitle(
-        "Residuals vs Actual Target (below 0 = under-predicting)",
-        fontsize=12.5,
-    )
-    fig1.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    fig1.suptitle("Residuals vs Actual Target (below 0 = under-predicting)", fontsize=13)
+    fig1.tight_layout()
     if prefix_path is not None:
         fig1.savefig(f"{prefix_path}_residuals_vs_actual.png", dpi=140)
     plt.show()
+    plt.close(fig1)
 
     # ------------------------------------------------------------------
-    # 2. Actual vs Predicted Target by Era + Per-Era Residual (Predicted - Actual)
+    # 2. Actual vs Predicted Target by Era (era-mean trend)
     # ------------------------------------------------------------------
-    ts_cols: Dict[str, Any] = {"era": era_all, "Actual": actual_all}
+    ts_cols: Dict[str, Any] = {
+        "era": era_all,
+        "Actual": np.where(np.isfinite(actual_all), actual_all, np.nan),
+    }
     for name, pred_arr in extracted_preds.items():
-        ts_cols[name] = pred_arr
+        ts_cols[name] = np.where(np.isfinite(pred_arr), pred_arr, np.nan)
     ts_df = pd.DataFrame(ts_cols).groupby("era", sort=True).mean()
-    if era_window is not None and len(era_window) == 2:
-        ts_df = ts_df.loc[int(era_window[0]) : int(era_window[1])]
     ts_df = ts_df.dropna(subset=["Actual"])
+    ts_df = _slice_era_window(ts_df, era_window, era_kind=era_kind)
 
     if not ts_df.empty:
-        era_idx = ts_df.index.to_numpy(dtype=np.int32)
-        n_eras_plotted = len(era_idx)
-        use_markers = n_eras_plotted <= 80
-        fig2, (ax_top, ax_bot) = plt.subplots(
-            2,
-            1,
-            figsize=(14.5, 6.8),
-            sharex=True,
-            gridspec_kw={"height_ratios": [3, 1.4]},
-        )
-        ax_top.plot(
-            era_idx,
+        n_eras_plotted = len(ts_df)
+        marker_step = max(1, n_eras_plotted // 60) if n_eras_plotted > 80 else 1
+        fig2, ax2 = plt.subplots(figsize=(14, 5))
+        if era_kind == "str":
+            x_era = np.arange(n_eras_plotted, dtype=np.int64)
+            era_tick_labels = ts_df.index.astype(str).to_numpy()
+        else:
+            x_era = ts_df.index.to_numpy()
+            era_tick_labels = None
+
+        ax2.plot(
+            x_era,
             ts_df["Actual"].to_numpy(dtype=np.float64),
             color=actual_color,
-            linewidth=2.4,
-            marker="o" if use_markers else None,
-            markersize=4.5,
+            linewidth=2.5,
+            marker="o",
+            markevery=marker_step,
             label="Actual",
-            zorder=4,
         )
-        ax_bot.axhline(0.0, color="black", linestyle="--", linewidth=1.1, zorder=2)
         for name in extracted_preds:
-            pred_series = ts_df[name].to_numpy(dtype=np.float64)
-            actual_series = ts_df["Actual"].to_numpy(dtype=np.float64)
-            ax_top.plot(
-                era_idx,
-                pred_series,
+            ax2.plot(
+                x_era,
+                ts_df[name].to_numpy(dtype=np.float64),
                 color=model_colors[name],
-                linewidth=1.9,
                 linestyle="--",
-                marker="o" if use_markers else None,
-                markersize=3.5,
+                marker="o",
+                markersize=4,
+                markevery=marker_step,
                 label=f"{display_labels[name]} predicted",
-                zorder=3,
             )
-            ax_bot.plot(
-                era_idx,
-                pred_series - actual_series,
-                color=model_colors[name],
-                linewidth=1.6,
-                marker="o" if use_markers else None,
-                markersize=3.0,
-                label=display_labels[name],
-                zorder=3,
-            )
-
-        fig2.suptitle(
-            f"Actual vs Predicted Target by Era (Eras {int(era_idx[0])}–{int(era_idx[-1])}, {n_eras_plotted} validation eras)",
-            fontsize=12.5,
-            fontweight="bold",
-        )
-        ax_top.set_ylabel("Average Target")
-        ax_top.legend(
-            loc="lower center",
-            bbox_to_anchor=(0.5, 1.02),
-            frameon=False,
-            ncol=min(2, n_models + 1),
-            fontsize=8.8,
-        )
-        _apply_clean_residual_axes_style(ax_top)
-
-        ax_bot.set_xlabel("Validation Era")
-        ax_bot.set_ylabel("Predicted - Actual")
-        _apply_clean_residual_axes_style(ax_bot)
-
-        fig2.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+        if era_tick_labels is not None:
+            tick_step = max(1, n_eras_plotted // 12)
+            ax2.set_xticks(x_era[::tick_step])
+            ax2.set_xticklabels(era_tick_labels[::tick_step], rotation=35, ha="right")
+        ax2.set_title("Actual vs Predicted Target by Era")
+        ax2.set_xlabel("Era")
+        ax2.set_ylabel("Average Target")
+        ax2.legend(frameon=False)
+        _apply_clean_residual_axes_style(ax2)
+        fig2.tight_layout()
         if prefix_path is not None:
             fig2.savefig(f"{prefix_path}_actual_vs_predicted_by_era.png", dpi=140)
         plt.show()
+        plt.close(fig2)
 
+    # ------------------------------------------------------------------
+    # 3. Percentage Error vs Actual Target (on non-zero actual targets)
+    # ------------------------------------------------------------------
+    fig3, axes3 = plt.subplots(
+        1,
+        n_models,
+        figsize=(7 * n_models, 5),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    flat_axes3 = axes3.ravel()
+    for idx, (name, pred_arr) in enumerate(extracted_preds.items()):
+        ax = flat_axes3[idx]
+        nz_mask = valid_masks[name] & (np.abs(actual_all) > 1e-12)
+        if np.any(nz_mask):
+            actual_nz = actual_all[nz_mask]
+            pred_nz = pred_arr[nz_mask]
+            pct_err = (pred_nz - actual_nz) / actual_nz * 100.0
+            a_nz_s, pct_s = _subsample_scatter_pair(actual_nz, pct_err, max_scatter_points=cap_pts, rng=rng)
+            x_nz_plot = (
+                a_nz_s + rng.uniform(-jitter_half, jitter_half, size=len(a_nz_s))
+                if (jitter_discrete and is_discrete_target and jitter_half > 0.0)
+                else a_nz_s
+            )
+            ax.scatter(x_nz_plot, pct_s, alpha=0.55, s=24, color=model_colors[name])
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No non-zero actual targets",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                color="#64748b",
+            )
+        ax.axhline(0.0, color="black", linestyle="--")
+        ax.yaxis.set_major_formatter(FuncFormatter(_format_pct_tick))
+        ax.set_title(f"{display_labels[name]}: % Error vs Actual")
+        ax.set_xlabel("Actual Target")
+        ax.set_ylabel("Percentage Error (%)")
+        _apply_clean_residual_axes_style(ax)
+
+    fig3.suptitle("Percentage Error vs Actual Target", fontsize=13)
+    fig3.tight_layout()
+    if prefix_path is not None:
+        fig3.savefig(f"{prefix_path}_pct_error_vs_actual.png", dpi=140)
+    plt.show()
+    plt.close(fig3)
+
+    del extracted_preds, valid_masks, ts_df
     return pd.DataFrame(summary_rows)
 
 
@@ -5139,6 +5290,7 @@ def simulate_live_staking_scenarios(
     random_state: int = 42,
     title: str = "Model",
     era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
+    retain_paths: bool = False,
 ) -> Dict[str, Any]:
     """Run dual-scenario realistic live staking simulations (Conservative Floor vs. Realistic Live Estimate).
 
@@ -5181,6 +5333,7 @@ def simulate_live_staking_scenarios(
         random_state=random_state,
         title=f"{title} [Conservative Floor]",
         era_dates=era_dates,
+        retain_paths=retain_paths,
     )
 
     live_pnl = simulate_stake_pnl(
@@ -5210,6 +5363,7 @@ def simulate_live_staking_scenarios(
         random_state=random_state,
         title=f"{title} [Realistic Live]",
         era_dates=era_dates,
+        retain_paths=retain_paths,
     )
 
     opt_pnl = simulate_stake_pnl(
@@ -5795,15 +5949,11 @@ def plot_top2_residuals_vs_actual(
     best_variant_name: Optional[str] = None,
     variant_order: Optional[Sequence[str]] = None,
     max_scatter_points: int = 5000,
-    jitter_strength: float = 0.035,
+    jitter_strength: float = 0.0,
     random_state: int = 42,
     save_path: Optional[Any] = None,
 ) -> pd.DataFrame:
-    """Plot a side-by-side 2-panel Residuals vs. Actual Target comparison for the top 2 variants.
-
-    Uses slight horizontal jitter across Numerai's discrete target bins (`0.0, 0.25, 0.50, 0.75, 1.0`)
-    plus per-bin mean ±1 SD markers so stacked points and shrinkage bias remain clearly visible.
-    """
+    """Plot a clean CAVU flight-deck style side-by-side Residuals vs. Actual Target comparison for the top 2 variants."""
     import matplotlib.pyplot as plt
 
     del eras  # Accepted for signature parity with plot_residual_diagnostics
@@ -5831,34 +5981,33 @@ def plot_top2_residuals_vs_actual(
     unique_actuals = np.sort(np.unique(actual_all[finite_actual]))
     is_discrete = 2 <= len(unique_actuals) <= 10
     min_step = float(np.min(np.diff(unique_actuals))) if len(unique_actuals) >= 2 else 0.25
-    jitter_half = min(abs(float(jitter_strength)), 0.16 * min_step) if is_discrete else 0.0
+    jitter_half = min(abs(float(jitter_strength)), 0.16 * min_step) if (is_discrete and jitter_strength) else 0.0
 
     n_panels = len(top_names)
     fig, axes = plt.subplots(
         1,
         n_panels,
-        figsize=(7.4 * n_panels, 5.4),
+        figsize=(7 * n_panels, 5),
         sharex=True,
         sharey=True,
-        facecolor="white",
         squeeze=False,
     )
     flat_axes = axes.ravel()
-    panel_colors = ("#2563eb", "#d97706")
+    panel_colors = ("#2e8b57", "#e07b00")
     rng = np.random.default_rng(int(random_state))
-    cap_pts = max(100, int(max_scatter_points))
+    cap_pts = max(1, int(max_scatter_points))
     summary_rows: List[Dict[str, Any]] = []
 
     for idx, name in enumerate(top_names):
         ax = flat_axes[idx]
-        ax.set_facecolor("white")
         pred_arr = extracted[name]
         mask = finite_actual & np.isfinite(pred_arr)
         if not np.any(mask):
             raise ValueError(f"No finite prediction/target pairs available for {name!r}.")
 
         a_v = actual_all[mask]
-        r_v = pred_arr[mask] - a_v
+        p_v = pred_arr[mask]
+        r_v = p_v - a_v
         mae_v = float(np.mean(np.abs(r_v)))
         rmse_v = float(np.sqrt(np.mean(r_v * r_v)))
         mean_r = float(np.mean(r_v))
@@ -5877,87 +6026,73 @@ def plot_top2_residuals_vs_actual(
             "over_predict_pct": round(over_pct, 2),
         })
 
-        if len(a_v) > cap_pts:
-            pick = rng.choice(len(a_v), size=cap_pts, replace=False)
-            a_s, r_s = a_v[pick], r_v[pick]
-        else:
-            a_s, r_s = a_v, r_v
-
+        a_s, p_s = _subsample_scatter_pair(a_v, p_v, max_scatter_points=cap_pts, rng=rng)
         x_plot = a_s + rng.uniform(-jitter_half, jitter_half, size=len(a_s)) if jitter_half > 0.0 else a_s
         base_color = panel_colors[idx % len(panel_colors)]
 
-        ax.scatter(x_plot, r_s, alpha=0.28, s=18, color=base_color, edgecolors="none", zorder=2, label="Sampled rows (jittered)")
-        ax.axhline(0.0, color="#0f172a", linestyle="--", linewidth=1.8, zorder=4, label="Zero residual (y = 0)")
-
-        if is_discrete:
-            bin_means: List[float] = []
-            bin_stds: List[float] = []
-            bin_xs: List[float] = []
-            for tv in unique_actuals:
-                t_mask = np.abs(a_v - tv) <= 1e-9
-                if np.any(t_mask):
-                    bin_xs.append(float(tv))
-                    bin_means.append(float(np.mean(r_v[t_mask])))
-                    bin_stds.append(float(np.std(r_v[t_mask])))
-            if bin_xs:
-                ax.errorbar(
-                    bin_xs,
-                    bin_means,
-                    yerr=bin_stds,
-                    fmt="D-",
-                    color="#0f172a",
-                    markerfacecolor=base_color,
-                    markeredgecolor="white",
-                    markersize=7.0,
-                    linewidth=1.5,
-                    elinewidth=1.3,
-                    capsize=4,
-                    zorder=5,
-                    label="Bin mean ± 1 SD",
-                )
-            ax.set_xticks(unique_actuals)
-            ax.set_xlim(float(unique_actuals[0]) - 0.12, float(unique_actuals[-1]) + 0.12)
-
-        ax.text(
-            0.03,
-            0.04,
-            f"MAE: {mae_v:.4f} | Mean Resid: {mean_r:+.4f}\nOver: {over_pct:.1f}% | Under: {under_pct:.1f}%",
-            transform=ax.transAxes,
-            ha="left",
-            va="bottom",
-            fontsize=8.4,
-            fontweight="bold",
-            color="#1e293b",
-            bbox={"boxstyle": "round,pad=0.30", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1", "alpha": 0.94},
-            zorder=6,
-        )
-        ax.set_title(display_name, fontsize=11.0, fontweight="bold", pad=8)
+        ax.scatter(x_plot, p_s - a_s, alpha=0.55, s=24, color=base_color)
+        ax.axhline(0.0, color="black", linestyle="--")
+        ax.set_title(f"{display_name}: Residuals vs Actual")
         ax.set_xlabel("Actual Target")
-        if idx == 0:
-            ax.set_ylabel("Residual (Predicted − Actual)")
-        ax.legend(loc="upper right", frameon=True, facecolor="white", framealpha=0.90, fontsize=8.1)
+        ax.set_ylabel("Residual: Predicted - Actual")
         _apply_clean_residual_axes_style(ax)
 
-    fig.suptitle(
-        "Top-2 Variants: Residuals vs. Actual Target",
-        fontsize=13.2,
-        fontweight="bold",
-        y=0.985,
-    )
-    fig.text(
-        0.5,
-        0.925,
-        "(below 0 = under-predicting, above 0 = over-predicting)",
-        ha="center",
-        va="top",
-        fontsize=9.6,
-        style="italic",
-        color="#475569",
-    )
-    fig.subplots_adjust(left=0.07, right=0.98, top=0.83, bottom=0.12, wspace=0.10)
+    fig.suptitle("Residuals vs Actual Target (below 0 = under-predicting)", fontsize=13)
+    fig.tight_layout()
     if save_path is not None:
         out_path = Path(save_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_path, dpi=140)
     plt.show()
+    plt.close(fig)
     return pd.DataFrame(summary_rows)
+
+
+def strip_validation_predictions(results_by_variant: Mapping[str, Dict[str, Any]]) -> int:
+    """Remove large `validation_preds` arrays from variant result dicts and reclaim memory."""
+    removed = 0
+    for entry in results_by_variant.values():
+        if isinstance(entry, dict) and entry.pop("validation_preds", None) is not None:
+            removed += 1
+    gc.collect()
+    return removed
+
+
+def build_afml_diagnostics_df(
+    results_by_variant: Mapping[str, Mapping[str, Any]],
+    *,
+    cv_trial_stats_by_baseline: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Build AFML backtest diagnostics strictly from per-era CORRs, precomputed FNC scalars, and lightweight CV trial stats.
+
+    Avoids requiring `X_validation`, `y_validation`, `validation_eras`, raw `validation_preds`, or full CV DataFrames.
+    """
+    trial_stats_map = cv_trial_stats_by_baseline or {}
+    rows: List[Dict[str, Any]] = []
+    for variant_name, res_entry in results_by_variant.items():
+        base_key = str(variant_name).split(" [")[0]
+        is_tuned = "[Tuned" in str(variant_name)
+        stats_ref = trial_stats_map.get(base_key, {})
+        raw_trial_srs = stats_ref.get("trial_srs") if is_tuned else None
+        v_trial_srs = (
+            raw_trial_srs
+            if (raw_trial_srs is not None and len(raw_trial_srs) > 0)
+            else [res_entry["validation_sharpe"]]
+        )
+        v_trials_mat = stats_ref.get("trials_era_corrs_df") if is_tuned else None
+        row = summarize_afml_backtest_diagnostics(
+            res_entry["validation_era_corrs"],
+            trial_srs=v_trial_srs,
+            trials_matrix=v_trials_mat,
+            label=str(variant_name),
+            random_state=random_state,
+        )
+        if "validation_fnc" in res_entry:
+            fnc_val = float(res_entry["validation_fnc"])
+            row["fnc_mean"] = round(fnc_val, 4) if np.isfinite(fnc_val) else float(np.nan)
+        if "validation_fnc_sharpe" in res_entry:
+            fnc_sr = float(res_entry["validation_fnc_sharpe"])
+            row["fnc_sharpe"] = round(fnc_sr, 4) if np.isfinite(fnc_sr) else float(np.nan)
+        rows.append(row)
+    return pd.DataFrame(rows)

@@ -14,7 +14,8 @@ Numerai Classic v6.0 ("Unity") panel data, supporting:
 from __future__ import annotations
 
 from itertools import combinations
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -907,3 +908,77 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
 
 
 MiniRocketEstimator = MiniRocketNumeraiEstimator
+
+
+def extract_minirocket_interpretability(
+    fitted_models: Mapping[str, Any],
+    *,
+    model_name: str = "MiniRocket Regressor",
+    top_n: int = 20,
+) -> Dict[str, Any]:
+    """Extract compact MiniRocket kernel/channel attribution summaries so heavy fitted models can be freed."""
+    if model_name not in fitted_models:
+        return {}
+    fitted_mr = fitted_models[model_name].named_steps["estimator"]
+    cap = max(1, int(top_n))
+    return {
+        "model_name": str(model_name),
+        "active_backend": fitted_mr.active_backend_,
+        "active_input_mode": fitted_mr.active_input_mode_,
+        "n_channels_in": int(fitted_mr.n_channels_in_),
+        "seq_len_in": int(fitted_mr.seq_len_in_),
+        "n_rocket_features": int(fitted_mr.n_rocket_features_),
+        "active_head_type": fitted_mr.active_head_type_,
+        "chosen_alpha": float(fitted_mr.chosen_alpha_),
+        "top_kernels_df": fitted_mr.kernel_importance_df_.head(cap).copy(),
+        "top_channels_df": fitted_mr.channel_importance_df_.head(cap).copy(),
+    }
+
+
+def display_minirocket_interpretability(
+    interpretability: Mapping[str, Any],
+    *,
+    results_dir: Optional[Any] = None,
+    timestamp: str = "",
+    experiment_name: str = "",
+    save_results: bool = False,
+) -> None:
+    """Display and plot compact MiniRocket kernel and channel attribution artifacts."""
+    from utils import display_compact_dataframe
+
+    if not interpretability:
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        plt = None
+
+    top_kernels_df = interpretability["top_kernels_df"]
+    top_channels_df = interpretability["top_channels_df"]
+    print(
+        f"MiniRocket Fitted Summary | backend={interpretability['active_backend']} | "
+        f"input_mode={interpretability['active_input_mode']} | channels={interpretability['n_channels_in']} | "
+        f"seq_len={interpretability['seq_len_in']} | rocket_features={interpretability['n_rocket_features']} | "
+        f"head={interpretability['active_head_type']} (alpha={interpretability['chosen_alpha']:.4g})"
+    )
+    display_compact_dataframe(top_kernels_df, title="Top 20 MiniRocket PPV Kernels by |Weight|:")
+    display_compact_dataframe(top_channels_df, title="Top 20 Input Channels by Aggregated MiniRocket Kernel Weight:")
+
+    if plt is not None and len(top_kernels_df) and len(top_channels_df):
+        fig_imp, axes_imp = plt.subplots(1, 2, figsize=(16, 6))
+        plot_k = top_kernels_df.sort_values("abs_coef", ascending=True)
+        axes_imp[0].barh(plot_k["rocket_feature"], plot_k["abs_coef"], color="#2563eb", alpha=0.85)
+        axes_imp[0].set_xlabel("|Standardized Linear Weight|")
+        axes_imp[0].set_title("Top 20 MiniRocket PPV Kernels")
+
+        plot_c = top_channels_df.sort_values("kernel_weight_sum", ascending=True)
+        axes_imp[1].barh(plot_c["feature"], plot_c["kernel_weight_sum"], color="#059669", alpha=0.85)
+        axes_imp[1].set_xlabel("Aggregated |Kernel Weight| Attribution")
+        axes_imp[1].set_title("Top 20 Input Channels (Features)")
+        fig_imp.tight_layout()
+        if save_results and results_dir is not None:
+            out_dir = Path(results_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fig_imp.savefig(out_dir / f"{timestamp}_{experiment_name}_minirocket_importance.png", dpi=140)
+        plt.show()
+        plt.close(fig_imp)

@@ -24,6 +24,10 @@ from baseline_utils import (
     _build_extraction_cache_key,
     clear_extraction_cache,
     configure_extraction_cache,
+    display_baseline_interpretability,
+    display_top_cv_candidates,
+    extract_baseline_interpretability,
+    extract_cv_analysis_artifacts,
     run_baseline,
 )
 import lgbm_utils
@@ -180,7 +184,13 @@ class TestNotebookStructureAndStandards(unittest.TestCase):
             "plot_top2_residuals_vs_actual",
         )
         expected_symbols = {
-            "baseline_unity.ipynb": ("BinSnappingEstimator", "LagReversalEstimator", "PersistenceEstimator", "run_baseline") + shared_analysis_symbols,
+            "baseline_unity.ipynb": (
+                "BinSnappingEstimator",
+                "LagReversalEstimator",
+                "PersistenceEstimator",
+                "clear_extraction_cache",
+                "run_baseline",
+            ) + shared_analysis_symbols,
             "lightgbm_unity.ipynb": ("LightGBMNumeraiEstimator",) + shared_analysis_symbols,
             "minirocket_unity.ipynb": ("MiniRocketNumeraiEstimator",) + shared_analysis_symbols,
         }
@@ -229,6 +239,70 @@ class TestBaselineNotebookUtils(unittest.TestCase):
 
         configure_extraction_cache(enabled=False, max_entries=0)
         self.assertEqual(len(baseline_utils._EXTRACTION_CACHE), 0)
+
+    def test_clear_extraction_cache_frees_populated_entries_on_100_rows(self) -> None:
+        small_df, _ = make_synthetic_numerai_panel(
+            n_eras=10, n_tickers=10, n_features=6, start_era=1, seed=77
+        )
+        self.assertEqual(len(small_df), 100)
+        configure_extraction_cache(enabled=True, max_entries=4)
+        clear_extraction_cache()
+        self.assertEqual(len(baseline_utils._EXTRACTION_CACHE), 0)
+
+        est = BinSnappingEstimator(extractor=NumeraiExtractions(top_k=4), top_k=3)
+        est.fit(small_df, small_df["target"])
+        self.assertGreaterEqual(len(baseline_utils._EXTRACTION_CACHE), 1)
+
+        cleared_count = clear_extraction_cache()
+        self.assertGreaterEqual(cleared_count, 1)
+        self.assertEqual(len(baseline_utils._EXTRACTION_CACHE), 0)
+
+    def test_persistence_only_artifact_extraction_on_100_rows(self) -> None:
+        train_100, feat_cols = make_synthetic_numerai_panel(
+            n_eras=10, n_tickers=10, n_features=4, start_era=1, seed=88
+        )
+        val_100, _ = make_synthetic_numerai_panel(
+            n_eras=10, n_tickers=10, n_features=4, start_era=11, seed=89
+        )
+        self.assertEqual(len(train_100), 100)
+        self.assertEqual(len(val_100), 100)
+        persist_cols = ["era", "numerai_ticker"]
+
+        pipe = Pipeline([("estimator", PersistenceEstimator(persistence_mode="last", persistence_lag=2, target_horizon_eras=2))])
+        grid = {"estimator__persistence_mode": ["last", "expanding_mean"], "estimator__smoothing": [0.0]}
+        b_name, entries, cv_df, _, tuned_model = run_baseline(
+            "Baseline P (Persistence)",
+            pipe,
+            grid,
+            train_100[persist_cols],
+            train_100["target"],
+            train_100["era"],
+            val_100[persist_cols],
+            val_100["target"],
+            val_100["era"],
+            [],
+            search_mode="grid",
+            score_version="v1_skepta",
+            eval_mode="static",
+            cv_object=TimeSeriesSplit(n_splits=2),
+            target_horizon_eras=2,
+            era_stride=1,
+            verbose=0,
+            n_jobs=1,
+        )
+        self.assertEqual(b_name, "Baseline P (Persistence)")
+        self.assertIn("Baseline P (Persistence) [Tuned]", entries)
+
+        interp = extract_baseline_interpretability({b_name: tuned_model})
+        self.assertIn(b_name, interp)
+        self.assertGreater(interp[b_name]["tracked_tickers"], 0)
+        display_baseline_interpretability(interp)
+
+        cv_art = extract_cv_analysis_artifacts({b_name: cv_df}, top_n=5, save_results=False)
+        self.assertIn(b_name, cv_art["top_candidates"])
+        self.assertIn(b_name, cv_art["trial_stats"])
+        self.assertEqual(cv_art["top_candidates"][b_name].attrs, {})
+        display_top_cv_candidates(cv_art)
 
     def test_base_estimator_era_weights_and_prediction_transforms(self) -> None:
         eras = np.array([1, 1, 2, 2, 2, 3], dtype=np.int32)
