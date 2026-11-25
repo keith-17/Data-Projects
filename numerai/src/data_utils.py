@@ -857,6 +857,31 @@ def _resolve_val_downsample_config(
     return resolved_mode, resolved_frac
 
 
+def _compute_keep_era_count(
+    n_available_eras: int,
+    frac: float,
+    *,
+    mode: str,
+    min_eras: int = 2,
+) -> int:
+    """Compute whole eras to retain, warning and clamping to `min_eras` (default 2) when `frac` resolves to <2 eras."""
+    n_avail = int(n_available_eras)
+    if n_avail <= 0:
+        return 0
+    raw_keep = int(round(n_avail * float(frac)))
+    floor_eras = min(n_avail, max(1, int(min_eras)))
+    if raw_keep < floor_eras:
+        warnings.warn(
+            f"Whole-era downsampling ({mode!r} @ frac={frac:g}) on {n_avail} era(s) resolved to "
+            f"{raw_keep} era(s); clamping to {floor_eras} eras so era-level CV splitting and "
+            f"temporal diagnostics remain valid.",
+            UserWarning,
+            stacklevel=3,
+        )
+        return floor_eras
+    return raw_keep
+
+
 def _select_downsampled_eras(
     unique_eras: np.ndarray,
     mode: str,
@@ -904,7 +929,7 @@ def downsample_panel_data(
 
     era_vals = df[era_col].to_numpy()
     unique_eras = np.sort(pd.unique(era_vals))
-    n_keep_eras = max(1, int(round(len(unique_eras) * frac)))
+    n_keep_eras = _compute_keep_era_count(len(unique_eras), frac, mode=mode, min_eras=2)
     if n_keep_eras >= len(unique_eras):
         return df
     kept_eras = _select_downsampled_eras(unique_eras, mode, n_keep_eras)
@@ -1227,7 +1252,7 @@ def _plan_whole_era_split_query(
     selected_eras = ordered_eras[:: int(era_stride)] if int(era_stride) > 1 else list(ordered_eras)
 
     if mode is not None and frac < 1.0 and len(selected_eras) > 0:
-        n_keep_eras = max(1, int(round(len(selected_eras) * frac)))
+        n_keep_eras = _compute_keep_era_count(len(selected_eras), frac, mode=mode, min_eras=2)
         if n_keep_eras < len(selected_eras):
             chosen = _select_downsampled_eras(np.asarray(selected_eras), mode, n_keep_eras)
             selected_eras = [int(e) for e in chosen.tolist()]

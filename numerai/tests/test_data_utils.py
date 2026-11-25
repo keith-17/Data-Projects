@@ -17,6 +17,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 
 from _fixtures import make_synthetic_numerai_panel, write_synthetic_unity_dataset
+from afml_utils import build_era_cv_splits
 from baseline_utils import PersistenceEstimator, run_baseline
 import data_utils
 from data_utils import (
@@ -354,6 +355,14 @@ class TestDownsampleTrainingData(unittest.TestCase):
             self.train_df, downsample_mode="uniform", downsample_frac=0.5, random_state=99
         )
         pd.testing.assert_frame_equal(ds_uniform, ds_uniform_repeat)
+
+    def test_tiny_downsample_frac_warns_and_clamps_to_at_least_two_eras(self) -> None:
+        for mode, expected_eras in (("recent", [11, 12]), ("earliest", [1, 2]), ("uniform", [1, 12])):
+            with self.subTest(mode=mode):
+                with self.assertWarns(UserWarning) as warn_ctx:
+                    ds = downsample_training_data(self.train_df, downsample_mode=mode, downsample_frac=0.01)
+                self.assertIn("clamping to 2 eras", str(warn_ctx.warning))
+                np.testing.assert_array_equal(sorted(ds["era"].unique()), expected_eras)
 
     def test_invalid_arguments_raise(self) -> None:
         with self.assertRaises(ValueError):
@@ -1008,6 +1017,58 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
             for col in cols_pl:
                 self.assertEqual(va_pl[col].dtype, np.int8)
             pd.testing.assert_frame_equal(tr_pl.reset_index(drop=True), tr_pd.reset_index(drop=True))
+
+        # 5. Tiny downsample_frac (e.g. 0.01 after era_stride) warns & clamps to >=2 eras so era-level CV stays valid
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            write_synthetic_unity_dataset(
+                ws / "data_folder" / "v6.0",
+                n_train_eras=24,
+                n_val_eras=10,
+                n_tickers=4,
+                n_features=4,
+                date_only=True,
+                seed=61,
+            )
+            with self.assertWarns(UserWarning):
+                tr_pl, va_pl, _, _ = load_unity_numerai_data(
+                    data_version="v6.0",
+                    feature_set="small",
+                    era_stride=4,
+                    downsample_mode="recent",
+                    downsample_frac=0.01,
+                    val_downsample_mode="recent",
+                    val_downsample_frac=0.01,
+                    workspace_root=ws,
+                    auto_download=False,
+                )
+            with patch.object(data_utils, "POLARS_AVAILABLE", False), self.assertWarns(UserWarning):
+                tr_pd, va_pd, _, _ = load_unity_numerai_data(
+                    data_version="v6.0",
+                    feature_set="small",
+                    era_stride=4,
+                    downsample_mode="recent",
+                    downsample_frac=0.01,
+                    val_downsample_mode="recent",
+                    val_downsample_frac=0.01,
+                    workspace_root=ws,
+                    auto_download=False,
+                )
+            self.assertEqual(tr_pl["era"].nunique(), 2)
+            self.assertEqual(va_pl["era"].nunique(), 2)
+            pd.testing.assert_frame_equal(tr_pl.reset_index(drop=True), tr_pd.reset_index(drop=True))
+            pd.testing.assert_frame_equal(va_pl.reset_index(drop=True), va_pd.reset_index(drop=True))
+
+            cv_splits = build_era_cv_splits(
+                tr_pl["era"].to_numpy(),
+                cv_strategy="timeseries",
+                n_splits=1,
+                cv_split=0.8,
+                target_horizon_eras=12,
+            )
+            self.assertEqual(len(cv_splits), 1)
+            self.assertGreater(len(cv_splits[0][0]), 0)
+            self.assertGreater(len(cv_splits[0][1]), 0)
 
     def test_polars_vs_pandas_load_unity_parity(self) -> None:
         if not POLARS_AVAILABLE:
