@@ -103,11 +103,9 @@ VALID_TICKER_TIMESERIES_MODES: Tuple[str, ...] = (
     "raw_lags",
 )
 VALID_DOWNSAMPLE_MODES: Tuple[str, ...] = (
-    "within_era",
     "recent",
     "earliest",
     "uniform",
-    "random_eras",
 )
 V6_CONTRIBUTION_KEYWORDS: Tuple[str, ...] = ("meta", "benchmark", "neutralizer", "example")
 V6_BENCHMARK_FALLBACK_ORDER: Tuple[str, ...] = (
@@ -815,6 +813,23 @@ def _normalize_downsample_mode(downsample_mode: Optional[str]) -> Optional[str]:
     return str(downsample_mode).strip().lower()
 
 
+def _validate_downsample_mode(
+    raw_mode: Optional[str],
+    *,
+    param_name: str,
+    allow_same: bool = False,
+) -> Optional[str]:
+    """Validate that a downsampling mode is `None` or a supported whole-era mode (rejecting `within_era`/`random_eras`)."""
+    mode = _normalize_downsample_mode(raw_mode)
+    allowed = (None,) + VALID_DOWNSAMPLE_MODES + (("same",) if allow_same else ())
+    if mode not in allowed:
+        raise ValueError(
+            f"{param_name} only supports whole-era modes {allowed} so cross-sectional numerai_corr, "
+            f"per-era FNC, and ticker/time-series continuity remain valid; got {raw_mode!r}"
+        )
+    return mode
+
+
 def _resolve_val_downsample_config(
     *,
     downsample_mode: Optional[str],
@@ -822,13 +837,9 @@ def _resolve_val_downsample_config(
     val_downsample_mode: Optional[str],
     val_downsample_frac: Optional[float],
 ) -> Tuple[Optional[str], float]:
-    """Validate and resolve validation downsampling knobs (`None`, `'same'`, or any `VALID_DOWNSAMPLE_MODES`)."""
-    train_mode = _normalize_downsample_mode(downsample_mode)
-    raw_val_mode = _normalize_downsample_mode(val_downsample_mode)
-    if raw_val_mode is not None and raw_val_mode != "same" and raw_val_mode not in VALID_DOWNSAMPLE_MODES:
-        raise ValueError(
-            f"val_downsample_mode must be None, 'same', or one of {VALID_DOWNSAMPLE_MODES}, got {val_downsample_mode!r}"
-        )
+    """Validate and resolve validation downsampling knobs (`None`, `'same'`, or any whole-era `VALID_DOWNSAMPLE_MODES`)."""
+    train_mode = _validate_downsample_mode(downsample_mode, param_name="downsample_mode", allow_same=False)
+    raw_val_mode = _validate_downsample_mode(val_downsample_mode, param_name="val_downsample_mode", allow_same=True)
     if val_downsample_frac is not None:
         v_frac = float(val_downsample_frac)
         if not (0.0 < v_frac <= 1.0):
@@ -846,34 +857,12 @@ def _resolve_val_downsample_config(
     return resolved_mode, resolved_frac
 
 
-def _build_within_era_keep_mask(
-    era_vals: np.ndarray,
-    frac: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Build a boolean row mask keeping `frac` of rows randomly within every era."""
-    order = np.argsort(era_vals, kind="stable")
-    sorted_eras = era_vals[order]
-    _, start_indices, counts = np.unique(sorted_eras, return_index=True, return_counts=True)
-    keep_mask = np.zeros(len(era_vals), dtype=bool)
-    for start, count in zip(start_indices, counts):
-        positions = order[start : start + count]
-        n_keep = max(1, int(round(int(count) * frac)))
-        if n_keep >= int(count):
-            keep_mask[positions] = True
-        else:
-            chosen = rng.choice(positions, size=n_keep, replace=False)
-            keep_mask[chosen] = True
-    return keep_mask
-
-
 def _select_downsampled_eras(
     unique_eras: np.ndarray,
     mode: str,
     n_keep_eras: int,
-    rng: np.random.Generator,
 ) -> np.ndarray:
-    """Select the subset of unique eras according to `recent`, `earliest`, `uniform`, or `random_eras`."""
+    """Select the subset of unique eras according to whole-era modes `'recent'`, `'earliest'`, or `'uniform'`."""
     n_eras = len(unique_eras)
     if mode == "recent":
         return unique_eras[-n_keep_eras:]
@@ -882,9 +871,9 @@ def _select_downsampled_eras(
     if mode == "uniform":
         idx = np.round(np.linspace(0, n_eras - 1, n_keep_eras)).astype(np.int64)
         return unique_eras[idx]
-    if mode == "random_eras":
-        return np.sort(rng.choice(unique_eras, size=n_keep_eras, replace=False))
-    raise ValueError(f"Unsupported downsample_mode '{mode}'.")
+    raise ValueError(
+        f"Unsupported downsample_mode {mode!r}; only whole-era modes {VALID_DOWNSAMPLE_MODES} are supported."
+    )
 
 
 def downsample_panel_data(
@@ -895,21 +884,16 @@ def downsample_panel_data(
     era_col: str = "era",
     random_state: int = 42,
 ) -> pd.DataFrame:
-    """Deterministically downsample a Numerai panel DataFrame (train or validation) while preserving chronological era order.
+    """Deterministically downsample a Numerai panel DataFrame (train or validation) by whole eras while preserving chronological era order.
 
-    Supported modes:
+    Supported whole-era modes (preserving cross-sectional `numerai_corr`, per-era FNC, and ticker continuity):
       - `None`: keep 100% of rows.
-      - `'within_era'`: keep every era, randomly sampling `downsample_frac` of rows within each era.
       - `'recent'`: keep the most recent `downsample_frac` fraction of unique eras.
       - `'earliest'`: keep the earliest `downsample_frac` fraction of unique eras.
       - `'uniform'`: keep evenly spaced eras spanning the full range.
-      - `'random_eras'`: randomly sample `downsample_frac` of unique eras without replacement.
     """
-    mode = _normalize_downsample_mode(downsample_mode)
-    if mode is not None and mode not in VALID_DOWNSAMPLE_MODES:
-        raise ValueError(
-            f"downsample_mode must be None or one of {VALID_DOWNSAMPLE_MODES}, got {downsample_mode!r}"
-        )
+    _ = random_state  # Retained in public signature for backwards call-site compatibility.
+    mode = _validate_downsample_mode(downsample_mode, param_name="downsample_mode", allow_same=False)
     frac = float(downsample_frac)
     if not (0.0 < frac <= 1.0):
         raise ValueError(f"downsample_frac must be in (0.0, 1.0], got {downsample_frac!r}")
@@ -918,17 +902,12 @@ def downsample_panel_data(
     if era_col not in df.columns:
         raise KeyError(f"Column '{era_col}' not found in DataFrame.")
 
-    rng = np.random.default_rng(int(random_state))
     era_vals = df[era_col].to_numpy()
-    if mode == "within_era":
-        keep_mask = _build_within_era_keep_mask(era_vals, frac, rng)
-        return df.loc[keep_mask].copy()
-
     unique_eras = np.sort(pd.unique(era_vals))
     n_keep_eras = max(1, int(round(len(unique_eras) * frac)))
     if n_keep_eras >= len(unique_eras):
         return df
-    kept_eras = _select_downsampled_eras(unique_eras, mode, n_keep_eras, rng)
+    kept_eras = _select_downsampled_eras(unique_eras, mode, n_keep_eras)
     return df.loc[df[era_col].isin(kept_eras)].copy()
 
 
@@ -954,36 +933,145 @@ def downsample_training_data(
 # Polars & Pandas Parquet Loading, Era Unification, and Int8 Casting Helpers
 # ---------------------------------------------------------------------------
 
+def _is_polars_integer_dtype(dtype: Any) -> bool:
+    """True when a Polars dtype is a native signed or unsigned integer type."""
+    if dtype is None or pl is None:
+        return False
+    return dtype in (
+        pl.Int8,
+        pl.Int16,
+        pl.Int32,
+        pl.Int64,
+        pl.UInt8,
+        pl.UInt16,
+        pl.UInt32,
+        pl.UInt64,
+    )
+
+
+def _is_polars_datetime_or_date_dtype(dtype: Any) -> bool:
+    """True when a Polars dtype is `Date` or any `Datetime` precision/timezone variant."""
+    if dtype is None or pl is None:
+        return False
+    return dtype == pl.Date or dtype == pl.Datetime or isinstance(dtype, pl.Datetime)
+
+
+def _is_polars_string_dtype(dtype: Any) -> bool:
+    """True when a Polars dtype is `Utf8` / `String`."""
+    if dtype is None or pl is None:
+        return False
+    return dtype in (pl.Utf8, pl.String)
+
+
+def _format_unique_polars_dates_iso(unique_series: Any) -> Tuple[List[str], bool]:
+    """Normalize only the unique date values into ISO `'YYYY-MM-DD'` strings and report whether native order matches ISO order."""
+    if len(unique_series) == 0:
+        return [], True
+    if _is_polars_datetime_or_date_dtype(unique_series.dtype):
+        return unique_series.dt.strftime("%Y-%m-%d").to_list(), True
+    if _is_polars_string_dtype(unique_series.dtype):
+        if bool(unique_series.str.contains(r"^\d{4}-\d{2}-\d{2}$").all()):
+            return unique_series.to_list(), True
+    return pd.to_datetime(unique_series.to_pandas()).dt.strftime("%Y-%m-%d").tolist(), False
+
+
 def _format_polars_date_column_iso(series: Any) -> Any:
-    """Convert a Polars `Date`, `Datetime`, or string-like date column into `YYYY-MM-DD` UTF-8 strings."""
-    if series.dtype in (pl.Date, pl.Datetime):
+    """Convert a Polars `Date`, `Datetime`, or string-like date column into `'YYYY-MM-DD'` strings via unique-value mapping."""
+    if len(series) == 0:
+        return pl.Series(series.name or "date", [], dtype=pl.Utf8)
+    if _is_polars_datetime_or_date_dtype(series.dtype):
         return series.dt.strftime("%Y-%m-%d")
-    return pl.Series("date", pd.to_datetime(series.to_pandas()).dt.strftime("%Y-%m-%d").to_numpy())
+    uniq = series.unique()
+    iso_vals, is_native_iso = _format_unique_polars_dates_iso(uniq)
+    if is_native_iso and _is_polars_string_dtype(series.dtype):
+        return series
+    raw_to_iso = dict(zip(uniq.to_list(), iso_vals))
+    return series.replace_strict(raw_to_iso, return_dtype=pl.Utf8)
+
+
+def _build_unified_era_mapping(
+    train_unique_keys: Any,
+    val_unique_keys: Any,
+    *,
+    key_col: str,
+) -> Tuple[Dict[Any, np.int32], bool, bool]:
+    """Build a compact `raw_key -> Int32 era` mapping from the unique keys of train U validation.
+
+    Returns `(key_to_era, era_is_native_int, key_order_matches_era_order)`.
+    """
+    tr_uniq = train_unique_keys.drop_nulls()
+    va_uniq = val_unique_keys.drop_nulls()
+
+    if key_col == "era":
+        tr_num = tr_uniq.cast(pl.Int32, strict=False)
+        va_num = va_uniq.cast(pl.Int32, strict=False)
+        if tr_num.null_count() == 0 and va_num.null_count() == 0:
+            era_is_native_int = _is_polars_integer_dtype(tr_uniq.dtype) and _is_polars_integer_dtype(va_uniq.dtype)
+            key_to_era: Dict[Any, np.int32] = {}
+            for raw_k, num_k in zip(tr_uniq.to_list(), tr_num.to_list()):
+                key_to_era[raw_k] = np.int32(num_k)
+            for raw_k, num_k in zip(va_uniq.to_list(), va_num.to_list()):
+                key_to_era[raw_k] = np.int32(num_k)
+            return key_to_era, era_is_native_int, era_is_native_int
+
+        tr_raw = tr_uniq.to_list()
+        va_raw = va_uniq.to_list()
+        tr_str = tr_uniq.cast(pl.Utf8).to_list()
+        va_str = va_uniq.cast(pl.Utf8).to_list()
+        all_keys = sorted(set(tr_str) | set(va_str))
+        str_to_id = {k: np.int32(pos + 1) for pos, k in enumerate(all_keys)}
+        key_to_era = {}
+        for raw_k, s_k in zip(tr_raw, tr_str):
+            key_to_era[raw_k] = str_to_id[s_k]
+        for raw_k, s_k in zip(va_raw, va_str):
+            key_to_era[raw_k] = str_to_id[s_k]
+        is_str_native = _is_polars_string_dtype(tr_uniq.dtype) and _is_polars_string_dtype(va_uniq.dtype)
+        return key_to_era, False, is_str_native
+
+    tr_iso, tr_iso_ordered = _format_unique_polars_dates_iso(tr_uniq)
+    va_iso, va_iso_ordered = _format_unique_polars_dates_iso(va_uniq)
+    all_iso = sorted(set(tr_iso) | set(va_iso))
+    iso_to_id = {k: np.int32(pos + 1) for pos, k in enumerate(all_iso)}
+    key_to_era = {}
+    for raw_k, iso_k in zip(tr_uniq.to_list(), tr_iso):
+        key_to_era[raw_k] = iso_to_id[iso_k]
+    for raw_k, iso_k in zip(va_uniq.to_list(), va_iso):
+        key_to_era[raw_k] = iso_to_id[iso_k]
+    return key_to_era, False, (tr_iso_ordered and va_iso_ordered)
+
+
+def _attach_polars_era_column(
+    pl_df: Any,
+    key_col: str,
+    key_to_era: Dict[Any, np.int32],
+    *,
+    era_is_native_int: bool,
+) -> Any:
+    """Attach a unified `Int32` `'era'` column directly from `key_col` without any join."""
+    if len(pl_df) == 0:
+        return pl_df.with_columns(pl.lit(None, dtype=pl.Int32).alias("era"))
+    if era_is_native_int and key_col == "era" and "era" in pl_df.columns:
+        return pl_df.with_columns(pl.col("era").cast(pl.Int32))
+    return pl_df.with_columns(pl.col(key_col).replace_strict(key_to_era, return_dtype=pl.Int32).alias("era"))
 
 
 def _unify_polars_split_eras(train_pl: Any, val_pl: Any) -> Tuple[Any, Any]:
-    """Ensure both Polars train and validation frames share a monotonic `Int32` `era` column."""
+    """Ensure both Polars train and validation frames share a monotonic `Int32` `era` column using unique-key mapping."""
     if "era" in train_pl.columns and "era" in val_pl.columns:
-        tr_num = train_pl.get_column("era").cast(pl.Int32, strict=False)
-        va_num = val_pl.get_column("era").cast(pl.Int32, strict=False)
-        if tr_num.null_count() == 0 and va_num.null_count() == 0:
-            return (
-                train_pl.with_columns(tr_num.alias("era")),
-                val_pl.with_columns(va_num.alias("era")),
-            )
-        tr_keys = train_pl.get_column("era").cast(pl.Utf8)
-        va_keys = val_pl.get_column("era").cast(pl.Utf8)
+        key_col = "era"
     elif "date" in train_pl.columns and "date" in val_pl.columns:
-        tr_keys = _format_polars_date_column_iso(train_pl.get_column("date"))
-        va_keys = _format_polars_date_column_iso(val_pl.get_column("date"))
+        key_col = "date"
     else:
         raise KeyError("Expected 'era' or 'date' column in both train and validation Parquet files.")
 
-    all_keys = sorted(set(tr_keys.unique().to_list()) | set(va_keys.unique().to_list()))
-    key_to_id = {k: np.int32(pos + 1) for pos, k in enumerate(all_keys)}
+    key_to_era, era_is_native_int, _ = _build_unified_era_mapping(
+        train_pl.get_column(key_col).unique(),
+        val_pl.get_column(key_col).unique(),
+        key_col=key_col,
+    )
     return (
-        train_pl.with_columns(tr_keys.replace_strict(key_to_id, return_dtype=pl.Int32).alias("era")),
-        val_pl.with_columns(va_keys.replace_strict(key_to_id, return_dtype=pl.Int32).alias("era")),
+        _attach_polars_era_column(train_pl, key_col, key_to_era, era_is_native_int=era_is_native_int),
+        _attach_polars_era_column(val_pl, key_col, key_to_era, era_is_native_int=era_is_native_int),
     )
 
 
@@ -1028,14 +1116,12 @@ def _polars_cast_features_to_int8(pl_df: Any, feature_columns: List[str]) -> Any
     return pl_df.with_columns(cast_exprs)
 
 
-def _scan_parquet_polars(path: Path, *, parallel_prefiltered: bool = False) -> Any:
-    """Open a Polars lazy Parquet scan, using `parallel='prefiltered'` when supported with clean fallback."""
-    if parallel_prefiltered:
-        try:
-            return pl.scan_parquet(path, parallel="prefiltered")
-        except (TypeError, ValueError):
-            return pl.scan_parquet(path)
-    return pl.scan_parquet(path)
+def _scan_parquet_polars(path: Path) -> Any:
+    """Open a Polars lazy Parquet scan using `parallel='auto'` with clean fallback on older Polars versions."""
+    try:
+        return pl.scan_parquet(path, parallel="auto")
+    except (TypeError, ValueError):
+        return pl.scan_parquet(path)
 
 
 def _pl_is_in_values(col_expr: Any, values: Any, dtype: Any) -> Any:
@@ -1053,176 +1139,194 @@ def _pl_non_null_target_mask(target_col: str) -> Any:
     return t_col.is_not_null() & t_col.cast(pl.Float32, strict=False).is_not_nan()
 
 
-def _scan_split_metadata_polars(
+def _pl_validation_type_predicate(*, exact_lowercase: bool) -> Any:
+    """Build a native Polars `data_type == 'validation'` predicate (preferring raw equality for footer pruning)."""
+    if exact_lowercase:
+        return pl.col("data_type") == "validation"
+    return pl.col("data_type").cast(pl.Utf8).str.to_lowercase() == "validation"
+
+
+def _discover_split_keys_polars(
     path: Path,
     available_cols: Sequence[str],
+    key_col: str,
     target_col: str,
     *,
     filter_validation_type: bool,
-) -> Tuple[Any, Optional[Any]]:
-    """Pass 1: Scan only lightweight metadata/index columns (`_row_idx`, `era`/`date`, `data_type`, `target_col`).
+) -> Tuple[Any, Any, Optional[Any]]:
+    """Step 1: Lightweight scan of only the native time key (`era` or `date`), optional `data_type`, and `target_col`.
 
-    Returns `(filtered_meta_pl, raw_era_dtype)` where `raw_era_dtype` is the native Parquet dtype of `'era'`
-    when present (used to enable native row-group statistics pushdown in Pass 2).
+    Pushes `_pl_non_null_target_mask(target_col)` directly into `pl.scan_parquet(..., parallel='auto')`
+    with zero `_row_idx` tracking. Returns `(filtered_key_series, raw_key_dtype, val_type_predicate)`.
     """
     avail_set = set(available_cols)
-    meta_cols = [c for c in ("era", "date", "data_type") if c in avail_set]
-    scan_cols = list(dict.fromkeys(meta_cols + [target_col]))
-
-    lf = _scan_parquet_polars(path, parallel_prefiltered=False)
+    lf = _scan_parquet_polars(path)
     schema = lf.collect_schema() if hasattr(lf, "collect_schema") else lf.schema
-    raw_era_dtype = schema.get("era") if "era" in avail_set else None
+    raw_key_dtype = schema.get(key_col)
+
+    need_data_type = filter_validation_type and "data_type" in avail_set
+    scan_cols = [key_col, "data_type"] if need_data_type else [key_col]
 
     meta_pl = (
-        lf.with_row_index("_row_idx")
-        .select(["_row_idx"] + scan_cols)
-        .filter(_pl_non_null_target_mask(target_col))
+        lf.filter(_pl_non_null_target_mask(target_col))
+        .select(scan_cols)
         .collect()
     )
-    if filter_validation_type and "data_type" in meta_pl.columns:
-        val_mask = meta_pl.get_column("data_type").cast(pl.Utf8).str.to_lowercase() == "validation"
+
+    val_type_predicate: Optional[Any] = None
+    if need_data_type:
+        dt_col = meta_pl.get_column("data_type")
+        val_mask = dt_col.cast(pl.Utf8).str.to_lowercase() == "validation"
         if bool(val_mask.any()):
+            matched_vals = dt_col.filter(val_mask).unique().to_list()
+            exact_lc = _is_polars_string_dtype(dt_col.dtype) and matched_vals == ["validation"]
+            val_type_predicate = _pl_validation_type_predicate(exact_lowercase=exact_lc)
             meta_pl = meta_pl.filter(val_mask)
 
-    keep_meta_cols = [c for c in ("_row_idx", "era", "date") if c in meta_pl.columns]
-    return meta_pl.select(keep_meta_cols), raw_era_dtype
+    return meta_pl.get_column(key_col), raw_key_dtype, val_type_predicate
 
 
-def _is_polars_integer_dtype(dtype: Any) -> bool:
-    """True when a Polars dtype is a native signed or unsigned integer type."""
-    if dtype is None or pl is None:
-        return False
-    return dtype in (
-        pl.Int8,
-        pl.Int16,
-        pl.Int32,
-        pl.Int64,
-        pl.UInt8,
-        pl.UInt16,
-        pl.UInt32,
-        pl.UInt64,
-    )
-
-
-def _select_split_keep_metadata(
-    meta_pl: Any,
+def _plan_whole_era_split_query(
+    key_series: Any,
+    raw_key_dtype: Any,
+    key_col: str,
+    key_to_era: Dict[Any, np.int32],
     *,
+    key_order_matches_era_order: bool,
     era_stride: int,
     downsample_mode: Optional[str],
     downsample_frac: float,
-    random_state: int,
-) -> Tuple[Any, Optional[List[int]], bool]:
-    """Apply chronological sort, optional `era_stride`, and deterministic downsampling on Pass 1 metadata.
+) -> Tuple[Optional[Any], bool, bool]:
+    """Classify a split into full / contiguous-range / non-contiguous whole-era predicates and check 1D sortedness.
 
-    Uses the exact same `np.random.default_rng(random_state)` helpers as `downsample_panel_data`
-    so Pass 2 loads the bit-for-bit identical row subset as the Pandas fallback path.
-    Returns `(kept_meta_pl, kept_eras, is_era_subset)`.
+    Returns `(key_predicate, is_empty, is_sorted)` where:
+      - No era subsetting -> `key_predicate = None`
+      - Contiguous era range (`recent`/`earliest` without stride breaks) -> `pl.col(key_col).is_between(min_k, max_k)`
+      - Non-contiguous subset (`era_stride > 1`, `uniform`, or combined) -> `is_in(kept_keys)` plus `is_between`
+        whenever the kept span is strictly narrower than the split's full min..max span.
     """
-    mode = _normalize_downsample_mode(downsample_mode)
-    if mode is not None and mode not in VALID_DOWNSAMPLE_MODES:
-        raise ValueError(
-            f"downsample_mode must be None or one of {VALID_DOWNSAMPLE_MODES}, got {downsample_mode!r}"
-        )
+    mode = _validate_downsample_mode(downsample_mode, param_name="downsample_mode", allow_same=False)
     frac = float(downsample_frac)
     if not (0.0 < frac <= 1.0):
         raise ValueError(f"downsample_frac must be in (0.0, 1.0], got {downsample_frac!r}")
 
-    sorted_meta = meta_pl.select(["_row_idx", "era"]).sort("era", maintain_order=True)
-    if len(sorted_meta) == 0:
-        return sorted_meta, [], True
+    if len(key_series) == 0:
+        return None, True, True
 
-    all_unique_eras = sorted(sorted_meta.get_column("era").unique().to_list())
-    n_total_eras = len(all_unique_eras)
+    if key_order_matches_era_order:
+        is_sorted = bool(key_series.is_sorted())
+    else:
+        is_sorted = bool(key_series.replace_strict(key_to_era, return_dtype=pl.Int32).is_sorted())
 
-    if int(era_stride) > 1:
-        strided_eras = all_unique_eras[:: int(era_stride)]
-        sorted_meta = sorted_meta.filter(_pl_is_in_values(pl.col("era"), strided_eras, pl.Int32))
+    era_to_raw_keys: Dict[int, List[Any]] = {}
+    for raw_k in key_series.unique().to_list():
+        era_id = int(key_to_era[raw_k])
+        era_to_raw_keys.setdefault(era_id, []).append(raw_k)
 
-    if mode is not None and frac < 1.0 and len(sorted_meta) > 0:
-        rng = np.random.default_rng(int(random_state))
-        era_vals = sorted_meta.get_column("era").to_numpy()
-        if mode == "within_era":
-            keep_mask = _build_within_era_keep_mask(era_vals, frac, rng)
-            sorted_meta = sorted_meta.filter(pl.Series(keep_mask))
-        else:
-            unique_eras = np.sort(pd.unique(era_vals))
-            n_keep_eras = max(1, int(round(len(unique_eras) * frac)))
-            if n_keep_eras < len(unique_eras):
-                chosen_eras = _select_downsampled_eras(unique_eras, mode, n_keep_eras, rng)
-                sorted_meta = sorted_meta.filter(
-                    _pl_is_in_values(pl.col("era"), [int(e) for e in chosen_eras], pl.Int32)
-                )
+    ordered_eras = sorted(era_to_raw_keys.keys())
+    selected_eras = ordered_eras[:: int(era_stride)] if int(era_stride) > 1 else list(ordered_eras)
 
-    kept_eras = sorted(int(e) for e in sorted_meta.get_column("era").unique().to_list())
-    is_era_subset = len(kept_eras) < n_total_eras
-    return sorted_meta, kept_eras, is_era_subset
+    if mode is not None and frac < 1.0 and len(selected_eras) > 0:
+        n_keep_eras = max(1, int(round(len(selected_eras) * frac)))
+        if n_keep_eras < len(selected_eras):
+            chosen = _select_downsampled_eras(np.asarray(selected_eras), mode, n_keep_eras)
+            selected_eras = [int(e) for e in chosen.tolist()]
+
+    if len(selected_eras) == 0:
+        return None, True, True
+
+    # Regime 1: No era subsetting (all eras kept) -> no date/era predicate needed
+    if len(selected_eras) == len(ordered_eras):
+        return None, False, is_sorted
+
+    kept_keys: List[Any] = []
+    for era_id in selected_eras:
+        kept_keys.extend(era_to_raw_keys[era_id])
+
+    first_idx = ordered_eras.index(selected_eras[0])
+    is_contiguous = ordered_eras[first_idx : first_idx + len(selected_eras)] == selected_eras
+
+    # Regime 2: Contiguous era range -> pure is_between(min, max) for footer row-group skipping
+    if is_contiguous and key_order_matches_era_order:
+        min_key = min(kept_keys)
+        max_key = max(kept_keys)
+        range_pred = pl.col(key_col).is_between(
+            pl.lit(min_key, dtype=raw_key_dtype),
+            pl.lit(max_key, dtype=raw_key_dtype),
+        )
+        return range_pred, False, is_sorted
+
+    # Regime 3: Non-contiguous era subset -> is_in(kept_keys), plus is_between when narrower than full span
+    in_pred = _pl_is_in_values(pl.col(key_col), kept_keys, raw_key_dtype)
+    if key_order_matches_era_order:
+        all_keys: List[Any] = []
+        for era_id in ordered_eras:
+            all_keys.extend(era_to_raw_keys[era_id])
+        full_min, full_max = min(all_keys), max(all_keys)
+        min_key, max_key = min(kept_keys), max(kept_keys)
+        if min_key > full_min or max_key < full_max:
+            range_pred = pl.col(key_col).is_between(
+                pl.lit(min_key, dtype=raw_key_dtype),
+                pl.lit(max_key, dtype=raw_key_dtype),
+            )
+            return range_pred & in_pred, False, is_sorted
+    return in_pred, False, is_sorted
 
 
-def _load_filtered_split_polars(
+def _load_whole_era_split_polars(
     path: Path,
     req_cols: List[str],
     feature_columns: List[str],
     target_col: str,
-    kept_meta_pl: Any,
     *,
-    kept_eras: Optional[List[int]],
+    key_col: str,
+    key_to_era: Dict[Any, np.int32],
     era_is_native_int: bool,
-    pushdown_era_filter: bool,
-    raw_era_dtype: Any,
+    key_predicate: Optional[Any],
+    val_type_predicate: Optional[Any],
+    is_empty: bool,
+    is_sorted: bool,
 ) -> pd.DataFrame:
-    """Pass 2: Push down `_row_idx` (and native `era` when applicable) before selecting `req_cols` and casting to Int8."""
+    """Step 2: Single declarative `pl.scan_parquet(..., parallel='auto')` pushing native predicates with zero joins."""
     has_orig_era = "era" in req_cols
     final_cols = list(req_cols) if has_orig_era else list(req_cols) + ["era"]
 
-    if len(kept_meta_pl) == 0:
+    if is_empty:
         empty_pl = (
-            _scan_parquet_polars(path, parallel_prefiltered=False)
+            _scan_parquet_polars(path)
             .select(req_cols)
             .head(0)
             .collect()
             .with_columns(pl.col(target_col).cast(pl.Float32))
         )
-        if not has_orig_era:
-            empty_pl = empty_pl.with_columns(pl.lit(None, dtype=pl.Int32).alias("era"))
-        else:
-            empty_pl = empty_pl.with_columns(pl.col("era").cast(pl.Int32))
+        empty_pl = _attach_polars_era_column(empty_pl, key_col, key_to_era, era_is_native_int=era_is_native_int)
         empty_pl = _polars_cast_features_to_int8(empty_pl, feature_columns)
         return empty_pl.select(final_cols).to_pandas()
 
-    row_idx_series = kept_meta_pl.get_column("_row_idx").sort()
-    filter_expr = _pl_is_in_values(pl.col("_row_idx"), row_idx_series, row_idx_series.dtype)
-    if (
-        pushdown_era_filter
-        and era_is_native_int
-        and kept_eras is not None
-        and len(kept_eras) > 0
-        and _is_polars_integer_dtype(raw_era_dtype)
-    ):
-        era_filter = _pl_is_in_values(pl.col("era"), kept_eras, raw_era_dtype)
-        filter_expr = era_filter & filter_expr
+    predicates: List[Any] = []
+    if key_predicate is not None:
+        predicates.append(key_predicate)
+    if val_type_predicate is not None:
+        predicates.append(val_type_predicate)
+    predicates.append(_pl_non_null_target_mask(target_col))
+
+    filter_expr = predicates[0]
+    for extra_pred in predicates[1:]:
+        filter_expr = filter_expr & extra_pred
 
     split_pl = (
-        _scan_parquet_polars(path, parallel_prefiltered=True)
-        .with_row_index("_row_idx")
+        _scan_parquet_polars(path)
         .filter(filter_expr)
-        .select(["_row_idx"] + req_cols)
+        .select(req_cols)
         .collect()
     )
 
-    if era_is_native_int and has_orig_era:
-        split_pl = split_pl.with_columns(pl.col("era").cast(pl.Int32))
-    else:
-        era_lookup = kept_meta_pl.select(["_row_idx", pl.col("era").cast(pl.Int32).alias("_unified_era_")])
-        split_pl = split_pl.join(era_lookup, on="_row_idx", how="inner")
-        if has_orig_era:
-            split_pl = split_pl.with_columns(pl.col("_unified_era_").alias("era")).drop("_unified_era_")
-        else:
-            split_pl = split_pl.rename({"_unified_era_": "era"})
-
+    split_pl = _attach_polars_era_column(split_pl, key_col, key_to_era, era_is_native_int=era_is_native_int)
     split_pl = split_pl.with_columns(pl.col(target_col).cast(pl.Float32))
     split_pl = _polars_cast_features_to_int8(split_pl, feature_columns)
-    split_pl = split_pl.sort(["era", "_row_idx"]).select(final_cols)
-    return split_pl.to_pandas()
+    if not is_sorted:
+        split_pl = split_pl.sort("era", maintain_order=True)
+    return split_pl.select(final_cols).to_pandas()
 
 
 def _load_and_clean_splits_polars(
@@ -1241,18 +1345,19 @@ def _load_and_clean_splits_polars(
     val_downsample_frac: Optional[float] = None,
     random_state: int = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Fast multi-threaded Polars Parquet reader with feature-set-agnostic two-pass predicate pushdown, Int8 casting, and era unification."""
+    """Declarative whole-era Polars Parquet reader with native predicate pushdown, zero `_row_idx`, and Int8 casting."""
+    _ = random_state  # Retained in signature for call-site compatibility.
     if not two_pass:
         train_pl = (
-            _scan_parquet_polars(train_path, parallel_prefiltered=False)
-            .select(train_cols)
+            _scan_parquet_polars(train_path)
             .filter(_pl_non_null_target_mask(target_col))
+            .select(train_cols)
             .collect()
         )
         val_pl = (
-            _scan_parquet_polars(validation_path, parallel_prefiltered=False)
-            .select(val_cols)
+            _scan_parquet_polars(validation_path)
             .filter(_pl_non_null_target_mask(target_col))
+            .select(val_cols)
             .collect()
         )
 
@@ -1265,8 +1370,10 @@ def _load_and_clean_splits_polars(
         val_pl = val_pl.with_columns(pl.col(target_col).cast(pl.Float32))
         train_pl, val_pl = _unify_polars_split_eras(train_pl, val_pl)
 
-        train_pl = train_pl.sort("era", maintain_order=True)
-        val_pl = val_pl.sort("era", maintain_order=True)
+        if not train_pl.get_column("era").is_sorted():
+            train_pl = train_pl.sort("era", maintain_order=True)
+        if not val_pl.get_column("era").is_sorted():
+            val_pl = val_pl.sort("era", maintain_order=True)
 
         if apply_era_stride_early is not None and int(apply_era_stride_early) > 1:
             kept_eras = sorted(train_pl.get_column("era").unique().to_list())[:: int(apply_era_stride_early)]
@@ -1276,60 +1383,80 @@ def _load_and_clean_splits_polars(
         val_pl = _polars_cast_features_to_int8(val_pl, feature_columns)
         return train_pl.to_pandas(), val_pl.to_pandas()
 
-    # Pass 1: Metadata-only scan (independent of feature_set width)
+    # Step 1: Lightweight native-key/era discovery (zero _row_idx, zero pd.to_datetime on 7M rows)
     resolved_val_mode, resolved_val_frac = _resolve_val_downsample_config(
         downsample_mode=downsample_mode,
         downsample_frac=downsample_frac,
         val_downsample_mode=val_downsample_mode,
         val_downsample_frac=val_downsample_frac,
     )
-    train_meta_pl, train_raw_era_dtype = _scan_split_metadata_polars(
-        train_path, train_cols, target_col, filter_validation_type=False
+    if "era" in train_cols and "era" in val_cols:
+        key_col = "era"
+    elif "date" in train_cols and "date" in val_cols:
+        key_col = "date"
+    else:
+        raise KeyError("Expected 'era' or 'date' column in both train and validation Parquet files.")
+
+    tr_key_series, tr_key_dtype, _ = _discover_split_keys_polars(
+        train_path, train_cols, key_col, target_col, filter_validation_type=False
     )
-    val_meta_pl, val_raw_era_dtype = _scan_split_metadata_polars(
-        validation_path, val_cols, target_col, filter_validation_type=True
+    va_key_series, va_key_dtype, va_type_pred = _discover_split_keys_polars(
+        validation_path, val_cols, key_col, target_col, filter_validation_type=True
     )
-    train_meta_pl, val_meta_pl = _unify_polars_split_eras(train_meta_pl, val_meta_pl)
+    key_to_era, era_is_native_int, key_order_matches_era_order = _build_unified_era_mapping(
+        tr_key_series.unique(),
+        va_key_series.unique(),
+        key_col=key_col,
+    )
 
     train_stride = int(apply_era_stride_early) if apply_era_stride_early is not None else 1
-    train_keep_meta, train_kept_eras, train_is_era_subset = _select_split_keep_metadata(
-        train_meta_pl,
+    tr_key_pred, tr_is_empty, tr_is_sorted = _plan_whole_era_split_query(
+        tr_key_series,
+        tr_key_dtype,
+        key_col,
+        key_to_era,
+        key_order_matches_era_order=key_order_matches_era_order,
         era_stride=train_stride,
         downsample_mode=downsample_mode,
         downsample_frac=downsample_frac,
-        random_state=random_state,
     )
-    val_keep_meta, val_kept_eras, val_is_era_subset = _select_split_keep_metadata(
-        val_meta_pl,
+    va_key_pred, va_is_empty, va_is_sorted = _plan_whole_era_split_query(
+        va_key_series,
+        va_key_dtype,
+        key_col,
+        key_to_era,
+        key_order_matches_era_order=key_order_matches_era_order,
         era_stride=1,
         downsample_mode=resolved_val_mode,
         downsample_frac=resolved_val_frac,
-        random_state=random_state,
     )
 
-    # Pass 2: Prefiltered scan pulling only req_cols for the active feature_set and selected rows
-    era_is_native_int = _is_polars_integer_dtype(train_raw_era_dtype) and _is_polars_integer_dtype(val_raw_era_dtype)
-    train_df = _load_filtered_split_polars(
+    # Step 2: Single declarative parallel='auto' Parquet scan per split with native predicates & zero joins
+    train_df = _load_whole_era_split_polars(
         train_path,
         train_cols,
         feature_columns,
         target_col,
-        train_keep_meta,
-        kept_eras=train_kept_eras,
+        key_col=key_col,
+        key_to_era=key_to_era,
         era_is_native_int=era_is_native_int,
-        pushdown_era_filter=train_is_era_subset and era_is_native_int,
-        raw_era_dtype=train_raw_era_dtype,
+        key_predicate=tr_key_pred,
+        val_type_predicate=None,
+        is_empty=tr_is_empty,
+        is_sorted=tr_is_sorted,
     )
-    val_df = _load_filtered_split_polars(
+    val_df = _load_whole_era_split_polars(
         validation_path,
         val_cols,
         feature_columns,
         target_col,
-        val_keep_meta,
-        kept_eras=val_kept_eras,
+        key_col=key_col,
+        key_to_era=key_to_era,
         era_is_native_int=era_is_native_int,
-        pushdown_era_filter=val_is_era_subset and era_is_native_int,
-        raw_era_dtype=val_raw_era_dtype,
+        key_predicate=va_key_pred,
+        val_type_predicate=va_type_pred,
+        is_empty=va_is_empty,
+        is_sorted=va_is_sorted,
     )
     return train_df, val_df
 
@@ -1764,9 +1891,9 @@ def load_unity_numerai_data_cached(
     """Cached wrapper around `load_unity_numerai_data` persisting processed Parquets & metadata in `<workspace>/<data_folder>/processed_cache/`.
 
     Keys the disk cache by `(feature_set, era_stride, target_col, downsample_mode, downsample_frac,
-    val_downsample_mode, val_downsample_frac, random_state, ...)` and passes all downsampling knobs
-    directly into `load_unity_numerai_data(...)` so two-pass Polars skips unused rows on cache miss
-    and only the already-downsampled lightweight Parquets are written to disk.
+    val_downsample_mode, val_downsample_frac, random_state, ...)` and passes all whole-era downsampling knobs
+    directly into `load_unity_numerai_data(...)` so declarative Polars predicate pushdown skips unused eras on
+    cache miss and only the already-downsampled lightweight Parquets are written to disk.
     """
     resolved_val_mode, resolved_val_frac = _resolve_val_downsample_config(
         downsample_mode=downsample_mode,

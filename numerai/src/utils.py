@@ -1782,7 +1782,7 @@ def infer_target_horizon_eras(target_col: str) -> int:
     return 4
 
 
-VALID_DOWNSAMPLE_MODES = (None, "within_era", "recent", "earliest", "uniform", "random_eras")
+VALID_DOWNSAMPLE_MODES = (None, "recent", "earliest", "uniform")
 VALID_VAL_DOWNSAMPLE_MODES = VALID_DOWNSAMPLE_MODES + ("same",)
 VALID_SCORE_VERSIONS = ("v0_default", "v1_skepta", "v2_skepta_mmc")
 
@@ -1875,13 +1875,17 @@ def build_experiment_setup(
         raise ValueError(f"cv_split must be strictly in (0.0, 1.0), got {cv_split!r}")
     if clean_downsample_mode not in VALID_DOWNSAMPLE_MODES:
         raise ValueError(
-            f"downsample_mode must be one of {VALID_DOWNSAMPLE_MODES}, got {downsample_mode!r}"
+            f"downsample_mode must be a whole-era mode in {VALID_DOWNSAMPLE_MODES} "
+            f"(row-level/random modes like 'within_era' and 'random_eras' are unsupported so cross-sectional "
+            f"numerai_corr, per-era FNC, and ticker/time-series continuity remain valid), got {downsample_mode!r}"
         )
     if not (0.0 < downsample_frac_val <= 1.0):
         raise ValueError(f"downsample_frac must be in (0.0, 1.0], got {downsample_frac!r}")
     if clean_val_downsample_mode not in VALID_VAL_DOWNSAMPLE_MODES:
         raise ValueError(
-            f"val_downsample_mode must be one of {VALID_VAL_DOWNSAMPLE_MODES}, got {val_downsample_mode!r}"
+            f"val_downsample_mode must be a whole-era mode in {VALID_VAL_DOWNSAMPLE_MODES} "
+            f"(row-level/random modes like 'within_era' and 'random_eras' are unsupported so cross-sectional "
+            f"numerai_corr, per-era FNC, and ticker/time-series continuity remain valid), got {val_downsample_mode!r}"
         )
     if val_downsample_frac_raw is not None and not (0.0 < val_downsample_frac_raw <= 1.0):
         raise ValueError(f"val_downsample_frac must be in (0.0, 1.0], got {val_downsample_frac!r}")

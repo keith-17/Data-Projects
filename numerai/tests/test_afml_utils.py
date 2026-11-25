@@ -61,7 +61,7 @@ class TestPurgedCVAndPurging(unittest.TestCase):
         self.assertEqual(len(X_p), len(y_p))
 
     def test_purged_era_kfold_purges_and_embargoes_by_era_value(self) -> None:
-        # Irregular era spacing (simulating random_eras downsampling)
+        # Irregular era spacing (simulating non-uniform era gaps)
         era_ids = np.array([1, 2, 5, 9, 10, 14, 20, 25, 30, 35, 42, 50, 55, 62, 70, 75, 82, 90, 95, 100])
         eras = np.repeat(era_ids, 4)
         X_dummy = np.zeros((len(eras), 2), dtype=np.float32)

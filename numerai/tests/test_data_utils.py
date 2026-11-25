@@ -103,10 +103,36 @@ def _write_100_row_multi_feature_set_dataset(root_dir: Path, *, seed: int = 42) 
 
 
 def _scan_parquet_reject_parallel(orig_scan: object, path: object, **kwargs: object) -> object:
-    """Simulate an older Polars version where `scan_parquet(..., parallel='prefiltered')` raises TypeError."""
+    """Simulate an older Polars version where `scan_parquet(..., parallel='auto')` raises TypeError."""
     if "parallel" in kwargs:
         raise TypeError("unexpected keyword argument 'parallel'")
     return orig_scan(path, **kwargs)
+
+
+def _scan_parquet_record_parallel(
+    orig_scan: object,
+    recorded_modes: list,
+    path: object,
+    **kwargs: object,
+) -> object:
+    """Record every `parallel` kwarg passed to `pl.scan_parquet` and delegate to `orig_scan`."""
+    recorded_modes.append(kwargs.get("parallel"))
+    return orig_scan(path, **kwargs)
+
+
+def _write_custom_unity_dataset(
+    root_dir: Path,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    feature_cols: list,
+) -> Path:
+    """Persist custom train/val DataFrames and `features.json` into `root_dir` for parity tests."""
+    root_dir.mkdir(parents=True, exist_ok=True)
+    feature_metadata = {"feature_sets": {"small": list(feature_cols), "all": list(feature_cols)}, "targets": ["target"]}
+    (root_dir / "features.json").write_text(json.dumps(feature_metadata), encoding="utf-8")
+    train_df.to_parquet(root_dir / "train.parquet", index=False)
+    val_df.to_parquet(root_dir / "validation.parquet", index=False)
+    return root_dir
 
 
 class TestHttpAndPathHelpers(unittest.TestCase):
@@ -302,14 +328,18 @@ class TestDownsampleTrainingData(unittest.TestCase):
         empty = self.train_df.head(0)
         self.assertIs(downsample_training_data(empty, downsample_mode="recent", downsample_frac=0.5), empty)
 
-    def test_within_era_keeps_all_eras_and_is_deterministic(self) -> None:
-        ds1 = downsample_training_data(self.train_df, downsample_mode="within_era", downsample_frac=0.5, random_state=7)
-        ds2 = downsample_training_data(self.train_df, downsample_mode="within_era", downsample_frac=0.5, random_state=7)
-        self.assertEqual(set(ds1["era"].unique()), set(self.train_df["era"].unique()))
-        self.assertEqual(len(ds1), 12 * 5)
-        pd.testing.assert_frame_equal(ds1, ds2)
+    def test_removed_row_and_random_modes_raise_value_error(self) -> None:
+        for removed_mode in ("within_era", "random_eras"):
+            with self.subTest(removed_mode=removed_mode):
+                with self.assertRaises(ValueError) as ctx:
+                    downsample_training_data(self.train_df, downsample_mode=removed_mode, downsample_frac=0.5)
+                self.assertIn("whole-era", str(ctx.exception).lower())
+                self.assertIn("numerai_corr", str(ctx.exception))
+                # Also rejected even when frac=1.0
+                with self.assertRaises(ValueError):
+                    downsample_training_data(self.train_df, downsample_mode=removed_mode, downsample_frac=1.0)
 
-    def test_recent_earliest_uniform_and_random_eras(self) -> None:
+    def test_recent_earliest_and_uniform_whole_era_modes(self) -> None:
         ds_recent = downsample_training_data(self.train_df, downsample_mode="recent", downsample_frac=0.5)
         np.testing.assert_array_equal(sorted(ds_recent["era"].unique()), [7, 8, 9, 10, 11, 12])
 
@@ -320,11 +350,10 @@ class TestDownsampleTrainingData(unittest.TestCase):
         self.assertEqual(len(ds_uniform["era"].unique()), 6)
         self.assertEqual(int(ds_uniform["era"].min()), 1)
         self.assertEqual(int(ds_uniform["era"].max()), 12)
-
-        ds_rand1 = downsample_training_data(self.train_df, downsample_mode="random_eras", downsample_frac=0.5, random_state=99)
-        ds_rand2 = downsample_training_data(self.train_df, downsample_mode="random_eras", downsample_frac=0.5, random_state=99)
-        self.assertEqual(len(ds_rand1["era"].unique()), 6)
-        pd.testing.assert_frame_equal(ds_rand1, ds_rand2)
+        ds_uniform_repeat = downsample_training_data(
+            self.train_df, downsample_mode="uniform", downsample_frac=0.5, random_state=99
+        )
+        pd.testing.assert_frame_equal(ds_uniform, ds_uniform_repeat)
 
     def test_invalid_arguments_raise(self) -> None:
         with self.assertRaises(ValueError):
@@ -463,14 +492,14 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
             ws = Path(tmp)
             write_synthetic_unity_dataset(ws / "data_folder" / "v6.0", n_train_eras=8, n_val_eras=4, n_tickers=6, n_features=4)
 
-            # First call with downsampling populates processed_cache with already-downsampled Parquets
+            # First call with whole-era downsampling populates processed_cache with already-downsampled Parquets
             tr1, val1, cols1, _ = load_unity_numerai_data_cached(
                 data_version="v6.0",
                 feature_set="small",
                 era_stride=1,
-                downsample_mode="within_era",
+                downsample_mode="recent",
                 downsample_frac=0.5,
-                val_downsample_mode="within_era",
+                val_downsample_mode="recent",
                 val_downsample_frac=0.5,
                 random_state=42,
                 workspace_root=ws,
@@ -482,11 +511,11 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
             cached_val_files = list(cache_dir.glob("validation_*.parquet"))
             self.assertEqual(len(cached_train_files), 1)
             self.assertEqual(len(cached_val_files), 1)
-            # Disk cache must store ONLY the already-downsampled rows (24 train, 12 val), NOT full 48/24
+            # Disk cache must store ONLY the already-downsampled whole eras (4*6=24 train, 2*6=12 val), NOT full 48/24
             self.assertEqual(len(pd.read_parquet(cached_train_files[0])), len(tr1))
             self.assertEqual(len(pd.read_parquet(cached_val_files[0])), len(val1))
-            self.assertEqual(len(tr1), 8 * 3)
-            self.assertEqual(len(val1), 4 * 3)
+            self.assertEqual(len(tr1), 4 * 6)
+            self.assertEqual(len(val1), 2 * 6)
 
             # Repeat call with identical knobs MUST hit cache (never invoke uncached loader)
             with patch.object(data_utils, "load_unity_numerai_data", side_effect=AssertionError("Should have hit cache!")):
@@ -494,9 +523,9 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
                     data_version="v6.0",
                     feature_set="small",
                     era_stride=1,
-                    downsample_mode="within_era",
+                    downsample_mode="recent",
                     downsample_frac=0.5,
-                    val_downsample_mode="within_era",
+                    val_downsample_mode="recent",
                     val_downsample_frac=0.5,
                     random_state=42,
                     workspace_root=ws,
@@ -512,7 +541,7 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
                     data_version="v6.0",
                     feature_set="small",
                     era_stride=1,
-                    downsample_mode="within_era",
+                    downsample_mode="recent",
                     downsample_frac=0.5,
                     val_downsample_mode="same",
                     val_downsample_frac=None,
@@ -524,20 +553,20 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
             pd.testing.assert_frame_equal(val1.reset_index(drop=True), val_same.reset_index(drop=True))
 
             # Different downsampling config creates a separate lightweight cache entry
-            tr_recent, val_recent, _, _ = load_unity_numerai_data_cached(
+            tr_earliest, val_earliest, _, _ = load_unity_numerai_data_cached(
                 data_version="v6.0",
                 feature_set="small",
                 era_stride=1,
-                downsample_mode="recent",
+                downsample_mode="earliest",
                 downsample_frac=0.5,
-                val_downsample_mode="recent",
+                val_downsample_mode="uniform",
                 val_downsample_frac=0.5,
                 random_state=42,
                 workspace_root=ws,
                 auto_download=False,
             )
-            self.assertEqual(len(tr_recent["era"].unique()), 4)
-            self.assertEqual(len(val_recent["era"].unique()), 2)
+            self.assertEqual(len(tr_earliest["era"].unique()), 4)
+            self.assertEqual(len(val_earliest["era"].unique()), 2)
             self.assertEqual(len(list(cache_dir.glob("train_*.parquet"))), 2)
 
             # force_reload=True bypasses cache
@@ -546,9 +575,9 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
                     data_version="v6.0",
                     feature_set="small",
                     era_stride=1,
-                    downsample_mode="within_era",
+                    downsample_mode="recent",
                     downsample_frac=0.5,
-                    val_downsample_mode="within_era",
+                    val_downsample_mode="recent",
                     val_downsample_frac=0.5,
                     random_state=42,
                     workspace_root=ws,
@@ -557,7 +586,7 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
                 )
                 self.assertEqual(spy.call_count, 1)
 
-    def test_two_pass_polars_100_row_feature_sets_cache_and_persistence_baseline(self) -> None:
+    def test_declarative_polars_100_row_feature_sets_cache_and_persistence_baseline(self) -> None:
         """Fast 100-row verification across 'small', 'medium', and 'all' feature sets: Polars vs Pandas parity, cache hits, and Persistence baseline."""
         if not POLARS_AVAILABLE:
             self.skipTest("Polars not installed")
@@ -569,22 +598,23 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
             last_split: Optional[tuple] = None
             for fset_name, expected_cols in expected_feature_sets.items():
                 with self.subTest(feature_set=fset_name):
-                    # 1. Cache miss via two-pass Polars
+                    # 1. Cache miss via declarative whole-era Polars loader
                     tr_pl, va_pl, cols_pl, _ = load_unity_numerai_data_cached(
                         data_version="v6.0",
                         feature_set=fset_name,
                         era_stride=2,
-                        downsample_mode="within_era",
-                        downsample_frac=0.5,
-                        val_downsample_mode="within_era",
+                        downsample_mode="recent",
+                        downsample_frac=0.67,
+                        val_downsample_mode="earliest",
                         val_downsample_frac=0.5,
                         random_state=42,
                         workspace_root=ws,
                         auto_download=False,
                     )
                     self.assertEqual(cols_pl, expected_cols)
-                    # 6 train eras strided by 2 -> 3 eras x 5 rows = 15 rows; 4 val eras x 5 rows = 20 rows
-                    self.assertEqual(len(tr_pl), 15)
+                    # 6 train eras strided by 2 -> [1, 3, 5] -> recent 67% keeps 2 eras x 10 rows = 20 rows
+                    # 4 val eras -> earliest 50% keeps 2 eras x 10 rows = 20 rows
+                    self.assertEqual(len(tr_pl), 20)
                     self.assertEqual(len(va_pl), 20)
 
                     # 2. Cache hit must return identical DataFrames without calling uncached loader
@@ -595,9 +625,9 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
                             data_version="v6.0",
                             feature_set=fset_name,
                             era_stride=2,
-                            downsample_mode="within_era",
-                            downsample_frac=0.5,
-                            val_downsample_mode="within_era",
+                            downsample_mode="recent",
+                            downsample_frac=0.67,
+                            val_downsample_mode="earliest",
                             val_downsample_frac=0.5,
                             random_state=42,
                             workspace_root=ws,
@@ -613,9 +643,9 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
                             data_version="v6.0",
                             feature_set=fset_name,
                             era_stride=2,
-                            downsample_mode="within_era",
-                            downsample_frac=0.5,
-                            val_downsample_mode="within_era",
+                            downsample_mode="recent",
+                            downsample_frac=0.67,
+                            val_downsample_mode="earliest",
                             val_downsample_frac=0.5,
                             random_state=42,
                             workspace_root=ws,
@@ -638,7 +668,7 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
             # All 3 feature sets stored lightweight downsampled Parquets on disk
             self.assertEqual(len(list(cache_dir.glob("train_*.parquet"))), 3)
             for p_file in cache_dir.glob("train_*.parquet"):
-                self.assertEqual(len(pd.read_parquet(p_file)), 15)
+                self.assertEqual(len(pd.read_parquet(p_file)), 20)
             for p_file in cache_dir.glob("validation_*.parquet"):
                 self.assertEqual(len(pd.read_parquet(p_file)), 20)
 
@@ -673,34 +703,86 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
             self.assertGreaterEqual(len(b_cv_df), 2)
             self.assertEqual(b_summary["score_version"], "v1_skepta")
 
-    def test_two_pass_polars_parallel_prefiltered_fallback_and_downsample_modes(self) -> None:
+    def test_declarative_polars_parallel_fallback_no_prefiltered_no_row_idx_and_whole_era_modes(self) -> None:
         if not POLARS_AVAILABLE:
             self.skipTest("Polars not installed")
         with tempfile.TemporaryDirectory() as tmp:
             ws = Path(tmp)
             _write_100_row_multi_feature_set_dataset(ws / "data_folder" / "v6.0", seed=77)
 
-            # Fallback when installed Polars does not support `parallel='prefiltered'`
+            # 1. Fallback when installed Polars rejects `parallel='auto'`
             orig_scan = data_utils.pl.scan_parquet
             with patch.object(data_utils.pl, "scan_parquet", side_effect=partial(_scan_parquet_reject_parallel, orig_scan)):
                 tr_fb, va_fb, cols_fb, _ = load_unity_numerai_data(
                     data_version="v6.0",
                     feature_set="medium",
                     era_stride=2,
-                    downsample_mode="within_era",
-                    downsample_frac=0.5,
-                    val_downsample_mode="within_era",
+                    downsample_mode="recent",
+                    downsample_frac=0.67,
+                    val_downsample_mode="earliest",
                     val_downsample_frac=0.5,
                     random_state=42,
                     workspace_root=ws,
                     auto_download=False,
                 )
             self.assertEqual(len(cols_fb), 8)
-            self.assertEqual(len(tr_fb), 15)
+            self.assertEqual(len(tr_fb), 20)
             self.assertEqual(len(va_fb), 20)
 
-            # Parity across era-level downsampling modes
-            for ds_mode in ("recent", "earliest", "uniform", "random_eras"):
+            # 2. Verify `parallel='prefiltered'` and `LazyFrame.with_row_index` are NEVER used
+            recorded_modes: list = []
+            with (
+                patch.object(
+                    data_utils.pl,
+                    "scan_parquet",
+                    side_effect=partial(_scan_parquet_record_parallel, orig_scan, recorded_modes),
+                ),
+                patch.object(
+                    data_utils.pl.LazyFrame,
+                    "with_row_index",
+                    side_effect=AssertionError("with_row_index must not be called by declarative Polars loader"),
+                ),
+            ):
+                load_unity_numerai_data(
+                    data_version="v6.0",
+                    feature_set="small",
+                    era_stride=2,
+                    downsample_mode="recent",
+                    downsample_frac=0.67,
+                    val_downsample_mode="earliest",
+                    val_downsample_frac=0.5,
+                    workspace_root=ws,
+                    auto_download=False,
+                )
+            self.assertTrue(len(recorded_modes) >= 4)
+            self.assertNotIn("prefiltered", recorded_modes)
+            self.assertTrue(all(mode == "auto" for mode in recorded_modes))
+
+            # 3. Removed modes raise ValueError immediately in load_unity_numerai_data
+            for bad_mode in ("within_era", "random_eras"):
+                with self.subTest(bad_train_mode=bad_mode):
+                    with self.assertRaises(ValueError):
+                        load_unity_numerai_data(
+                            data_version="v6.0",
+                            feature_set="small",
+                            downsample_mode=bad_mode,
+                            downsample_frac=0.5,
+                            workspace_root=ws,
+                            auto_download=False,
+                        )
+                with self.subTest(bad_val_mode=bad_mode):
+                    with self.assertRaises(ValueError):
+                        load_unity_numerai_data(
+                            data_version="v6.0",
+                            feature_set="small",
+                            val_downsample_mode=bad_mode,
+                            val_downsample_frac=0.5,
+                            workspace_root=ws,
+                            auto_download=False,
+                        )
+
+            # 4. Parity across all supported whole-era modes
+            for ds_mode in (None, "recent", "earliest", "uniform"):
                 with self.subTest(downsample_mode=ds_mode):
                     tr_pl, va_pl, _, _ = load_unity_numerai_data(
                         data_version="v6.0",
@@ -729,6 +811,203 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
                         )
                     pd.testing.assert_frame_equal(tr_pl.reset_index(drop=True), tr_pd.reset_index(drop=True))
                     pd.testing.assert_frame_equal(va_pl.reset_index(drop=True), va_pd.reset_index(drop=True))
+
+    def test_polars_vs_pandas_parity_across_date_only_int_era_unsorted_modes_and_empty(self) -> None:
+        """Exhaustive Polars vs Pandas parity for Unity v6.0 ISO date-only, integer era, unsorted Parquets, all modes, and empty split."""
+        if not POLARS_AVAILABLE:
+            self.skipTest("Polars not installed")
+
+        # 1. Unity v6.0-style date: pl.String Parquet (no 'era' column) + verify pd.to_datetime is NOT invoked on ISO strings
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            write_synthetic_unity_dataset(
+                ws / "data_folder" / "v6.0",
+                n_train_eras=24,
+                n_val_eras=10,
+                n_tickers=4,
+                n_features=6,
+                date_only=True,
+                include_non_validation_rows=True,
+                include_nan_targets=True,
+                seed=123,
+            )
+            mode_combos = [
+                (1, None, 1.0, None, None),
+                (12, None, 1.0, None, None),
+                (1, "recent", 0.5, "earliest", 0.4),
+                (1, "earliest", 0.5, "recent", 0.4),
+                (1, "uniform", 0.5, "uniform", 0.5),
+                (4, "recent", 0.5, "earliest", 0.5),
+            ]
+            for stride, ds_m, ds_f, v_m, v_f in mode_combos:
+                with self.subTest(schema="date_only", stride=stride, ds_m=ds_m, v_m=v_m):
+                    with patch.object(
+                        data_utils.pd,
+                        "to_datetime",
+                        side_effect=AssertionError("pd.to_datetime must not be called for ISO YYYY-MM-DD dates"),
+                    ):
+                        tr_pl, va_pl, cols_pl, _ = load_unity_numerai_data(
+                            data_version="v6.0",
+                            feature_set="small",
+                            era_stride=stride,
+                            downsample_mode=ds_m,
+                            downsample_frac=ds_f,
+                            val_downsample_mode=v_m,
+                            val_downsample_frac=v_f,
+                            workspace_root=ws,
+                            auto_download=False,
+                        )
+                    with patch.object(data_utils, "POLARS_AVAILABLE", False):
+                        tr_pd, va_pd, cols_pd, _ = load_unity_numerai_data(
+                            data_version="v6.0",
+                            feature_set="small",
+                            era_stride=stride,
+                            downsample_mode=ds_m,
+                            downsample_frac=ds_f,
+                            val_downsample_mode=v_m,
+                            val_downsample_frac=v_f,
+                            workspace_root=ws,
+                            auto_download=False,
+                        )
+                    self.assertEqual(cols_pl, cols_pd)
+                    self.assertEqual(tr_pl["era"].dtype, np.int32)
+                    self.assertEqual(va_pl["era"].dtype, np.int32)
+                    self.assertEqual(tr_pl["target"].dtype, np.float32)
+                    self.assertEqual(va_pl["target"].dtype, np.float32)
+                    for col in cols_pl:
+                        self.assertEqual(tr_pl[col].dtype, np.int8)
+                        self.assertEqual(va_pl[col].dtype, np.int8)
+                    pd.testing.assert_frame_equal(tr_pl.reset_index(drop=True), tr_pd.reset_index(drop=True))
+                    pd.testing.assert_frame_equal(va_pl.reset_index(drop=True), va_pd.reset_index(drop=True))
+
+        # 2. Classic integer `era` Parquet (without `date`)
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            tr_raw, feat_cols = make_synthetic_numerai_panel(
+                n_eras=24, n_tickers=4, n_features=5, start_era=1, seed=31, data_type="train", include_date=False
+            )
+            va_raw, _ = make_synthetic_numerai_panel(
+                n_eras=8, n_tickers=4, n_features=5, start_era=25, seed=32, data_type="validation", include_date=False
+            )
+            _write_custom_unity_dataset(ws / "data_folder" / "v6.0", tr_raw, va_raw, feat_cols)
+            for stride, ds_m, ds_f, v_m, v_f in [
+                (12, None, 1.0, None, None),
+                (4, "recent", 0.5, "earliest", 0.5),
+                (1, "uniform", 0.5, "recent", 0.5),
+            ]:
+                with self.subTest(schema="int_era", stride=stride, ds_m=ds_m, v_m=v_m):
+                    tr_pl, va_pl, _, _ = load_unity_numerai_data(
+                        data_version="v6.0",
+                        feature_set="small",
+                        era_stride=stride,
+                        downsample_mode=ds_m,
+                        downsample_frac=ds_f,
+                        val_downsample_mode=v_m,
+                        val_downsample_frac=v_f,
+                        workspace_root=ws,
+                        auto_download=False,
+                    )
+                    with patch.object(data_utils, "POLARS_AVAILABLE", False):
+                        tr_pd, va_pd, _, _ = load_unity_numerai_data(
+                            data_version="v6.0",
+                            feature_set="small",
+                            era_stride=stride,
+                            downsample_mode=ds_m,
+                            downsample_frac=ds_f,
+                            val_downsample_mode=v_m,
+                            val_downsample_frac=v_f,
+                            workspace_root=ws,
+                            auto_download=False,
+                        )
+                    pd.testing.assert_frame_equal(tr_pl.reset_index(drop=True), tr_pd.reset_index(drop=True))
+                    pd.testing.assert_frame_equal(va_pl.reset_index(drop=True), va_pd.reset_index(drop=True))
+
+        # 3. Unsorted Parquet (date-only shuffled across eras -> conditional sort MUST restore monotonic era order)
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            tr_raw, feat_cols = make_synthetic_numerai_panel(
+                n_eras=12, n_tickers=4, n_features=4, start_era=1, seed=41, data_type="train", include_date=True
+            )
+            va_raw, _ = make_synthetic_numerai_panel(
+                n_eras=6, n_tickers=4, n_features=4, start_era=13, seed=42, data_type="validation", include_date=True
+            )
+            tr_shuf = tr_raw.drop(columns=["era"]).sample(frac=1.0, random_state=7).reset_index(drop=True)
+            va_shuf = va_raw.drop(columns=["era"]).sample(frac=1.0, random_state=9).reset_index(drop=True)
+            _write_custom_unity_dataset(ws / "data_folder" / "v6.0", tr_shuf, va_shuf, feat_cols)
+
+            tr_pl, va_pl, _, _ = load_unity_numerai_data(
+                data_version="v6.0",
+                feature_set="small",
+                era_stride=4,
+                downsample_mode="recent",
+                downsample_frac=0.67,
+                val_downsample_mode="earliest",
+                val_downsample_frac=0.5,
+                workspace_root=ws,
+                auto_download=False,
+            )
+            with patch.object(data_utils, "POLARS_AVAILABLE", False):
+                tr_pd, va_pd, _, _ = load_unity_numerai_data(
+                    data_version="v6.0",
+                    feature_set="small",
+                    era_stride=4,
+                    downsample_mode="recent",
+                    downsample_frac=0.67,
+                    val_downsample_mode="earliest",
+                    val_downsample_frac=0.5,
+                    workspace_root=ws,
+                    auto_download=False,
+                )
+            self.assertTrue(tr_pl["era"].is_monotonic_increasing)
+            self.assertTrue(va_pl["era"].is_monotonic_increasing)
+            pd.testing.assert_frame_equal(tr_pl.reset_index(drop=True), tr_pd.reset_index(drop=True))
+            pd.testing.assert_frame_equal(va_pl.reset_index(drop=True), va_pd.reset_index(drop=True))
+
+        # 4. Empty-result edge case (all validation targets NaN -> 0 rows with intact schema/dtypes)
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            tr_raw, feat_cols = make_synthetic_numerai_panel(
+                n_eras=4, n_tickers=3, n_features=4, start_era=1, seed=51, data_type="train", include_date=True
+            )
+            va_raw, _ = make_synthetic_numerai_panel(
+                n_eras=2, n_tickers=3, n_features=4, start_era=5, seed=52, data_type="validation", include_date=True
+            )
+            tr_raw = tr_raw.drop(columns=["era"])
+            va_raw = va_raw.drop(columns=["era"])
+            va_raw["target"] = np.float32(np.nan)
+            _write_custom_unity_dataset(ws / "data_folder" / "v6.0", tr_raw, va_raw, feat_cols)
+
+            tr_pl, va_pl, cols_pl, _ = load_unity_numerai_data(
+                data_version="v6.0",
+                feature_set="small",
+                era_stride=1,
+                downsample_mode="recent",
+                downsample_frac=0.5,
+                val_downsample_mode="earliest",
+                val_downsample_frac=0.5,
+                workspace_root=ws,
+                auto_download=False,
+            )
+            with patch.object(data_utils, "POLARS_AVAILABLE", False):
+                tr_pd, va_pd, cols_pd, _ = load_unity_numerai_data(
+                    data_version="v6.0",
+                    feature_set="small",
+                    era_stride=1,
+                    downsample_mode="recent",
+                    downsample_frac=0.5,
+                    val_downsample_mode="earliest",
+                    val_downsample_frac=0.5,
+                    workspace_root=ws,
+                    auto_download=False,
+                )
+            self.assertEqual(cols_pl, cols_pd)
+            self.assertEqual(len(va_pl), 0)
+            self.assertEqual(list(va_pl.columns), list(va_pd.columns))
+            self.assertEqual(va_pl["era"].dtype, np.int32)
+            self.assertEqual(va_pl["target"].dtype, np.float32)
+            for col in cols_pl:
+                self.assertEqual(va_pl[col].dtype, np.int8)
+            pd.testing.assert_frame_equal(tr_pl.reset_index(drop=True), tr_pd.reset_index(drop=True))
 
     def test_polars_vs_pandas_load_unity_parity(self) -> None:
         if not POLARS_AVAILABLE:

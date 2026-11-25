@@ -556,12 +556,12 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
         cfg_both = build_experiment_setup(
             target_col="target",
             era_stride=4,
-            downsample_mode="within_era",
-            downsample_frac=0.05,
+            downsample_mode="recent",
+            downsample_frac=0.25,
             val_downsample_mode="same",
         )
-        self.assertEqual(cfg_both["val_downsample_mode"], "within_era")
-        self.assertEqual(cfg_both["val_downsample_frac"], 0.05)
+        self.assertEqual(cfg_both["val_downsample_mode"], "recent")
+        self.assertEqual(cfg_both["val_downsample_frac"], 0.25)
 
         # era_stride='auto' / None auto-syncs with target_horizon_eras and suppresses [Overlap Notice]
         buf_60d = io.StringIO()
@@ -606,8 +606,12 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
             {"era_stride": "bad_stride"},
             {"era_stride": True},
             {"downsample_mode": "unknown"},
+            {"downsample_mode": "within_era"},
+            {"downsample_mode": "random_eras"},
             {"downsample_frac": 0.0},
             {"val_downsample_mode": "unknown"},
+            {"val_downsample_mode": "within_era"},
+            {"val_downsample_mode": "random_eras"},
             {"val_downsample_frac": 0.0},
             {"eval_mode": "invalid"},
             {"walk_forward_window": "invalid"},
