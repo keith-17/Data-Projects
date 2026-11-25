@@ -4606,6 +4606,349 @@ def plot_error_bin_waterfall(
     plt.show()
 
 
+def plot_flight_residual_diagnostics(
+    y_true: Any,
+    predictions_by_model: Mapping[str, Any],
+    eras: Any,
+    *,
+    best_variant_name: Optional[str] = None,
+    max_models: int = 4,
+    max_scatter_points: int = 5000,
+    jitter_discrete: bool = True,
+    era_window: Optional[Tuple[int, int]] = None,
+    random_state: int = 42,
+    save_prefix: Optional[Any] = None,
+) -> pd.DataFrame:
+    """Plot flight-notebook-style residual diagnostics across one or more models.
+
+    Generates three figures mirroring the flight-deck residual analysis:
+      1. Residuals vs Actual Target (`Predicted - Actual`, below 0 = under-predicting), side-by-side per model.
+      2. Actual vs Predicted Target by Era (era-mean trend) stacked above Per-Era Residual (`Predicted - Actual`).
+      3. Percentage Error vs Actual Target (`(Predicted - Actual) / Actual * 100` for `actual > 0`), side-by-side per model.
+
+    Subsamples scatter points deterministically when validation rows exceed `max_scatter_points` so
+    multi-million-row Numerai panels render quickly, while computing summary metrics and per-target-bin
+    mean markers on all finite rows.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+
+    actual_all = np.asarray(y_true, dtype=np.float64).ravel()
+    era_all = np.asarray(eras, dtype=np.int32).ravel()
+    if len(actual_all) == 0 or len(actual_all) != len(era_all):
+        raise ValueError(
+            f"y_true ({len(actual_all)}) and eras ({len(era_all)}) must be non-empty and equal length."
+        )
+    if not predictions_by_model:
+        raise ValueError("predictions_by_model must contain at least one model entry.")
+
+    # Order models with best_variant_name first, preserving insertion order for remaining models
+    ordered_names: List[str] = []
+    if best_variant_name is not None and best_variant_name in predictions_by_model:
+        ordered_names.append(str(best_variant_name))
+    for name in predictions_by_model:
+        name_str = str(name)
+        if name_str not in ordered_names:
+            ordered_names.append(name_str)
+    ordered_names = ordered_names[: max(1, int(max_models))]
+
+    extracted_preds: Dict[str, np.ndarray] = {}
+    for name in ordered_names:
+        raw_entry = predictions_by_model[name]
+        raw_vals = raw_entry["validation_preds"] if isinstance(raw_entry, Mapping) and "validation_preds" in raw_entry else raw_entry
+        pred_arr = np.asarray(raw_vals, dtype=np.float64).ravel()
+        if len(pred_arr) != len(actual_all):
+            raise ValueError(
+                f"Prediction length mismatch for {name!r}: expected {len(actual_all)}, got {len(pred_arr)}."
+            )
+        extracted_preds[name] = pred_arr
+
+    palette = ["#2e8b57", "#e07b00", "#2563eb", "#7446A5", "#dc2626", "#0d9488"]
+    actual_color = "#1f4e79"
+    model_colors = {name: palette[idx % len(palette)] for idx, name in enumerate(extracted_preds)}
+    display_labels = {
+        name: (f"[BEST] {name}" if best_variant_name is not None and name == best_variant_name else name)
+        for name in extracted_preds
+    }
+
+    # Build per-model valid masks and summary metrics on ALL finite rows
+    finite_actual = np.isfinite(actual_all)
+    valid_masks: Dict[str, np.ndarray] = {}
+    summary_rows: List[Dict[str, Any]] = []
+    for name, pred_arr in extracted_preds.items():
+        mask = finite_actual & np.isfinite(pred_arr)
+        if not np.any(mask):
+            raise ValueError(f"No finite prediction/target pairs available for {name!r}.")
+        valid_masks[name] = mask
+        a_v = actual_all[mask]
+        p_v = pred_arr[mask]
+        r_v = p_v - a_v
+        nz = a_v > 0.0
+        mean_pct_err = float(np.mean(((p_v[nz] - a_v[nz]) / a_v[nz]) * 100.0)) if np.any(nz) else float("nan")
+        summary_rows.append({
+            "variant": display_labels[name],
+            "n_valid": int(len(r_v)),
+            "mean_residual": round(float(np.mean(r_v)), 6),
+            "mae": round(float(np.mean(np.abs(r_v))), 4),
+            "rmse": round(float(np.sqrt(np.mean(r_v * r_v))), 4),
+            "mean_pct_error_nonzero": round(mean_pct_err, 2) if np.isfinite(mean_pct_err) else np.nan,
+            "under_predict_pct": round(float(np.mean(r_v < 0.0) * 100.0), 2),
+            "over_predict_pct": round(float(np.mean(r_v > 0.0) * 100.0), 2),
+        })
+
+    n_models = len(extracted_preds)
+    n_cols = min(3, n_models)
+    n_rows = int(np.ceil(float(n_models) / float(n_cols)))
+    rng = np.random.default_rng(int(random_state))
+    cap_pts = max(100, int(max_scatter_points))
+    any_subsampled = any(int(mask.sum()) > cap_pts for mask in valid_masks.values())
+    sample_note = f"  (sampled up to {cap_pts:,} pts/model; ◆ = full-sample bin mean)" if any_subsampled else ""
+
+    unique_actuals = np.sort(np.unique(actual_all[finite_actual]))
+    is_discrete_target = 2 <= len(unique_actuals) <= 10
+    jitter_half = 0.08 * float(np.min(np.diff(unique_actuals))) if is_discrete_target else 0.0
+
+    def _despine_and_grid(ax: Any) -> None:
+        ax.yaxis.grid(True, color="grey", alpha=0.25)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    prefix_path = Path(save_prefix) if save_prefix is not None else None
+    if prefix_path is not None:
+        prefix_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 1. Residuals vs Actual Target (Predicted - Actual; < 0 = under-predicting)
+    # ------------------------------------------------------------------
+    fig1, axes1 = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(6.4 * n_cols, 4.6 * n_rows),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    flat_axes1 = axes1.ravel()
+    for idx, (name, pred_arr) in enumerate(extracted_preds.items()):
+        ax = flat_axes1[idx]
+        mask = valid_masks[name]
+        a_v = actual_all[mask]
+        r_v = pred_arr[mask] - a_v
+        if len(a_v) > cap_pts:
+            pick = rng.choice(len(a_v), size=cap_pts, replace=False)
+            a_s, r_s = a_v[pick], r_v[pick]
+        else:
+            a_s, r_s = a_v, r_v
+        x_plot = (
+            a_s + rng.uniform(-jitter_half, jitter_half, size=len(a_s))
+            if (jitter_discrete and is_discrete_target and jitter_half > 0.0)
+            else a_s
+        )
+        ax.scatter(x_plot, r_s, alpha=0.45, s=18, color=model_colors[name], edgecolors="none", zorder=2)
+        ax.axhline(0.0, color="black", linestyle="--", linewidth=1.2, zorder=3)
+        if is_discrete_target:
+            bin_x: List[float] = []
+            bin_y: List[float] = []
+            for u_val in unique_actuals:
+                u_mask = a_v == u_val
+                if np.any(u_mask):
+                    bin_x.append(float(u_val))
+                    bin_y.append(float(np.mean(r_v[u_mask])))
+            if bin_x:
+                ax.plot(bin_x, bin_y, color="#111111", linestyle=":", linewidth=1.2, alpha=0.85, zorder=4)
+                ax.scatter(
+                    bin_x,
+                    bin_y,
+                    marker="D",
+                    s=44,
+                    facecolor="white",
+                    edgecolor="#111111",
+                    linewidths=1.4,
+                    zorder=5,
+                    label="Full-sample bin mean",
+                )
+                ax.legend(loc="upper right", frameon=False, fontsize=8.5)
+        ax.set_title(f"{display_labels[name]}: Residuals vs Actual", fontsize=10.5, fontweight="bold")
+        ax.set_xlabel("Actual Target")
+        ax.set_ylabel("Residual: Predicted - Actual")
+        _despine_and_grid(ax)
+
+    for extra_ax in flat_axes1[n_models:]:
+        extra_ax.set_visible(False)
+
+    fig1.suptitle(
+        f"Residuals vs Actual Target (below 0 = under-predicting){sample_note}",
+        fontsize=12.5,
+        fontweight="bold",
+    )
+    fig1.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    if prefix_path is not None:
+        fig1.savefig(f"{prefix_path}_residuals_vs_actual.png", dpi=140)
+    plt.show()
+
+    # ------------------------------------------------------------------
+    # 2. Actual vs Predicted Target by Era + Per-Era Residual (Predicted - Actual)
+    # ------------------------------------------------------------------
+    ts_cols: Dict[str, Any] = {"era": era_all, "Actual": actual_all}
+    for name, pred_arr in extracted_preds.items():
+        ts_cols[name] = pred_arr
+    ts_df = pd.DataFrame(ts_cols).groupby("era", sort=True).mean()
+    if era_window is not None and len(era_window) == 2:
+        ts_df = ts_df.loc[int(era_window[0]) : int(era_window[1])]
+    ts_df = ts_df.dropna(subset=["Actual"])
+
+    if not ts_df.empty:
+        era_idx = ts_df.index.to_numpy(dtype=np.int32)
+        n_eras_plotted = len(era_idx)
+        use_markers = n_eras_plotted <= 80
+        fig2, (ax_top, ax_bot) = plt.subplots(
+            2,
+            1,
+            figsize=(14.5, 6.8),
+            sharex=True,
+            gridspec_kw={"height_ratios": [3, 1.4]},
+        )
+        ax_top.plot(
+            era_idx,
+            ts_df["Actual"].to_numpy(dtype=np.float64),
+            color=actual_color,
+            linewidth=2.4,
+            marker="o" if use_markers else None,
+            markersize=4.5,
+            label="Actual",
+            zorder=4,
+        )
+        ax_bot.axhline(0.0, color="black", linestyle="--", linewidth=1.1, zorder=2)
+        for name in extracted_preds:
+            pred_series = ts_df[name].to_numpy(dtype=np.float64)
+            actual_series = ts_df["Actual"].to_numpy(dtype=np.float64)
+            ax_top.plot(
+                era_idx,
+                pred_series,
+                color=model_colors[name],
+                linewidth=1.9,
+                linestyle="--",
+                marker="o" if use_markers else None,
+                markersize=3.5,
+                label=f"{display_labels[name]} predicted",
+                zorder=3,
+            )
+            ax_bot.plot(
+                era_idx,
+                pred_series - actual_series,
+                color=model_colors[name],
+                linewidth=1.6,
+                marker="o" if use_markers else None,
+                markersize=3.0,
+                label=display_labels[name],
+                zorder=3,
+            )
+
+        fig2.suptitle(
+            f"Actual vs Predicted Target by Era (Eras {int(era_idx[0])}–{int(era_idx[-1])}, {n_eras_plotted} validation eras)",
+            fontsize=12.5,
+            fontweight="bold",
+        )
+        ax_top.set_ylabel("Average Target")
+        ax_top.legend(
+            loc="lower center",
+            bbox_to_anchor=(0.5, 1.02),
+            frameon=False,
+            ncol=min(2, n_models + 1),
+            fontsize=8.8,
+        )
+        _despine_and_grid(ax_top)
+
+        ax_bot.set_xlabel("Validation Era")
+        ax_bot.set_ylabel("Predicted - Actual")
+        _despine_and_grid(ax_bot)
+
+        fig2.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+        if prefix_path is not None:
+            fig2.savefig(f"{prefix_path}_actual_vs_predicted_by_era.png", dpi=140)
+        plt.show()
+
+    # ------------------------------------------------------------------
+    # 3. Percentage Error vs Actual Target (actual > 0)
+    # ------------------------------------------------------------------
+    has_any_nonzero = any(bool(np.any(actual_all[valid_masks[name]] > 0.0)) for name in extracted_preds)
+    if has_any_nonzero:
+        nz_unique = unique_actuals[unique_actuals > 0.0]
+        is_discrete_nz = 2 <= len(nz_unique) <= 10
+        nz_jitter_half = 0.08 * float(np.min(np.diff(nz_unique))) if is_discrete_nz else 0.0
+
+        fig3, axes3 = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(6.4 * n_cols, 4.6 * n_rows),
+            sharex=True,
+            sharey=True,
+            squeeze=False,
+        )
+        flat_axes3 = axes3.ravel()
+        pct_fmt = FuncFormatter(lambda v, _: f"{v:g}%")
+        for idx, (name, pred_arr) in enumerate(extracted_preds.items()):
+            ax = flat_axes3[idx]
+            nz_mask = valid_masks[name] & (actual_all > 0.0)
+            a_nz = actual_all[nz_mask]
+            pct_err = ((pred_arr[nz_mask] - a_nz) / a_nz) * 100.0
+            if len(a_nz) > cap_pts:
+                pick = rng.choice(len(a_nz), size=cap_pts, replace=False)
+                a_s, e_s = a_nz[pick], pct_err[pick]
+            else:
+                a_s, e_s = a_nz, pct_err
+            x_plot = (
+                a_s + rng.uniform(-nz_jitter_half, nz_jitter_half, size=len(a_s))
+                if (jitter_discrete and is_discrete_nz and nz_jitter_half > 0.0)
+                else a_s
+            )
+            ax.scatter(x_plot, e_s, alpha=0.45, s=18, color=model_colors[name], edgecolors="none", zorder=2)
+            ax.axhline(0.0, color="black", linestyle="--", linewidth=1.2, zorder=3)
+            if is_discrete_nz:
+                bin_x_nz: List[float] = []
+                bin_y_nz: List[float] = []
+                for u_val in nz_unique:
+                    u_mask = a_nz == u_val
+                    if np.any(u_mask):
+                        bin_x_nz.append(float(u_val))
+                        bin_y_nz.append(float(np.mean(pct_err[u_mask])))
+                if bin_x_nz:
+                    ax.plot(bin_x_nz, bin_y_nz, color="#111111", linestyle=":", linewidth=1.2, alpha=0.85, zorder=4)
+                    ax.scatter(
+                        bin_x_nz,
+                        bin_y_nz,
+                        marker="D",
+                        s=44,
+                        facecolor="white",
+                        edgecolor="#111111",
+                        linewidths=1.4,
+                        zorder=5,
+                        label="Full-sample bin mean",
+                    )
+                    ax.legend(loc="upper right", frameon=False, fontsize=8.5)
+            ax.set_title(f"{display_labels[name]}: % Error vs Actual", fontsize=10.5, fontweight="bold")
+            ax.set_xlabel("Actual Target (actual > 0)")
+            ax.set_ylabel("Percentage Error (%)")
+            ax.yaxis.set_major_formatter(pct_fmt)
+            _despine_and_grid(ax)
+
+        for extra_ax in flat_axes3[n_models:]:
+            extra_ax.set_visible(False)
+
+        fig3.suptitle(
+            f"Percentage Error vs Actual Target (actual > 0){sample_note}",
+            fontsize=12.5,
+            fontweight="bold",
+        )
+        fig3.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+        if prefix_path is not None:
+            fig3.savefig(f"{prefix_path}_pct_error_vs_actual.png", dpi=140)
+        plt.show()
+
+    return pd.DataFrame(summary_rows)
+
+
 def run_numereval_diagnostics(
     y_true: Any,
     y_pred: Any,

@@ -675,6 +675,47 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
         with self.assertRaises(ValueError):
             compute_era_error_envelope(y_true, y_pred[:-1], eras)
 
+    def test_plot_flight_residual_diagnostics_summary_and_exports(self) -> None:
+        eras = np.repeat(np.arange(1, 7, dtype=np.int32), 25)
+        rng = np.random.default_rng(77)
+        y_true = rng.choice([0.0, 0.25, 0.5, 0.75, 1.0], size=len(eras))
+        preds_a = np.clip(y_true * 0.2 + 0.4 + rng.normal(0.0, 0.03, size=len(eras)), 0.0, 1.0)
+        preds_b = np.clip(y_true * 0.1 + 0.45 + rng.normal(0.0, 0.05, size=len(eras)), 0.0, 1.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "flight_diag"
+            summary_df = utils.plot_flight_residual_diagnostics(
+                y_true,
+                {"Model A [Tuned]": {"validation_preds": preds_a}, "Model B [Tuned]": preds_b},
+                eras,
+                best_variant_name="Model A [Tuned]",
+                max_scatter_points=60,
+                era_window=(2, 5),
+                random_state=77,
+                save_prefix=prefix,
+            )
+            self.assertEqual(len(summary_df), 2)
+            self.assertEqual(summary_df.loc[0, "variant"], "[BEST] Model A [Tuned]")
+            self.assertSetEqual(
+                set(summary_df.columns),
+                {
+                    "variant",
+                    "n_valid",
+                    "mean_residual",
+                    "mae",
+                    "rmse",
+                    "mean_pct_error_nonzero",
+                    "under_predict_pct",
+                    "over_predict_pct",
+                },
+            )
+            self.assertTrue((Path(f"{prefix}_residuals_vs_actual.png")).is_file())
+            self.assertTrue((Path(f"{prefix}_actual_vs_predicted_by_era.png")).is_file())
+            self.assertTrue((Path(f"{prefix}_pct_error_vs_actual.png")).is_file())
+
+        with self.assertRaises(ValueError):
+            utils.plot_flight_residual_diagnostics(y_true, {"Bad": preds_a[:-1]}, eras)
+
     def test_candidate_score_and_build_quick_results_df(self) -> None:
         df, _ = make_synthetic_numerai_panel(n_eras=6, n_tickers=15, n_features=4, seed=44)
         est = _DummyMeanEstimator().fit(df, df["target"])
