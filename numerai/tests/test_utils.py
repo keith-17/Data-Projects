@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -762,6 +763,193 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
 
         pbo = utils.compute_pbo_cscv(quick_df.attrs["trials_era_corrs_df"], n_submatrices=4, random_state=42)
         self.assertIn("pbo", pbo)
+
+    def test_four_layer_analysis_scorecards_json_corr_envelope_and_top2_residuals(self) -> None:
+        comp_df = pd.DataFrame([
+            {
+                "variant": "Model [Default]",
+                "end_capital": 1120.556,
+                "total_return_pct": 12.0556,
+                "money_drawdown_pct": -8.456,
+                "max_drawdown_gbp": -92.123,
+                "worst_round_gbp": -18.765,
+                "tuw_max_eras": 26,
+                "train_corr": 0.0321,
+                "validation_corr": 0.0185,
+                "corr_gap": 0.0136,
+                "validation_sharpe": 0.92,
+                "validation_psr": 0.962,
+                "validation_dsr": 0.910,
+                "sanity_status": "OK",
+                "feature_exposure": 0.145,
+                "validation_fnc": 0.0112,
+                "validation_fnc_sharpe": 0.71,
+                "validation_mae": 0.194,
+                "forecast_bias": -0.002,
+                "directional_hit_rate": 0.518,
+                "adf_pvalue": 0.012,
+                "ljung_box_pvalue": 0.21,
+                "arch_lm_pvalue": 0.34,
+                "hhi_pos": 0.04,
+                "hhi_neg": 0.05,
+            },
+            {
+                "variant": "Model [Tuned]",
+                "end_capital": 1285.40,
+                "total_return_pct": 28.54,
+                "money_drawdown_pct": -6.10,
+                "max_drawdown_gbp": -71.50,
+                "worst_round_gbp": -12.30,
+                "tuw_max_eras": 52,
+                "train_corr": 0.0385,
+                "validation_corr": 0.0231,
+                "corr_gap": 0.0154,
+                "validation_sharpe": 1.18,
+                "validation_psr": 0.991,
+                "validation_dsr": 0.964,
+                "sanity_status": "OK",
+                "feature_exposure": 0.112,
+                "validation_fnc": np.nan,
+                "validation_fnc_sharpe": np.inf,
+                "validation_mae": 0.189,
+                "forecast_bias": 0.001,
+                "directional_hit_rate": 0.529,
+                "adf_pvalue": 0.004,
+                "ljung_box_pvalue": 0.41,
+                "arch_lm_pvalue": 0.52,
+                "hhi_pos": 0.03,
+                "hhi_neg": 0.04,
+            },
+        ])
+
+        money_df, science_df = utils.build_executive_scorecard_tables(
+            comp_df, best_variant_name="Model [Tuned]"
+        )
+        self.assertEqual(
+            list(money_df.columns),
+            [
+                "variant",
+                "end_capital",
+                "total_return_pct",
+                "money_drawdown_pct",
+                "max_drawdown_gbp",
+                "worst_round_gbp",
+                "tuw_max_eras",
+            ],
+        )
+        self.assertEqual(
+            list(science_df.columns),
+            [
+                "variant",
+                "train_corr",
+                "validation_corr",
+                "corr_gap",
+                "validation_sharpe",
+                "validation_psr",
+                "validation_dsr",
+                "sanity_status",
+            ],
+        )
+        self.assertEqual(money_df.loc[0, "variant"], "[WINNER] Model [Tuned]")
+        self.assertIn("1.00 yr", str(money_df.loc[0, "tuw_max_eras"]))
+        # Original DataFrame must remain unmutated
+        self.assertEqual(comp_df.loc[0, "variant"], "Model [Default]")
+
+        diag_df = utils.build_diagnostics_summary_table(comp_df, best_variant_name="Model [Tuned]")
+        self.assertEqual(
+            list(diag_df.columns),
+            [
+                "variant",
+                "feature_exposure",
+                "validation_fnc",
+                "validation_fnc_sharpe",
+                "validation_mae",
+                "forecast_bias",
+                "directional_hit_rate",
+            ],
+        )
+        self.assertEqual(diag_df.loc[0, "variant"], "[WINNER] Model [Tuned]")
+
+        rng = np.random.default_rng(123)
+        eras_30 = np.repeat(np.arange(1001, 1031, dtype=np.int32), 20)
+        y_true = rng.choice([0.0, 0.25, 0.5, 0.75, 1.0], size=len(eras_30))
+        preds_tuned = np.clip(0.5 + 0.15 * (y_true - 0.5) + rng.normal(0.0, 0.04, size=len(eras_30)), 0.0, 1.0)
+        preds_default = np.clip(0.5 + 0.08 * (y_true - 0.5) + rng.normal(0.0, 0.05, size=len(eras_30)), 0.0, 1.0)
+        corrs_tuned = compute_per_era_numerai_corr(y_true, preds_tuned, eras=eras_30)
+        corrs_default = compute_per_era_numerai_corr(y_true, preds_default, eras=eras_30)
+        results_map = {
+            "Model [Default]": {"validation_preds": preds_default, "validation_era_corrs": corrs_default, "validation_sharpe": 0.92},
+            "Model [Tuned]": {"validation_preds": preds_tuned, "validation_era_corrs": corrs_tuned, "validation_sharpe": 1.18},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            json_path = utils.export_winner_scorecard_json(
+                comp_df,
+                best_variant_name="Model [Tuned]",
+                model_tag="lightgbm",
+                output_dir=tmp_dir,
+                experiment_meta={"target_col": "target"},
+            )
+            self.assertEqual(json_path.name, "summary_lightgbm.json")
+            self.assertTrue(json_path.is_file())
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["model_tag"], "lightgbm")
+            self.assertEqual(payload["variant"], "Model [Tuned]")
+            self.assertIsNone(payload["validation_fnc"])
+            self.assertIsNone(payload["validation_fnc_sharpe"])
+            self.assertEqual(payload["money_table"]["tuw_max_years"], 1.0)
+
+            cum_png = tmp_dir / "cum_corr.png"
+            cum_df = utils.plot_cumulative_validation_corr(
+                results_map, best_variant_name="Model [Tuned]", save_path=cum_png
+            )
+            self.assertTrue(cum_png.is_file())
+            self.assertEqual(len(cum_df), 30)
+
+            roll_png = tmp_dir / "roll_corr.png"
+            roll_s = utils.plot_rolling_validation_corr(
+                corrs_tuned,
+                window=20,
+                comparison_corrs={"Model [Default]": corrs_default},
+                save_path=roll_png,
+            )
+            self.assertTrue(roll_png.is_file())
+            self.assertEqual(len(roll_s), 11)
+
+            # Short series (<20 eras) must also render cleanly
+            short_roll = utils.plot_rolling_validation_corr(corrs_tuned.head(8), window=20)
+            self.assertGreater(len(short_roll), 0)
+
+            env_png = tmp_dir / "envelope.png"
+            env_df = plot_era_error_envelope(
+                y_true, preds_tuned, eras_30, title="Model [Tuned]", is_best=True, save_path=env_png
+            )
+            self.assertTrue(env_png.is_file())
+            self.assertIn("over_count", env_df.columns)
+            self.assertIn("under_count", env_df.columns)
+
+            top2_png = tmp_dir / "top2_residuals.png"
+            top2_df = utils.plot_top2_residuals_vs_actual(
+                y_true,
+                results_map,
+                eras_30,
+                best_variant_name="Model [Tuned]",
+                variant_order=["Model [Tuned]", "Model [Default]"],
+                save_path=top2_png,
+            )
+            self.assertTrue(top2_png.is_file())
+            self.assertEqual(len(top2_df), 2)
+            self.assertEqual(top2_df.loc[0, "variant"], "[WINNER] Model [Tuned]")
+
+            # Graceful single-variant fallback
+            single_df = utils.plot_top2_residuals_vs_actual(
+                y_true,
+                {"Model [Tuned]": preds_tuned},
+                eras_30,
+                best_variant_name="Model [Tuned]",
+            )
+            self.assertEqual(len(single_df), 1)
 
 
 if __name__ == "__main__":

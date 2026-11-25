@@ -43,6 +43,7 @@ from statsmodels.tsa.stattools import adfuller
 from afml_utils import (
     CombinatorialPurgedEraCV,
     PurgedEraKFold,
+    build_compact_afml_reference_table,
     build_era_cv_splits,
     cluster_features_onc,
     compute_clustered_mda,
@@ -58,6 +59,7 @@ from afml_utils import (
     compute_strategy_risk,
     compute_variation_of_information_matrix,
     neutralize_predictions,
+    plot_afml_backtest_story,
     purge_train_before_validation,
     summarize_afml_backtest_diagnostics,
 )
@@ -4133,6 +4135,8 @@ def compute_era_error_envelope(
             data_points=("residual", "size"),
             under_share=("under", "mean"),
             over_share=("over", "mean"),
+            under_count=("under", "sum"),
+            over_count=("over", "sum"),
             mae=("abs_error", "mean"),
             mean_residual=("residual", "mean"),
         )
@@ -4144,9 +4148,88 @@ def compute_era_error_envelope(
     full_eras = pd.Index(np.arange(min_era, max_era + 1, dtype=np.int32), name="era")
     envelope_df = measured.reindex(full_eras)
     envelope_df["is_interpolated"] = envelope_df["data_points"].isna()
-    for col in ("data_points", "under_share", "over_share", "mae", "mean_residual"):
+    for col in ("data_points", "under_share", "over_share", "under_count", "over_count", "mae", "mean_residual"):
         envelope_df[col] = envelope_df[col].interpolate(method="index", limit_area="inside")
     return envelope_df
+
+
+def _find_envelope_peak_era(
+    era_index: np.ndarray,
+    total_counts: np.ndarray,
+    shares: np.ndarray,
+    peak_counts: np.ndarray,
+    is_measured: np.ndarray,
+) -> Optional[Dict[str, Any]]:
+    """Find the single measured validation era with the highest forecast error share (tie-broken by count)."""
+    measured_pos = np.flatnonzero(is_measured)
+    if len(measured_pos) == 0:
+        return None
+    m_shares = np.nan_to_num(shares[measured_pos], nan=-1.0)
+    m_counts = np.nan_to_num(peak_counts[measured_pos], nan=-1.0)
+    max_share = float(np.max(m_shares))
+    tied_mask = np.abs(m_shares - max_share) <= 1e-12
+    tied_local = np.flatnonzero(tied_mask)
+    best_local = int(tied_local[int(np.argmax(m_counts[tied_local]))])
+    pos = int(measured_pos[best_local])
+    return {
+        "pos": pos,
+        "era": int(era_index[pos]),
+        "share_pct": float(shares[pos] * 100.0),
+        "count": int(round(float(peak_counts[pos]))),
+        "total": int(round(float(total_counts[pos]))),
+    }
+
+
+def _annotate_envelope_peak(
+    ax: Any,
+    *,
+    era_id: int,
+    y_val: float,
+    label_text: str,
+    marker_color: str,
+    bg_color: str,
+    text_color: str,
+    is_upper: bool,
+    era_min: int,
+    era_max: int,
+) -> None:
+    """Plot a bold peak marker and non-overlapping callout box on the error-direction envelope."""
+    span = max(1, era_max - era_min)
+    rel_x = float(era_id - era_min) / float(span)
+    if rel_x < 0.28:
+        ha_align, x_off = "left", 10
+    elif rel_x > 0.72:
+        ha_align, x_off = "right", -10
+    else:
+        ha_align, x_off = "center", 0
+    y_off = 24 if is_upper else -28
+    va_align = "bottom" if is_upper else "top"
+    marker_shape = "^" if is_upper else "v"
+
+    ax.scatter(
+        [era_id],
+        [y_val],
+        color=marker_color,
+        edgecolors="white",
+        linewidths=1.4,
+        marker=marker_shape,
+        s=105,
+        zorder=7,
+    )
+    ax.annotate(
+        label_text,
+        xy=(era_id, y_val),
+        xytext=(x_off, y_off),
+        textcoords="offset points",
+        ha=ha_align,
+        va=va_align,
+        fontsize=8.6,
+        fontweight="bold",
+        color=text_color,
+        bbox={"boxstyle": "round,pad=0.30", "facecolor": bg_color, "edgecolor": marker_color, "linewidth": 1.2, "alpha": 0.96},
+        arrowprops={"arrowstyle": "->", "color": marker_color, "linewidth": 1.3},
+        zorder=8,
+    )
 
 
 def plot_era_error_envelope(
@@ -4159,7 +4242,7 @@ def plot_era_error_envelope(
     is_best: bool = False,
     save_path: Optional[Any] = None,
 ) -> pd.DataFrame:
-    """Plot the directional error envelope across Numerai eras (x = eras, y = data points per era, ribbon = over/under forecast share)."""
+    """Plot the directional error envelope across Numerai eras with max overforecast/underforecast peak callouts."""
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
@@ -4167,13 +4250,17 @@ def plot_era_error_envelope(
 
     PURPLE = "#7446A5"
     BLUE = "#5C9ED6"
+    DEEP_BLUE = "#1d4ed8"
     ORANGE = "#EEA04B"
+    DEEP_ORANGE = "#c2410c"
 
     envelope_df = compute_era_error_envelope(y_true, y_pred, eras)
     era_index = envelope_df.index.to_numpy(dtype=np.int32)
     centre = envelope_df["data_points"].to_numpy(dtype=np.float64)
     under_share = envelope_df["under_share"].to_numpy(dtype=np.float64)
     over_share = envelope_df["over_share"].to_numpy(dtype=np.float64)
+    under_count = envelope_df["under_count"].to_numpy(dtype=np.float64)
+    over_count = envelope_df["over_count"].to_numpy(dtype=np.float64)
     is_interpolated = envelope_df["is_interpolated"].to_numpy(dtype=bool)
     is_measured = ~is_interpolated
 
@@ -4182,16 +4269,20 @@ def plot_era_error_envelope(
     scale = float(band_size) * (value_span if value_span > 1e-9 else fallback_span)
     lower = centre - scale * under_share
     upper = centre + scale * over_share
+    theo_upper = centre + scale
+    theo_lower = centre - scale
 
-    fig, ax = plt.subplots(figsize=(17, 6), facecolor="white")
+    fig, ax = plt.subplots(figsize=(17.5, 6.8), facecolor="white")
     ax.set_facecolor("white")
-    ax.fill_between(era_index, centre, upper, color=BLUE, alpha=0.45, linewidth=0)
-    ax.fill_between(era_index, lower, centre, color=ORANGE, alpha=0.45, linewidth=0)
-    ax.plot(era_index, upper, color=BLUE, linewidth=1.3)
-    ax.plot(era_index, lower, color=ORANGE, linewidth=1.3)
-    ax.plot(era_index, centre, color=PURPLE, linestyle=":", linewidth=2.3, zorder=3)
+    ax.plot(era_index, theo_upper, color="#94a3b8", linestyle=":", linewidth=0.9, alpha=0.65, zorder=1)
+    ax.plot(era_index, theo_lower, color="#94a3b8", linestyle=":", linewidth=0.9, alpha=0.65, zorder=1)
+    ax.fill_between(era_index, centre, upper, color=BLUE, alpha=0.45, linewidth=0, zorder=2)
+    ax.fill_between(era_index, lower, centre, color=ORANGE, alpha=0.45, linewidth=0, zorder=2)
+    ax.plot(era_index, upper, color=BLUE, linewidth=1.3, zorder=3)
+    ax.plot(era_index, lower, color=ORANGE, linewidth=1.3, zorder=3)
+    ax.plot(era_index, centre, color=PURPLE, linestyle=":", linewidth=2.3, zorder=4)
 
-    ax.scatter(era_index[is_measured], centre[is_measured], color=PURPLE, s=22, zorder=4)
+    ax.scatter(era_index[is_measured], centre[is_measured], color=PURPLE, s=22, zorder=5)
     if np.any(is_interpolated):
         ax.scatter(
             era_index[is_interpolated],
@@ -4200,28 +4291,91 @@ def plot_era_error_envelope(
             edgecolors=PURPLE,
             linewidths=1.5,
             s=45,
-            zorder=5,
+            zorder=6,
         )
 
     n_measured = int(is_measured.sum())
     min_era, max_era = int(era_index[0]), int(era_index[-1])
+
+    max_over_peak = _find_envelope_peak_era(era_index, centre, over_share, over_count, is_measured)
+    max_under_peak = _find_envelope_peak_era(era_index, centre, under_share, under_count, is_measured)
+
+    if max_over_peak is not None:
+        ov_pos = max_over_peak["pos"]
+        _annotate_envelope_peak(
+            ax,
+            era_id=max_over_peak["era"],
+            y_val=float(upper[ov_pos]),
+            label_text=(
+                f"Max Over: {max_over_peak['share_pct']:.1f}% "
+                f"({max_over_peak['count']:,}/{max_over_peak['total']:,}) @ Era {max_over_peak['era']}"
+            ),
+            marker_color=DEEP_BLUE,
+            bg_color="#eff6ff",
+            text_color="#1e3a8a",
+            is_upper=True,
+            era_min=min_era,
+            era_max=max_era,
+        )
+
+    if max_under_peak is not None:
+        un_pos = max_under_peak["pos"]
+        _annotate_envelope_peak(
+            ax,
+            era_id=max_under_peak["era"],
+            y_val=float(lower[un_pos]),
+            label_text=(
+                f"Max Under: {max_under_peak['share_pct']:.1f}% "
+                f"({max_under_peak['count']:,}/{max_under_peak['total']:,}) @ Era {max_under_peak['era']}"
+            ),
+            marker_color=DEEP_ORANGE,
+            bg_color="#fff7ed",
+            text_color="#9a3412",
+            is_upper=False,
+            era_min=min_era,
+            era_max=max_era,
+        )
+
+    env_ymin = float(np.nanmin(theo_lower))
+    env_ymax = float(np.nanmax(theo_upper))
+    env_span = max(env_ymax - env_ymin, 1.0)
+    ax.set_ylim(env_ymin - 0.24 * env_span, env_ymax + 0.26 * env_span)
+
     title_prefix = "[BEST] " if is_best else ""
     title_color = PURPLE if is_best else "#111111"
     fig.suptitle(
         f"{title_prefix}{title}  \u00b7  {n_measured} validation eras  \u00b7  Era {min_era}\u2013{max_era}",
         x=0.06,
+        y=0.965,
         ha="left",
-        fontsize=19,
+        fontsize=17.5,
         fontweight="bold",
         color=title_color,
     )
+    if max_over_peak is not None and max_under_peak is not None:
+        badge_line = (
+            f"Theoretical Max Volume: 100% of era rows  |  "
+            f"Observed Peak Over: {max_over_peak['share_pct']:.1f}% ({max_over_peak['count']:,}/{max_over_peak['total']:,}) @ Era {max_over_peak['era']}  |  "
+            f"Observed Peak Under: {max_under_peak['share_pct']:.1f}% ({max_under_peak['count']:,}/{max_under_peak['total']:,}) @ Era {max_under_peak['era']}"
+        )
+        fig.text(
+            0.06,
+            0.895,
+            badge_line,
+            ha="left",
+            va="top",
+            fontsize=8.9,
+            fontweight="bold",
+            color="#334155",
+            bbox={"boxstyle": "round,pad=0.30", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1", "linewidth": 1.0},
+        )
     if is_best:
         fig.patch.set_edgecolor(PURPLE)
         fig.patch.set_linewidth(2.5)
     ax.set_xlabel("Validation Era")
     ax.set_ylabel("Data points per era")
     ax.set_xlim(min_era, max_era)
-    if float(np.nanmax(upper)) >= 1000.0:
+    if float(np.nanmax(theo_upper)) >= 1000.0:
         ax.yaxis.set_major_formatter(FuncFormatter(_format_thousands_count_tick))
     else:
         ax.yaxis.set_major_formatter(FuncFormatter(_format_integer_count_tick))
@@ -4244,12 +4398,12 @@ def plot_era_error_envelope(
             block_label = f"Y{block_idx}" if block_step == 52 else f"B{block_idx}"
             ax.text(
                 midpoint,
-                1.015,
+                1.01,
                 block_label,
                 transform=ax.get_xaxis_transform(),
                 ha="center",
                 va="bottom",
-                fontsize=10,
+                fontsize=9.5,
                 fontweight="bold",
                 color="#666666",
                 clip_on=False,
@@ -4261,6 +4415,9 @@ def plot_era_error_envelope(
         Line2D([], [], color=PURPLE, linestyle=":", linewidth=2.3, label="Data points per era"),
         Patch(facecolor=BLUE, alpha=0.45, label="Overforecast share"),
         Patch(facecolor=ORANGE, alpha=0.45, label="Underforecast share"),
+        Line2D([], [], color=DEEP_BLUE, marker="^", linestyle="None", markersize=7, label="Max overforecast era"),
+        Line2D([], [], color=DEEP_ORANGE, marker="v", linestyle="None", markersize=7, label="Max underforecast era"),
+        Line2D([], [], color="#94a3b8", linestyle=":", linewidth=1.2, label="100% max volume ref"),
         Line2D([], [], color=PURPLE, marker="o", linestyle="None", markersize=5, label="Evaluated era"),
     ]
     if np.any(is_interpolated):
@@ -4279,26 +4436,26 @@ def plot_era_error_envelope(
     ax.legend(
         handles=legend_handles,
         loc="center left",
-        bbox_to_anchor=(1.02, 0.5),
+        bbox_to_anchor=(1.015, 0.5),
         frameon=False,
-        ncol=2,
-        columnspacing=1.6,
+        ncol=1,
         handletextpad=0.6,
-        labelspacing=1.1,
-        fontsize=10,
+        labelspacing=0.95,
+        fontsize=9.5,
     )
 
     mean_over_pct = float(np.nanmean(over_share[is_measured]) * 100.0)
     mean_under_pct = float(np.nanmean(under_share[is_measured]) * 100.0)
     fig.text(
         0.06,
-        0.035,
+        0.025,
         f"Bands show the share of held-out predictions above/below target (mean overforecast {mean_over_pct:.1f}%, "
-        f"underforecast {mean_under_pct:.1f}%), not error magnitude. Ribbon thickness scales to {int(round(band_size * 100))}% of era data-point range.",
-        fontsize=9,
+        f"underforecast {mean_under_pct:.1f}%), not error magnitude. Dotted bounds mark 100% theoretical era-row volume "
+        f"(ribbon scaled to {int(round(band_size * 100))}% of era data-point range).",
+        fontsize=8.8,
         color="#555555",
     )
-    fig.subplots_adjust(left=0.06, right=0.70, top=0.84, bottom=0.17)
+    fig.subplots_adjust(left=0.06, right=0.80, top=0.80, bottom=0.15)
     if save_path is not None:
         target_path = Path(save_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5107,3 +5264,696 @@ def build_live_staking_scenarios_df(
             "concurrent_rounds": int(m["concurrent_rounds"]),
         })
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# 4-Layer Analysis Suite: Executive Scorecards, JSON Export, CORR & Residuals
+# ---------------------------------------------------------------------------
+
+def _json_safe_scalar(value: Any) -> Any:
+    """Convert NumPy scalars and non-finite floats into strict RFC-8259 JSON-compatible values."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        fval = float(value)
+        return fval if np.isfinite(fval) else None
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    return str(value)
+
+
+def format_tuw_years(
+    tuw_eras: Any,
+    periods_per_year: float = 52.0,
+) -> str:
+    """Format Time-under-Water era count cleanly in years (e.g. `1.25 yr (65 eras)`)."""
+    if tuw_eras is None:
+        return "N/A"
+    try:
+        val = float(tuw_eras)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not np.isfinite(val):
+        return "N/A"
+    eras_int = max(0, int(round(val)))
+    yrs = float(eras_int) / max(1.0, float(periods_per_year))
+    return f"{yrs:.2f} yr ({eras_int}e)"
+
+
+def _prioritize_and_mark_winner(
+    df: pd.DataFrame,
+    best_variant_name: Optional[str] = None,
+) -> pd.DataFrame:
+    """Return a copy of `df` with `best_variant_name` promoted to row 0 and prefixed with `[WINNER]`."""
+    out = df.copy().reset_index(drop=True)
+    if best_variant_name is None or "variant" not in out.columns or out.empty:
+        return out
+    is_winner = out["variant"].astype(str) == str(best_variant_name)
+    if bool(is_winner.any()):
+        out = pd.concat([out.loc[is_winner], out.loc[~is_winner]], axis=0, ignore_index=True)
+        out["variant"] = np.where(
+            out["variant"].astype(str) == str(best_variant_name),
+            "[WINNER] " + out["variant"].astype(str),
+            out["variant"].astype(str),
+        )
+    return out
+
+
+def build_executive_scorecard_tables(
+    comparison_df: pd.DataFrame,
+    *,
+    best_variant_name: Optional[str] = None,
+    periods_per_year: float = 52.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Split the wide comparison DataFrame into two compact, untruncated Executive Scorecard tables.
+
+    Returns `(money_df, science_df)`:
+      - `money_df` (7 cols): `variant`, `end_capital`, `total_return_pct`, `money_drawdown_pct`,
+        `max_drawdown_gbp`, `worst_round_gbp`, `tuw_max_eras` (formatted in years).
+      - `science_df` (8 cols): `variant`, `train_corr`, `validation_corr`, `corr_gap`,
+        `validation_sharpe`, `validation_psr`, `validation_dsr`, `sanity_status`.
+    """
+    if comparison_df is None or comparison_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    base = _prioritize_and_mark_winner(comparison_df, best_variant_name=best_variant_name)
+
+    money_cols = [
+        "variant",
+        "end_capital",
+        "total_return_pct",
+        "money_drawdown_pct",
+        "max_drawdown_gbp",
+        "worst_round_gbp",
+        "tuw_max_eras",
+    ]
+    money_data: Dict[str, Any] = {}
+    for col in money_cols:
+        if col not in base.columns:
+            money_data[col] = [np.nan] * len(base)
+        elif col == "variant":
+            money_data[col] = base[col].astype(str).tolist()
+        elif col == "tuw_max_eras":
+            money_data[col] = [
+                format_tuw_years(v, periods_per_year=periods_per_year)
+                for v in base[col].tolist()
+            ]
+        else:
+            money_data[col] = pd.to_numeric(base[col], errors="coerce").round(2).tolist()
+    money_df = pd.DataFrame(money_data)
+
+    science_cols = [
+        "variant",
+        "train_corr",
+        "validation_corr",
+        "corr_gap",
+        "validation_sharpe",
+        "validation_psr",
+        "validation_dsr",
+        "sanity_status",
+    ]
+    science_data: Dict[str, Any] = {}
+    for col in science_cols:
+        if col not in base.columns:
+            science_data[col] = [np.nan] * len(base)
+        elif col in ("variant", "sanity_status"):
+            science_data[col] = base[col].astype(str).tolist()
+        else:
+            science_data[col] = pd.to_numeric(base[col], errors="coerce").round(4).tolist()
+    science_df = pd.DataFrame(science_data)
+
+    return money_df, science_df
+
+
+def build_diagnostics_summary_table(
+    comparison_df: pd.DataFrame,
+    *,
+    best_variant_name: Optional[str] = None,
+) -> pd.DataFrame:
+    """Build the compact 7-column Layer 3 Model Diagnostics table (no horizontal truncation)."""
+    if comparison_df is None or comparison_df.empty:
+        return pd.DataFrame()
+
+    base = _prioritize_and_mark_winner(comparison_df, best_variant_name=best_variant_name)
+    diag_cols = [
+        "variant",
+        "feature_exposure",
+        "validation_fnc",
+        "validation_fnc_sharpe",
+        "validation_mae",
+        "forecast_bias",
+        "directional_hit_rate",
+    ]
+    out_data: Dict[str, Any] = {}
+    for col in diag_cols:
+        if col not in base.columns:
+            out_data[col] = [np.nan] * len(base)
+        elif col == "variant":
+            out_data[col] = base[col].astype(str).tolist()
+        else:
+            out_data[col] = pd.to_numeric(base[col], errors="coerce").round(4).tolist()
+    return pd.DataFrame(out_data)
+
+
+def display_compact_dataframe(
+    df: pd.DataFrame,
+    *,
+    title: Optional[str] = None,
+) -> None:
+    """Display a compact DataFrame without horizontal `...` column truncation."""
+    if title:
+        print(title)
+    with pd.option_context(
+        "display.max_columns",
+        None,
+        "display.width",
+        220,
+        "display.max_colwidth",
+        64,
+        "display.expand_frame_repr",
+        False,
+    ):
+        try:
+            from IPython.display import display as ipython_display
+
+            ipython_display(df)
+        except Exception:
+            print(df.to_string(index=False))
+
+
+def export_winner_scorecard_json(
+    comparison_df: pd.DataFrame,
+    *,
+    best_variant_name: str,
+    model_tag: str,
+    output_dir: Union[str, Path],
+    experiment_meta: Optional[Mapping[str, Any]] = None,
+    periods_per_year: float = 52.0,
+) -> Path:
+    """Export the Train-CV-Locked Winner's scorecard row to `summary_<model_tag>.json` for cross-notebook comparison."""
+    if comparison_df is None or comparison_df.empty:
+        raise ValueError("comparison_df must be non-empty to export winner scorecard JSON.")
+
+    matched = comparison_df.loc[comparison_df["variant"].astype(str) == str(best_variant_name)]
+    winner_row = matched.reset_index(drop=True).loc[0] if not matched.empty else comparison_df.reset_index(drop=True).loc[0]
+
+    tuw_eras_raw = winner_row.get("tuw_max_eras", np.nan)
+    tuw_eras_num = _json_safe_scalar(tuw_eras_raw)
+    tuw_years_val = (
+        round(float(tuw_eras_num) / max(1.0, float(periods_per_year)), 3)
+        if isinstance(tuw_eras_num, (int, float))
+        else None
+    )
+
+    money_keys = (
+        "end_capital",
+        "total_return_pct",
+        "money_drawdown_pct",
+        "max_drawdown_gbp",
+        "worst_round_gbp",
+        "tuw_max_eras",
+    )
+    science_keys = (
+        "train_corr",
+        "validation_corr",
+        "corr_gap",
+        "validation_sharpe",
+        "validation_lo_sharpe",
+        "validation_psr",
+        "validation_dsr",
+        "sanity_status",
+    )
+    diagnostics_keys = (
+        "feature_exposure",
+        "validation_fnc",
+        "validation_fnc_sharpe",
+        "validation_mae",
+        "forecast_bias",
+        "directional_hit_rate",
+        "adf_pvalue",
+        "ljung_box_pvalue",
+        "arch_lm_pvalue",
+        "hhi_pos",
+        "hhi_neg",
+    )
+
+    money_metrics = {k: _json_safe_scalar(winner_row.get(k, None)) for k in money_keys}
+    money_metrics["tuw_max_years"] = tuw_years_val
+    money_metrics["tuw_formatted"] = format_tuw_years(tuw_eras_raw, periods_per_year=periods_per_year)
+    science_metrics = {k: _json_safe_scalar(winner_row.get(k, None)) for k in science_keys}
+    diagnostics_metrics = {k: _json_safe_scalar(winner_row.get(k, None)) for k in diagnostics_keys}
+
+    safe_tag = (
+        str(model_tag or "model")
+        .strip()
+        .lower()
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("\\", "_")
+    )
+    payload: Dict[str, Any] = {
+        "model_tag": safe_tag,
+        "variant": str(winner_row.get("variant", best_variant_name)),
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "experiment_meta": {
+            str(k): _json_safe_scalar(v) for k, v in (experiment_meta or {}).items()
+        },
+        **money_metrics,
+        **science_metrics,
+        **diagnostics_metrics,
+        "money_table": money_metrics,
+        "science_table": science_metrics,
+        "diagnostics_table": diagnostics_metrics,
+    }
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"summary_{safe_tag}.json"
+    out_path.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
+    return out_path
+
+
+def _extract_variant_era_corrs(entry: Any) -> pd.Series:
+    """Extract a clean, chronologically sorted per-era validation CORR Series from a variant entry."""
+    raw = entry["validation_era_corrs"] if isinstance(entry, Mapping) and "validation_era_corrs" in entry else entry
+    return pd.Series(raw, dtype=np.float64).dropna().sort_index()
+
+
+def plot_cumulative_validation_corr(
+    results_by_variant: Mapping[str, Mapping[str, Any]],
+    *,
+    best_variant_name: Optional[str] = None,
+    title: str = "Cumulative Validation CORR Across Variants",
+    save_path: Optional[Any] = None,
+) -> pd.DataFrame:
+    """Plot Cumulative Validation CORR across all variants with the Train-CV-Locked Winner highlighted."""
+    import matplotlib.pyplot as plt
+
+    if not results_by_variant:
+        raise ValueError("results_by_variant must contain at least one variant.")
+
+    cum_cols: Dict[str, pd.Series] = {}
+    sharpe_map: Dict[str, float] = {}
+    for variant_name, entry in results_by_variant.items():
+        era_s = _extract_variant_era_corrs(entry)
+        if len(era_s) == 0:
+            continue
+        cum_cols[str(variant_name)] = era_s.cumsum()
+        if isinstance(entry, Mapping) and "validation_sharpe" in entry and np.isfinite(float(entry["validation_sharpe"])):
+            sharpe_map[str(variant_name)] = float(entry["validation_sharpe"])
+        else:
+            sharpe_map[str(variant_name)] = float(sharpe_ratio(era_s))
+
+    if not cum_cols:
+        return pd.DataFrame()
+
+    cum_df = pd.DataFrame(cum_cols).sort_index()
+    x_pos = np.arange(len(cum_df), dtype=np.int64)
+    era_labels = cum_df.index.astype(str).to_numpy()
+    tick_step = max(1, len(x_pos) // 10)
+    palette = ["#2563eb", "#059669", "#d97706", "#7c3aed", "#dc2626", "#0891b2"]
+
+    fig, ax = plt.subplots(figsize=(14.5, 5.2), facecolor="white")
+    ax.set_facecolor("white")
+    ax.axhline(0.0, color="#0f172a", linestyle="--", linewidth=1.2, alpha=0.85, zorder=2)
+
+    for idx, variant_name in enumerate(cum_df.columns):
+        is_winner = best_variant_name is not None and str(variant_name) == str(best_variant_name)
+        color = "#1d4ed8" if is_winner else palette[(idx + 1) % len(palette)]
+        y_vals = cum_df[variant_name].to_numpy(dtype=np.float64)
+        final_val = float(y_vals[-1]) if len(y_vals) else 0.0
+        lbl_prefix = "[WINNER] " if is_winner else ""
+        ax.plot(
+            x_pos,
+            y_vals,
+            color=color,
+            linewidth=2.6 if is_winner else 1.8,
+            alpha=1.0 if is_winner else 0.82,
+            zorder=5 if is_winner else 3,
+            label=f"{lbl_prefix}{variant_name} (SR {sharpe_map[variant_name]:.2f}, End {final_val:+.2f})",
+        )
+        if is_winner and len(x_pos) > 0:
+            ax.scatter([x_pos[-1]], [final_val], color=color, edgecolors="white", s=60, zorder=6)
+
+    ax.set_xticks(x_pos[::tick_step])
+    ax.set_xticklabels(era_labels[::tick_step], rotation=40, ha="right", fontsize=8.5)
+    ax.set_xlabel("Validation Era")
+    ax.set_ylabel("Cumulative Numerai CORR")
+    ax.set_title(title, fontsize=12.5, fontweight="bold", pad=10)
+    ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(loc="upper left", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.6)
+
+    fig.tight_layout()
+    if save_path is not None:
+        out_path = Path(save_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=140)
+    plt.show()
+    return cum_df
+
+
+def plot_rolling_validation_corr(
+    per_era_corr: pd.Series,
+    *,
+    window: int = 20,
+    comparison_corrs: Optional[Mapping[str, pd.Series]] = None,
+    title: str = "Rolling 20-Era Validation CORR",
+    save_path: Optional[Any] = None,
+) -> pd.Series:
+    """Plot a Rolling 20-Era Validation CORR chart with `y=0` reference and positive/negative regime shading."""
+    import matplotlib.pyplot as plt
+
+    corr_s = pd.Series(per_era_corr, dtype=np.float64).dropna().sort_index()
+    if len(corr_s) == 0:
+        return pd.Series(dtype=np.float64)
+
+    req_window = max(2, int(window))
+    eff_window = min(req_window, len(corr_s))
+    min_p = eff_window if len(corr_s) >= req_window else max(1, eff_window // 2)
+    rolling_s = corr_s.rolling(window=eff_window, min_periods=min_p).mean().dropna()
+    if len(rolling_s) == 0:
+        rolling_s = corr_s.expanding(min_periods=1).mean()
+
+    x_pos = np.arange(len(rolling_s), dtype=np.int64)
+    y_vals = rolling_s.to_numpy(dtype=np.float64)
+    era_labels = rolling_s.index.astype(str).to_numpy()
+    tick_step = max(1, len(x_pos) // 10)
+    overall_mean = float(corr_s.mean())
+    pos_window_pct = float(np.mean(y_vals > 0.0) * 100.0)
+    latest_val = float(y_vals[-1])
+    min_idx = int(np.argmin(y_vals))
+    min_val = float(y_vals[min_idx])
+    min_era = era_labels[min_idx]
+
+    fig, ax = plt.subplots(figsize=(14.5, 5.4), facecolor="white")
+    ax.set_facecolor("white")
+
+    # Optional subtle overlays of non-winner variants
+    all_plotted_vals: List[np.ndarray] = [y_vals]
+    if comparison_corrs:
+        sec_colors = ["#64748b", "#8b5cf6", "#0891b2", "#a16207"]
+        for c_idx, (v_name, v_series) in enumerate(comparison_corrs.items()):
+            v_clean = pd.Series(v_series, dtype=np.float64).dropna().sort_index()
+            if len(v_clean) == 0:
+                continue
+            v_roll = v_clean.rolling(window=eff_window, min_periods=min_p).mean().reindex(rolling_s.index)
+            if v_roll.notna().any():
+                v_arr = v_roll.to_numpy(dtype=np.float64)
+                all_plotted_vals.append(v_arr[np.isfinite(v_arr)])
+                ax.plot(
+                    x_pos,
+                    v_arr,
+                    color=sec_colors[c_idx % len(sec_colors)],
+                    linestyle="--",
+                    linewidth=1.25,
+                    alpha=0.58,
+                    zorder=2,
+                    label=f"{v_name} ({eff_window}-era roll)",
+                )
+
+    ax.axhline(0.0, color="#0f172a", linestyle="--", linewidth=1.5, zorder=3, label="Zero Edge (0.0)")
+    ax.axhline(
+        overall_mean,
+        color="#475569",
+        linestyle=":",
+        linewidth=1.3,
+        zorder=3,
+        label=f"Full-Period Mean ({overall_mean:+.4f})",
+    )
+    ax.fill_between(x_pos, 0.0, y_vals, where=(y_vals >= 0.0), interpolate=True, color="#10b981", alpha=0.28, zorder=2)
+    ax.fill_between(x_pos, 0.0, y_vals, where=(y_vals < 0.0), interpolate=True, color="#ef4444", alpha=0.28, zorder=2)
+    ax.plot(x_pos, y_vals, color="#1d4ed8", linewidth=2.2, zorder=4, label=f"Winner Rolling {eff_window}-Era CORR")
+
+    # Highlight lowest rolling regime trough
+    ax.scatter([min_idx], [min_val], color="#b91c1c", edgecolors="white", s=65, zorder=6)
+    x_off = 10 if min_idx < 0.70 * len(x_pos) else -10
+    ha_min = "left" if x_off > 0 else "right"
+    ax.annotate(
+        f"Trough: {min_val:+.4f} @ Era {min_era}",
+        xy=(min_idx, min_val),
+        xytext=(x_off, -18),
+        textcoords="offset points",
+        ha=ha_min,
+        va="top",
+        fontsize=8.3,
+        fontweight="bold",
+        color="#991b1b",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "#fef2f2", "edgecolor": "#dc2626", "alpha": 0.94},
+        arrowprops={"arrowstyle": "->", "color": "#b91c1c", "linewidth": 1.1},
+        zorder=7,
+    )
+
+    combined_vals = np.concatenate([a for a in all_plotted_vals if len(a) > 0])
+    y_min_all = min(float(np.min(combined_vals)), 0.0)
+    y_max_all = max(float(np.max(combined_vals)), 0.0)
+    y_span = max(y_max_all - y_min_all, 0.02)
+    ax.set_ylim(y_min_all - 0.25 * y_span, y_max_all + 0.18 * y_span)
+
+    ax.set_xticks(x_pos[::tick_step])
+    ax.set_xticklabels(era_labels[::tick_step], rotation=40, ha="right", fontsize=8.5)
+    ax.set_xlabel("Validation Era")
+    ax.set_ylabel(f"Rolling {eff_window}-Era Mean CORR")
+    ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(loc="upper right", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.4)
+
+    fig.suptitle(title, fontsize=13.0, fontweight="bold", y=0.98)
+    fig.text(
+        0.5,
+        0.925,
+        f"Window: {eff_window} eras  |  Positive Windows: {pos_window_pct:.1f}%  |  "
+        f"Overall Mean: {overall_mean:+.4f}  |  Latest {eff_window}-Era: {latest_val:+.4f}  |  Worst Trough: {min_val:+.4f} (@ Era {min_era})",
+        ha="center",
+        va="top",
+        fontsize=8.9,
+        fontweight="bold",
+        color="#334155",
+        bbox={"boxstyle": "round,pad=0.30", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
+    )
+    fig.subplots_adjust(left=0.07, right=0.97, top=0.83, bottom=0.17)
+    if save_path is not None:
+        out_path = Path(save_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=140)
+    plt.show()
+    return rolling_s
+
+
+def _extract_variant_predictions(entry: Any) -> np.ndarray:
+    """Extract a 1D float64 prediction array from either a result dict or raw array-like."""
+    raw = entry["validation_preds"] if isinstance(entry, Mapping) and "validation_preds" in entry else entry
+    return np.asarray(raw, dtype=np.float64).ravel()
+
+
+def _select_top2_variants(
+    predictions_by_model: Mapping[str, Any],
+    *,
+    best_variant_name: Optional[str] = None,
+    variant_order: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Select the top 2 variants for side-by-side residual comparison (locked winner first, then top runner-up)."""
+    selected: List[str] = []
+    if best_variant_name is not None and best_variant_name in predictions_by_model:
+        selected.append(str(best_variant_name))
+    candidates = list(variant_order) if variant_order is not None else list(predictions_by_model.keys())
+    for name in candidates:
+        name_str = str(name)
+        if name_str in predictions_by_model and name_str not in selected:
+            selected.append(name_str)
+        if len(selected) >= 2:
+            break
+    if len(selected) < 2:
+        for name in predictions_by_model:
+            name_str = str(name)
+            if name_str not in selected:
+                selected.append(name_str)
+            if len(selected) >= 2:
+                break
+    return selected[:2]
+
+
+def plot_top2_residuals_vs_actual(
+    y_true: Any,
+    predictions_by_model: Mapping[str, Any],
+    eras: Optional[Any] = None,
+    *,
+    best_variant_name: Optional[str] = None,
+    variant_order: Optional[Sequence[str]] = None,
+    max_scatter_points: int = 5000,
+    jitter_strength: float = 0.035,
+    random_state: int = 42,
+    save_path: Optional[Any] = None,
+) -> pd.DataFrame:
+    """Plot a side-by-side 2-panel Residuals vs. Actual Target comparison for the top 2 variants.
+
+    Uses slight horizontal jitter across Numerai's discrete target bins (`0.0, 0.25, 0.50, 0.75, 1.0`)
+    plus per-bin mean ±1 SD markers so stacked points and shrinkage bias remain clearly visible.
+    """
+    import matplotlib.pyplot as plt
+
+    del eras  # Accepted for signature parity with plot_residual_diagnostics
+    actual_all = np.asarray(y_true, dtype=np.float64).ravel()
+    if len(actual_all) == 0:
+        raise ValueError("y_true must be non-empty.")
+    if not predictions_by_model:
+        raise ValueError("predictions_by_model must contain at least one variant.")
+
+    top_names = _select_top2_variants(
+        predictions_by_model,
+        best_variant_name=best_variant_name,
+        variant_order=variant_order,
+    )
+    extracted: Dict[str, np.ndarray] = {}
+    for name in top_names:
+        pred_arr = _extract_variant_predictions(predictions_by_model[name])
+        if len(pred_arr) != len(actual_all):
+            raise ValueError(
+                f"Prediction length mismatch for {name!r}: expected {len(actual_all)}, got {len(pred_arr)}."
+            )
+        extracted[name] = pred_arr
+
+    finite_actual = np.isfinite(actual_all)
+    unique_actuals = np.sort(np.unique(actual_all[finite_actual]))
+    is_discrete = 2 <= len(unique_actuals) <= 10
+    min_step = float(np.min(np.diff(unique_actuals))) if len(unique_actuals) >= 2 else 0.25
+    jitter_half = min(abs(float(jitter_strength)), 0.16 * min_step) if is_discrete else 0.0
+
+    n_panels = len(top_names)
+    fig, axes = plt.subplots(
+        1,
+        n_panels,
+        figsize=(7.4 * n_panels, 5.4),
+        sharex=True,
+        sharey=True,
+        facecolor="white",
+        squeeze=False,
+    )
+    flat_axes = axes.ravel()
+    panel_colors = ("#2563eb", "#d97706")
+    rng = np.random.default_rng(int(random_state))
+    cap_pts = max(100, int(max_scatter_points))
+    summary_rows: List[Dict[str, Any]] = []
+
+    for idx, name in enumerate(top_names):
+        ax = flat_axes[idx]
+        ax.set_facecolor("white")
+        pred_arr = extracted[name]
+        mask = finite_actual & np.isfinite(pred_arr)
+        if not np.any(mask):
+            raise ValueError(f"No finite prediction/target pairs available for {name!r}.")
+
+        a_v = actual_all[mask]
+        r_v = pred_arr[mask] - a_v
+        mae_v = float(np.mean(np.abs(r_v)))
+        rmse_v = float(np.sqrt(np.mean(r_v * r_v)))
+        mean_r = float(np.mean(r_v))
+        under_pct = float(np.mean(r_v < 0.0) * 100.0)
+        over_pct = float(np.mean(r_v > 0.0) * 100.0)
+        is_winner = best_variant_name is not None and name == best_variant_name
+        display_name = f"[WINNER] {name}" if is_winner else name
+
+        summary_rows.append({
+            "variant": display_name,
+            "n_valid": int(len(r_v)),
+            "mean_residual": round(mean_r, 6),
+            "mae": round(mae_v, 4),
+            "rmse": round(rmse_v, 4),
+            "under_predict_pct": round(under_pct, 2),
+            "over_predict_pct": round(over_pct, 2),
+        })
+
+        if len(a_v) > cap_pts:
+            pick = rng.choice(len(a_v), size=cap_pts, replace=False)
+            a_s, r_s = a_v[pick], r_v[pick]
+        else:
+            a_s, r_s = a_v, r_v
+
+        x_plot = a_s + rng.uniform(-jitter_half, jitter_half, size=len(a_s)) if jitter_half > 0.0 else a_s
+        base_color = panel_colors[idx % len(panel_colors)]
+
+        ax.scatter(x_plot, r_s, alpha=0.28, s=18, color=base_color, edgecolors="none", zorder=2, label="Sampled rows (jittered)")
+        ax.axhline(0.0, color="#0f172a", linestyle="--", linewidth=1.8, zorder=4, label="Zero residual (y = 0)")
+
+        if is_discrete:
+            bin_means: List[float] = []
+            bin_stds: List[float] = []
+            bin_xs: List[float] = []
+            for tv in unique_actuals:
+                t_mask = np.abs(a_v - tv) <= 1e-9
+                if np.any(t_mask):
+                    bin_xs.append(float(tv))
+                    bin_means.append(float(np.mean(r_v[t_mask])))
+                    bin_stds.append(float(np.std(r_v[t_mask])))
+            if bin_xs:
+                ax.errorbar(
+                    bin_xs,
+                    bin_means,
+                    yerr=bin_stds,
+                    fmt="D-",
+                    color="#0f172a",
+                    markerfacecolor=base_color,
+                    markeredgecolor="white",
+                    markersize=7.0,
+                    linewidth=1.5,
+                    elinewidth=1.3,
+                    capsize=4,
+                    zorder=5,
+                    label="Bin mean ± 1 SD",
+                )
+            ax.set_xticks(unique_actuals)
+            ax.set_xlim(float(unique_actuals[0]) - 0.12, float(unique_actuals[-1]) + 0.12)
+
+        ax.text(
+            0.03,
+            0.04,
+            f"MAE: {mae_v:.4f} | Mean Resid: {mean_r:+.4f}\nOver: {over_pct:.1f}% | Under: {under_pct:.1f}%",
+            transform=ax.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=8.4,
+            fontweight="bold",
+            color="#1e293b",
+            bbox={"boxstyle": "round,pad=0.30", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1", "alpha": 0.94},
+            zorder=6,
+        )
+        ax.set_title(display_name, fontsize=11.0, fontweight="bold", pad=8)
+        ax.set_xlabel("Actual Target")
+        if idx == 0:
+            ax.set_ylabel("Residual (Predicted − Actual)")
+        ax.legend(loc="upper right", frameon=True, facecolor="white", framealpha=0.90, fontsize=8.1)
+        _apply_clean_residual_axes_style(ax)
+
+    fig.suptitle(
+        "Top-2 Variants: Residuals vs. Actual Target",
+        fontsize=13.2,
+        fontweight="bold",
+        y=0.985,
+    )
+    fig.text(
+        0.5,
+        0.925,
+        "(below 0 = under-predicting, above 0 = over-predicting)",
+        ha="center",
+        va="top",
+        fontsize=9.6,
+        style="italic",
+        color="#475569",
+    )
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.83, bottom=0.12, wspace=0.10)
+    if save_path is not None:
+        out_path = Path(save_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=140)
+    plt.show()
+    return pd.DataFrame(summary_rows)

@@ -106,11 +106,16 @@ class TestNotebookStructureAndStandards(unittest.TestCase):
                     if cell["cell_type"] != "code":
                         continue
 
-                    # Repository coding standards: no forbidden indexer, no def in notebooks, imports in Cell 1 only
+                    # Repository coding standards: no forbidden indexer, no def/lambda in notebooks, imports in Cell 1 only
                     self.assertNotIn("." + "iloc", src, f"Forbidden indexer in {nb_name} cell {idx}")
+                    self.assertNotIn("display(comparison_df)", src, f"Truncated 42-col comparison_df dump in {nb_name} cell {idx}")
                     self.assertIsNone(
                         re.search(r"^\s*(async\s+)?def\s+", src, flags=re.M),
                         f"Function definition found in {nb_name} cell {idx}",
+                    )
+                    self.assertIsNone(
+                        re.search(r"\blambda\b", src),
+                        f"Anonymous lambda found in {nb_name} cell {idx}",
                     )
                     if idx > 1:
                         self.assertIsNone(
@@ -126,7 +131,7 @@ class TestNotebookStructureAndStandards(unittest.TestCase):
                     if cleaned_src.strip():
                         compile(cleaned_src, f"{nb_name}:cell_{idx}", "exec")
 
-                # Standard workflow header hierarchy mirrored from baseline_unity.ipynb (in order)
+                # Standard workflow + 4-layer # Analysis header hierarchy mirrored across all Unity notebooks (in order)
                 expected_sections = (
                     "# Setup",
                     "# Prep",
@@ -136,11 +141,20 @@ class TestNotebookStructureAndStandards(unittest.TestCase):
                     "## Bayesian",
                     "# Train",
                     "# Analysis",
-                    "## General",
-                    "## AFML Backtest Overfitting, Risk & Numerai Forum #1454 Diagnostics",
-                    "## NumerAPI v6.0 Dataset Discovery & True MMC vs BMC Proxy Check",
-                    "## Simulated Numerai Staking P&L Dashboard (£)",
-                    "## Monte Carlo Block-Bootstrap Risk Analysis (£)",
+                    "## Executive Scorecard",
+                    "## Core Performance & Money Visuals",
+                    "### NumerAPI v6.0 Dataset Discovery & True MMC vs BMC Proxy Check",
+                    "### Simulated Numerai Staking P&L Dashboard (£)",
+                    "### Monte Carlo Block-Bootstrap Risk Analysis (£)",
+                    "### Cumulative & Rolling 20-Era Validation CORR",
+                    "## Model Diagnostics & Residual Visuals",
+                    "### Compact Diagnostics Table",
+                    "### Error-Direction Envelope Analysis",
+                    "### Top-2 Variants Residuals vs. Actual",
+                    "### Model Interpretability & Top CV Candidates",
+                    "## AFML Backtest Visual Story",
+                    "### Statistical Credibility & Regime Dashboard",
+                    "### AFML Backtest Reference Table",
                     "## Optional Community Companion: `numereval` (Council of Elders)",
                 )
                 section_positions = []
@@ -150,24 +164,25 @@ class TestNotebookStructureAndStandards(unittest.TestCase):
                 self.assertEqual(
                     section_positions,
                     sorted(section_positions),
-                    f"{nb_name} baseline header sections are out of order: {list(zip(expected_sections, section_positions))}",
-                )
-                envelope_indices = [
-                    pos for pos, heading in enumerate(markdown_headings)
-                    if heading.startswith("## Error-Direction Envelope Analysis")
-                ]
-                self.assertEqual(len(envelope_indices), 1, f"{nb_name} missing Error-Direction Envelope Analysis header")
-                self.assertGreater(envelope_indices[0], markdown_headings.index("## General"))
-                self.assertLess(
-                    envelope_indices[0],
-                    markdown_headings.index("## AFML Backtest Overfitting, Risk & Numerai Forum #1454 Diagnostics"),
+                    f"{nb_name} header sections are out of order: {list(zip(expected_sections, section_positions))}",
                 )
 
     def test_notebook_cell1_imports_expected_model_modules(self) -> None:
+        shared_analysis_symbols = (
+            "build_compact_afml_reference_table",
+            "build_diagnostics_summary_table",
+            "build_executive_scorecard_tables",
+            "display_compact_dataframe",
+            "export_winner_scorecard_json",
+            "plot_afml_backtest_story",
+            "plot_cumulative_validation_corr",
+            "plot_rolling_validation_corr",
+            "plot_top2_residuals_vs_actual",
+        )
         expected_symbols = {
-            "baseline_unity.ipynb": ("BinSnappingEstimator", "LagReversalEstimator", "PersistenceEstimator", "run_baseline"),
-            "lightgbm_unity.ipynb": ("LightGBMNumeraiEstimator",),
-            "minirocket_unity.ipynb": ("MiniRocketNumeraiEstimator",),
+            "baseline_unity.ipynb": ("BinSnappingEstimator", "LagReversalEstimator", "PersistenceEstimator", "run_baseline") + shared_analysis_symbols,
+            "lightgbm_unity.ipynb": ("LightGBMNumeraiEstimator",) + shared_analysis_symbols,
+            "minirocket_unity.ipynb": ("MiniRocketNumeraiEstimator",) + shared_analysis_symbols,
         }
         for nb_name, symbols in expected_symbols.items():
             nb = json.loads((NOTEBOOKS_DIR / nb_name).read_text(encoding="utf-8"))

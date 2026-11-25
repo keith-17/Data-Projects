@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from itertools import combinations
 from math import comb
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -1672,4 +1673,652 @@ def summarize_afml_backtest_diagnostics(
         "hhi_neg": float(hhi_info["hhi_neg"]),
         "hhi_time": float(hhi_info["hhi_time"]),
         "strategy_fail_prob": float(risk_info["prob_strategy_failure"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7. AFML Backtest Visual Story (2x2 Dashboard) & Compact Reference Table
+# ---------------------------------------------------------------------------
+
+def _find_longest_underwater_span(dd_series: pd.Series) -> Tuple[Optional[int], Optional[int], int]:
+    """Return `(start_pos, end_pos, duration)` for the longest contiguous underwater episode (`dd > 1e-12`)."""
+    vals = np.asarray(dd_series.to_numpy(dtype=np.float64), dtype=np.float64)
+    if len(vals) == 0:
+        return None, None, 0
+    underwater = vals > 1e-12
+    best_start: Optional[int] = None
+    best_end: Optional[int] = None
+    best_len = 0
+    cur_start: Optional[int] = None
+    for pos, is_uw in enumerate(underwater):
+        if is_uw:
+            if cur_start is None:
+                cur_start = pos
+        elif cur_start is not None:
+            cur_len = pos - cur_start
+            if cur_len > best_len:
+                best_len = cur_len
+                best_start = cur_start
+                best_end = pos - 1
+            cur_start = None
+    if cur_start is not None:
+        cur_len = len(vals) - cur_start
+        if cur_len > best_len:
+            best_len = cur_len
+            best_start = cur_start
+            best_end = len(vals) - 1
+    return best_start, best_end, best_len
+
+
+def _afml_confidence_color(
+    value: float,
+    *,
+    pass_threshold: float = 0.95,
+    borderline_threshold: float = 0.80,
+) -> Tuple[str, str]:
+    """Map a probability/confidence metric in `[0, 1]` to `(hex_color, verdict_tag)`."""
+    if not np.isfinite(value):
+        return "#64748b", "N/A"
+    if value >= pass_threshold:
+        return "#059669", "PASS"
+    if value >= borderline_threshold:
+        return "#d97706", "BORDERLINE"
+    return "#dc2626", "FAIL"
+
+
+def _afml_hhi_color(hhi_val: float) -> Tuple[str, str]:
+    """Map an HHI concentration score in `[0, 1]` to `(hex_color, interpretation_label)`."""
+    if not np.isfinite(hhi_val):
+        return "#64748b", "N/A"
+    if hhi_val <= 0.15:
+        return "#059669", "Even"
+    if hhi_val <= 0.30:
+        return "#d97706", "Moderate"
+    return "#dc2626", "Concentrated"
+
+
+def _resolve_regime_badge_specs(
+    afml_summary: Mapping[str, Any],
+    regime_stats: Optional[Mapping[str, Any]] = None,
+) -> List[Dict[str, str]]:
+    """Build status-badge specifications for ADF, Ljung-Box, ARCH-LM, and PBO (CSCV)."""
+    stats_src = regime_stats if regime_stats is not None else {}
+
+    def_adf = stats_src.get("adf_pvalue", afml_summary.get("adf_pvalue", np.nan))
+    adf_p = float(def_adf) if def_adf is not None else float(np.nan)
+    if np.isfinite(adf_p):
+        if adf_p < 0.05:
+            adf_spec = {"title": "ADF Stationarity", "value": f"p = {adf_p:.3f}", "status": "PASS (Stationary)", "color": "#065f46", "bg": "#ecfdf5", "edge": "#10b981"}
+        else:
+            adf_spec = {"title": "ADF Stationarity", "value": f"p = {adf_p:.3f}", "status": "FAIL (Drift Risk)", "color": "#991b1b", "bg": "#fef2f2", "edge": "#ef4444"}
+    else:
+        adf_spec = {"title": "ADF Stationarity", "value": "p = N/A", "status": "N/A", "color": "#475569", "bg": "#f8fafc", "edge": "#cbd5e1"}
+
+    def_lb = stats_src.get("ljung_box_pvalue", afml_summary.get("ljung_box_pvalue", np.nan))
+    lb_p = float(def_lb) if def_lb is not None else float(np.nan)
+    if np.isfinite(lb_p):
+        if lb_p >= 0.05:
+            lb_spec = {"title": "Ljung-Box Autocorr", "value": f"p = {lb_p:.3f}", "status": "PASS (No Autocorr)", "color": "#065f46", "bg": "#ecfdf5", "edge": "#10b981"}
+        else:
+            lb_spec = {"title": "Ljung-Box Autocorr", "value": f"p = {lb_p:.3f}", "status": "WARN (Serial Corr)", "color": "#92400e", "bg": "#fffbeb", "edge": "#f59e0b"}
+    else:
+        lb_spec = {"title": "Ljung-Box Autocorr", "value": "p = N/A", "status": "N/A", "color": "#475569", "bg": "#f8fafc", "edge": "#cbd5e1"}
+
+    def_arch = stats_src.get("arch_lm_pvalue", afml_summary.get("arch_lm_pvalue", np.nan))
+    arch_p = float(def_arch) if def_arch is not None else float(np.nan)
+    if np.isfinite(arch_p):
+        if arch_p >= 0.05:
+            arch_spec = {"title": "ARCH-LM Vol Cluster", "value": f"p = {arch_p:.3f}", "status": "PASS (Stable Vol)", "color": "#065f46", "bg": "#ecfdf5", "edge": "#10b981"}
+        else:
+            arch_spec = {"title": "ARCH-LM Vol Cluster", "value": f"p = {arch_p:.3f}", "status": "WARN (Vol Cluster)", "color": "#92400e", "bg": "#fffbeb", "edge": "#f59e0b"}
+    else:
+        arch_spec = {"title": "ARCH-LM Vol Cluster", "value": "p = N/A", "status": "N/A", "color": "#475569", "bg": "#f8fafc", "edge": "#cbd5e1"}
+
+    def_pbo = afml_summary.get("pbo_cscv", stats_src.get("pbo_cscv", np.nan))
+    pbo_v = float(def_pbo) if def_pbo is not None else float(np.nan)
+    if np.isfinite(pbo_v):
+        if pbo_v < 0.25:
+            pbo_spec = {"title": "PBO (CSCV Overfit)", "value": f"{pbo_v * 100.0:.1f}%", "status": "PASS (Low Overfit)", "color": "#065f46", "bg": "#ecfdf5", "edge": "#10b981"}
+        elif pbo_v <= 0.50:
+            pbo_spec = {"title": "PBO (CSCV Overfit)", "value": f"{pbo_v * 100.0:.1f}%", "status": "BORDERLINE", "color": "#92400e", "bg": "#fffbeb", "edge": "#f59e0b"}
+        else:
+            pbo_spec = {"title": "PBO (CSCV Overfit)", "value": f"{pbo_v * 100.0:.1f}%", "status": "FAIL (High Overfit)", "color": "#991b1b", "bg": "#fef2f2", "edge": "#ef4444"}
+    else:
+        pbo_spec = {"title": "PBO (CSCV Overfit)", "value": "N/A", "status": "N/A (Need >=2 Trials)", "color": "#475569", "bg": "#f8fafc", "edge": "#cbd5e1"}
+
+    return [adf_spec, lb_spec, arch_spec, pbo_spec]
+
+
+def _draw_afml_status_badge(
+    ax: Any,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    spec: Mapping[str, str],
+) -> None:
+    """Render one rounded regime-health status card inside normalized axes coordinates `[0, 1]`."""
+    from matplotlib.patches import FancyBboxPatch
+
+    card = FancyBboxPatch(
+        (x, y),
+        width,
+        height,
+        boxstyle="round,pad=0.015,rounding_size=0.04",
+        facecolor=spec["bg"],
+        edgecolor=spec["edge"],
+        linewidth=1.5,
+        transform=ax.transAxes,
+    )
+    ax.add_patch(card)
+    cx = x + 0.5 * width
+    ax.text(
+        cx,
+        y + 0.76 * height,
+        spec["title"],
+        transform=ax.transAxes,
+        ha="center",
+        va="center",
+        fontsize=8.6,
+        fontweight="bold",
+        color="#1e293b",
+    )
+    ax.text(
+        cx,
+        y + 0.45 * height,
+        spec["value"],
+        transform=ax.transAxes,
+        ha="center",
+        va="center",
+        fontsize=9.4,
+        fontweight="bold",
+        color=spec["color"],
+    )
+    ax.text(
+        cx,
+        y + 0.18 * height,
+        spec["status"],
+        transform=ax.transAxes,
+        ha="center",
+        va="center",
+        fontsize=7.9,
+        fontweight="bold",
+        color=spec["color"],
+    )
+
+
+def _plot_afml_statistical_edge_panel(
+    ax: Any,
+    afml_summary: Mapping[str, Any],
+    confidence: float,
+) -> Dict[str, Any]:
+    """Render Panel 1: Horizontal progress bars comparing PSR and DSR against the 95% threshold."""
+    psr_val = float(afml_summary.get("psr", np.nan))
+    dsr_val = float(afml_summary.get("dsr", np.nan))
+    thresh_pct = float(confidence) * 100.0
+
+    labels = ["DSR\n(Multi-Trial)", "PSR\n(SR > 0)"]
+    raw_vals = [dsr_val, psr_val]
+    pct_vals = [float(np.clip(v, 0.0, 1.0) * 100.0) if np.isfinite(v) else 0.0 for v in raw_vals]
+    colors_and_tags = [_afml_confidence_color(v, pass_threshold=confidence) for v in raw_vals]
+    y_pos = np.arange(len(labels), dtype=np.float64)
+
+    ax.set_facecolor("white")
+    ax.barh(y_pos, [100.0, 100.0], height=0.46, color="#f1f5f9", edgecolor="#e2e8f0", linewidth=1.0, zorder=1)
+    ax.barh(
+        y_pos,
+        pct_vals,
+        height=0.46,
+        color=[c for c, _ in colors_and_tags],
+        alpha=0.88,
+        edgecolor="white",
+        linewidth=1.0,
+        zorder=2,
+    )
+    ax.axvline(thresh_pct, color="#0f172a", linestyle="--", linewidth=1.6, zorder=4)
+    ax.text(
+        thresh_pct - 1.5,
+        1.48,
+        f"{thresh_pct:.0f}% Threshold",
+        ha="right",
+        va="bottom",
+        fontsize=8.3,
+        fontweight="bold",
+        color="#0f172a",
+    )
+
+    for idx, (val_pct, (color, tag), raw_v) in enumerate(zip(pct_vals, colors_and_tags, raw_vals)):
+        lbl_str = f"{val_pct:.1f}%  {tag}" if np.isfinite(raw_v) else "N/A"
+        ax.text(
+            min(101.5, max(val_pct + 2.0, 3.0)) if val_pct < 78.0 else 101.5,
+            y_pos[idx],
+            lbl_str,
+            va="center",
+            ha="left",
+            fontsize=9.0,
+            fontweight="bold",
+            color=color,
+        )
+
+    sr_raw = float(afml_summary.get("numerai_sharpe", np.nan))
+    sr_lo = float(afml_summary.get("lo_adjusted_sharpe", np.nan))
+    eff_k = float(afml_summary.get("effective_n_trials_onc", np.nan))
+    note_parts: List[str] = []
+    if np.isfinite(sr_raw):
+        note_parts.append(f"Sharpe: {sr_raw:.2f}")
+    if np.isfinite(sr_lo):
+        note_parts.append(f"Lo-Adj SR: {sr_lo:.2f}")
+    if np.isfinite(eff_k):
+        note_parts.append(f"ONC E[K]: {eff_k:.1f}")
+    if note_parts:
+        ax.text(
+            0.02,
+            0.96,
+            "  |  ".join(note_parts),
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8.2,
+            fontweight="bold",
+            color="#334155",
+            bbox={"boxstyle": "round,pad=0.24", "facecolor": "#f8fafc", "edgecolor": "#e2e8f0"},
+        )
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=9.5, fontweight="bold")
+    ax.set_xlim(0.0, 140.0)
+    ax.set_ylim(-0.55, 1.72)
+    ax.set_xlabel("Confidence (%)")
+    ax.set_title("1. Statistical Edge (PSR & DSR)", fontsize=11.5, fontweight="bold", pad=10, loc="left")
+    ax.grid(axis="x", color="#e2e8f0", linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    return {"psr_status": colors_and_tags[1][1], "dsr_status": colors_and_tags[0][1]}
+
+
+def _plot_afml_track_record_panel(
+    ax: Any,
+    afml_summary: Mapping[str, Any],
+    confidence: float,
+    periods_per_year: float,
+) -> Dict[str, Any]:
+    """Render Panel 2: Observed validation eras vs MinTRL with years-needed or Sufficient annotation."""
+    ppy = max(1.0, float(periods_per_year))
+    obs_eras = max(0, int(afml_summary.get("n_eras", 0)))
+    obs_years = float(obs_eras) / ppy
+    min_trl_raw = float(afml_summary.get("min_trl_eras", np.inf))
+    is_finite_trl = bool(np.isfinite(min_trl_raw) and min_trl_raw > 0.0)
+    is_sufficient = bool(is_finite_trl and float(obs_eras) >= min_trl_raw)
+
+    ax.set_facecolor("white")
+    y_pos = np.array([0.0, 1.0], dtype=np.float64)
+    labels = [f"MinTRL\n({int(round(confidence * 100))}% Conf.)", "Observed\nVal Eras"]
+
+    cap_val = max(float(obs_eras) * 3.2, 60.0)
+    if is_sufficient:
+        trl_plot = min_trl_raw
+        trl_color = "#64748b"
+        obs_color = "#059669"
+        trl_label = f"{min_trl_raw:,.0f} eras ({min_trl_raw / ppy:.1f} yr)"
+        surplus_yrs = (float(obs_eras) - min_trl_raw) / ppy
+        badge_text = f"SUFFICIENT — Exceeds {int(round(confidence * 100))}% MinTRL by +{surplus_yrs:.1f} yrs"
+        badge_fg, badge_bg, badge_edge = "#065f46", "#ecfdf5", "#10b981"
+        x_max = max(float(obs_eras), trl_plot, 10.0) * 1.48
+        more_years = 0.0
+    elif is_finite_trl:
+        capped = min_trl_raw > cap_val
+        trl_plot = cap_val if capped else min_trl_raw
+        trl_color = "#d97706" if (min_trl_raw - float(obs_eras)) / ppy <= 5.0 else "#dc2626"
+        obs_color = "#2563eb"
+        cap_suffix = " [capped]" if capped else ""
+        trl_label = f"{min_trl_raw:,.0f}e ({min_trl_raw / ppy:.1f} yr){cap_suffix}"
+        more_eras = max(0.0, min_trl_raw - float(obs_eras))
+        more_years = more_eras / ppy
+        badge_text = f"NEED +{more_years:.1f} MORE YRS ({more_eras:,.0f} eras) for {int(round(confidence * 100))}% confidence"
+        badge_fg, badge_bg, badge_edge = (
+            ("#92400e", "#fffbeb", "#f59e0b") if more_years <= 5.0 else ("#991b1b", "#fef2f2", "#ef4444")
+        )
+        x_max = max(float(obs_eras), trl_plot, 10.0) * 1.68
+    else:
+        trl_plot = cap_val
+        trl_color = "#dc2626"
+        obs_color = "#2563eb"
+        trl_label = "∞ eras (SR ≤ 0)"
+        badge_text = "INSUFFICIENT — Non-positive Sharpe (cannot reach 95% confidence)"
+        badge_fg, badge_bg, badge_edge = "#991b1b", "#fef2f2", "#ef4444"
+        x_max = max(float(obs_eras), trl_plot, 10.0) * 1.62
+        more_years = float(np.inf)
+
+    ax.barh(y_pos, [trl_plot, float(obs_eras)], height=0.46, color=[trl_color, obs_color], alpha=0.88, edgecolor="white", zorder=2)
+    ax.text(
+        trl_plot + 0.02 * x_max,
+        y_pos[0],
+        trl_label,
+        va="center",
+        ha="left",
+        fontsize=8.6,
+        fontweight="bold",
+        color=trl_color,
+    )
+    ax.text(
+        float(obs_eras) + 0.02 * x_max,
+        y_pos[1],
+        f"{obs_eras:,} eras ({obs_years:.1f} yr)",
+        va="center",
+        ha="left",
+        fontsize=8.8,
+        fontweight="bold",
+        color=obs_color,
+    )
+    ax.text(
+        0.5,
+        0.92,
+        badge_text,
+        transform=ax.transAxes,
+        ha="center",
+        va="top",
+        fontsize=8.5,
+        fontweight="bold",
+        color=badge_fg,
+        bbox={"boxstyle": "round,pad=0.32", "facecolor": badge_bg, "edgecolor": badge_edge, "linewidth": 1.2},
+    )
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=9.5, fontweight="bold")
+    ax.set_xlim(0.0, x_max)
+    ax.set_ylim(-0.55, 1.85)
+    ax.set_xlabel("Track Record Length (Validation Eras)")
+    ax.set_title("2. Track Record Sufficiency (Actual vs. MinTRL)", fontsize=11.5, fontweight="bold", pad=10, loc="left")
+    ax.grid(axis="x", color="#e2e8f0", linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    return {"sufficient": is_sufficient, "more_years_needed": more_years}
+
+
+def _plot_afml_underwater_tuw_panel(
+    ax: Any,
+    corr_series: pd.Series,
+    periods_per_year: float,
+) -> Dict[str, Any]:
+    """Render Panel 3: Shaded underwater drawdown curve annotating Max Drawdown and Longest TuW span."""
+    dd_info = compute_drawdown_and_tuw(corr_series, is_returns=True, periods_per_year=periods_per_year)
+    dd_s = dd_info["drawdown_series"]
+    ax.set_facecolor("white")
+
+    if len(dd_s) == 0:
+        ax.text(0.5, 0.5, "No validation eras available", transform=ax.transAxes, ha="center", va="center", color="#64748b")
+        ax.set_title("3. Underwater / Time-Underwater (TuW) Curve", fontsize=11.5, fontweight="bold", pad=10, loc="left")
+        return dd_info
+
+    x_pos = np.arange(len(dd_s), dtype=np.int64)
+    uw_vals = -dd_s.to_numpy(dtype=np.float64)
+    era_labels = dd_s.index.astype(str).to_numpy()
+    max_dd = float(dd_info["max_drawdown"])
+    tuw_eras = int(dd_info["tuw_max_eras"])
+    tuw_years = float(dd_info["tuw_max_years"])
+
+    ax.axhline(0.0, color="#0f172a", linewidth=1.2, zorder=3)
+    ax.fill_between(x_pos, 0.0, uw_vals, color="#ef4444", alpha=0.28, zorder=2)
+    ax.plot(x_pos, uw_vals, color="#b91c1c", linewidth=1.6, zorder=4, label="Underwater Drawdown (Cum. CORR)")
+
+    span_start, span_end, span_len = _find_longest_underwater_span(dd_s)
+    if span_start is not None and span_end is not None and span_len > 0:
+        ax.axvspan(
+            span_start,
+            max(span_end, span_start + 0.5),
+            color="#f59e0b",
+            alpha=0.16,
+            zorder=1,
+            label=f"Longest TuW: {tuw_eras} eras ({tuw_years:.2f} yr)",
+        )
+        mid_x = 0.5 * (span_start + span_end)
+        top_anchor = -0.08 * max(max_dd, 0.01)
+        ha_span = "left" if mid_x < 0.25 * len(x_pos) else ("right" if mid_x > 0.75 * len(x_pos) else "center")
+        ax.text(
+            mid_x,
+            top_anchor,
+            f"Longest TuW: {tuw_eras} eras ({tuw_years:.2f} yr)",
+            ha=ha_span,
+            va="top",
+            fontsize=8.2,
+            fontweight="bold",
+            color="#92400e",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "#fffbeb", "edgecolor": "#f59e0b", "alpha": 0.94},
+            zorder=6,
+        )
+
+    if max_dd > 1e-12:
+        trough_pos = int(np.argmin(uw_vals))
+        trough_val = float(uw_vals[trough_pos])
+        trough_era = era_labels[trough_pos]
+        ax.scatter([trough_pos], [trough_val], color="#991b1b", edgecolor="white", marker="v", s=80, zorder=6)
+        x_offset = 10 if trough_pos < 0.65 * len(x_pos) else -10
+        ha_dd = "left" if x_offset > 0 else "right"
+        ax.annotate(
+            f"Max DD: -{max_dd:.4f} pts\n@ Era {trough_era}",
+            xy=(trough_pos, trough_val),
+            xytext=(x_offset, -8),
+            textcoords="offset points",
+            ha=ha_dd,
+            va="top",
+            fontsize=8.2,
+            fontweight="bold",
+            color="#991b1b",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "#fef2f2", "edgecolor": "#dc2626", "alpha": 0.95},
+            arrowprops={"arrowstyle": "->", "color": "#991b1b", "linewidth": 1.1},
+            zorder=7,
+        )
+        ax.set_ylim(-max_dd * 1.38, max_dd * 0.14)
+    else:
+        ax.text(
+            0.5,
+            0.45,
+            "Zero Drawdown — Cumulative CORR stayed at High-Water Mark",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=8.8,
+            fontweight="bold",
+            color="#065f46",
+            bbox={"boxstyle": "round,pad=0.3", "facecolor": "#ecfdf5", "edgecolor": "#10b981"},
+        )
+        ax.set_ylim(-0.05, 0.02)
+
+    tick_step = max(1, len(x_pos) // 8)
+    ax.set_xticks(x_pos[::tick_step])
+    ax.set_xticklabels(era_labels[::tick_step], rotation=35, ha="right", fontsize=8.0)
+    ax.set_xlabel("Validation Era")
+    ax.set_ylabel("Cum. CORR Below Peak (pts)")
+    ax.set_title("3. Underwater / Time-Underwater (TuW) Curve", fontsize=11.5, fontweight="bold", pad=10, loc="left")
+    ax.legend(loc="lower left", frameon=True, facecolor="white", framealpha=0.9, fontsize=8.0)
+    ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    return dd_info
+
+
+def _plot_afml_concentration_regime_panel(
+    fig: Any,
+    subplot_spec: Any,
+    afml_summary: Mapping[str, Any],
+    regime_stats: Optional[Mapping[str, Any]],
+) -> List[Dict[str, str]]:
+    """Render Panel 4: HHI (+)/(-) concentration bars above ADF / Ljung-Box / ARCH-LM / PBO status badges."""
+    sub_gs = subplot_spec.subgridspec(2, 1, height_ratios=[1.05, 1.25], hspace=0.45)
+    ax_hhi = fig.add_subplot(sub_gs[0])
+    ax_badges = fig.add_subplot(sub_gs[1])
+
+    hhi_pos = float(afml_summary.get("hhi_pos", np.nan))
+    hhi_neg = float(afml_summary.get("hhi_neg", np.nan))
+    hhi_vals = [hhi_neg if np.isfinite(hhi_neg) else 0.0, hhi_pos if np.isfinite(hhi_pos) else 0.0]
+    hhi_meta = [_afml_hhi_color(hhi_neg), _afml_hhi_color(hhi_pos)]
+    y_pos = np.array([0.0, 1.0], dtype=np.float64)
+
+    ax_hhi.set_facecolor("white")
+    ax_hhi.barh(y_pos, [1.0, 1.0], height=0.48, color="#f1f5f9", edgecolor="#e2e8f0", linewidth=0.9, zorder=1)
+    ax_hhi.barh(y_pos, hhi_vals, height=0.48, color=[c for c, _ in hhi_meta], alpha=0.88, edgecolor="white", zorder=2)
+    ax_hhi.axvline(0.15, color="#059669", linestyle=":", linewidth=1.2, zorder=3)
+    ax_hhi.axvline(0.30, color="#dc2626", linestyle="--", linewidth=1.2, zorder=3)
+    ax_hhi.text(0.15, 1.44, "Even ≤0.15", ha="center", va="bottom", fontsize=7.6, color="#065f46")
+    ax_hhi.text(0.30, 1.44, "Conc. >0.30", ha="left", va="bottom", fontsize=7.6, color="#991b1b")
+
+    for idx, (val, (col, tag), raw_v) in enumerate(zip(hhi_vals, hhi_meta, [hhi_neg, hhi_pos])):
+        txt = f"{val:.3f} ({tag})" if np.isfinite(raw_v) else "N/A"
+        ax_hhi.text(
+            min(val + 0.03, 0.72),
+            y_pos[idx],
+            txt,
+            va="center",
+            ha="left",
+            fontsize=8.4,
+            fontweight="bold",
+            color=col,
+            bbox={"boxstyle": "round,pad=0.14", "facecolor": "white", "edgecolor": "none", "alpha": 0.88},
+            zorder=5,
+        )
+
+    ax_hhi.set_yticks(y_pos)
+    ax_hhi.set_yticklabels(["HHI (−) Losses", "HHI (+) Gains"], fontsize=9.0, fontweight="bold")
+    ax_hhi.set_xlim(0.0, 1.15)
+    ax_hhi.set_ylim(-0.5, 1.75)
+    ax_hhi.set_xlabel("Concentration Index (0 = Even, 1 = Single Era)", fontsize=8.5)
+    ax_hhi.set_title("4. Concentration & Regime Health", fontsize=11.5, fontweight="bold", pad=10, loc="left")
+    ax_hhi.grid(axis="x", color="#e2e8f0", linewidth=0.7)
+    ax_hhi.set_axisbelow(True)
+    ax_hhi.spines["top"].set_visible(False)
+    ax_hhi.spines["right"].set_visible(False)
+
+    ax_badges.set_facecolor("white")
+    ax_badges.set_axis_off()
+    badge_specs = _resolve_regime_badge_specs(afml_summary, regime_stats=regime_stats)
+    positions = (
+        (0.01, 0.53, 0.46, 0.42),
+        (0.52, 0.53, 0.46, 0.42),
+        (0.01, 0.03, 0.46, 0.42),
+        (0.52, 0.03, 0.46, 0.42),
+    )
+    for (bx, by, bw, bh), spec in zip(positions, badge_specs):
+        _draw_afml_status_badge(ax_badges, bx, by, bw, bh, spec)
+    return badge_specs
+
+
+def build_compact_afml_reference_table(
+    afml_diagnostics_df: pd.DataFrame,
+    *,
+    best_variant_name: Optional[str] = None,
+) -> pd.DataFrame:
+    """Select and round the key AFML backtest credibility columns for a compact, untruncated reference table."""
+    if afml_diagnostics_df is None or afml_diagnostics_df.empty:
+        return pd.DataFrame()
+    cols = [
+        c
+        for c in (
+            "variant",
+            "n_eras",
+            "numerai_sharpe",
+            "lo_adjusted_sharpe",
+            "psr",
+            "dsr",
+            "min_trl_years",
+            "pbo_cscv",
+            "tuw_max_years",
+            "hhi_pos",
+            "hhi_neg",
+            "strategy_fail_prob",
+        )
+        if c in afml_diagnostics_df.columns
+    ]
+    out = afml_diagnostics_df[cols].copy().reset_index(drop=True)
+    if best_variant_name is not None and "variant" in out.columns:
+        is_winner = out["variant"].astype(str) == str(best_variant_name)
+        if bool(is_winner.any()):
+            out = pd.concat([out.loc[is_winner], out.loc[~is_winner]], axis=0, ignore_index=True)
+            out["variant"] = np.where(
+                out["variant"].astype(str) == str(best_variant_name),
+                "[WINNER] " + out["variant"].astype(str),
+                out["variant"].astype(str),
+            )
+    round_map = {
+        "numerai_sharpe": 3,
+        "lo_adjusted_sharpe": 3,
+        "psr": 4,
+        "dsr": 4,
+        "min_trl_years": 2,
+        "pbo_cscv": 4,
+        "tuw_max_years": 2,
+        "hhi_pos": 4,
+        "hhi_neg": 4,
+        "strategy_fail_prob": 4,
+    }
+    for col, decimals in round_map.items():
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(decimals)
+    return out
+
+
+def plot_afml_backtest_story(
+    era_corrs: Any,
+    afml_summary: Mapping[str, Any],
+    *,
+    regime_stats: Optional[Mapping[str, Any]] = None,
+    title: str = "Train-CV-Locked Winner",
+    confidence: float = 0.95,
+    periods_per_year: float = 52.0,
+    save_path: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Plot a 2x2 AFML statistical credibility visual story for the Train-CV-Locked Winner.
+
+    Panels:
+      1. Statistical Edge (PSR & DSR vs 95% confidence threshold).
+      2. Track Record Sufficiency (Observed Validation Eras vs MinTRL).
+      3. Underwater / Time-Underwater (TuW) Curve with Max Drawdown & Longest TuW annotations.
+      4. Concentration (HHI + / -) & Regime Health status badges (ADF, Ljung-Box, ARCH-LM, PBO).
+    """
+    import matplotlib.pyplot as plt
+
+    corr_s = pd.Series(era_corrs, dtype=np.float64).dropna().sort_index()
+    summary_dict = dict(afml_summary)
+    if "n_eras" not in summary_dict or not summary_dict.get("n_eras"):
+        summary_dict["n_eras"] = int(len(corr_s))
+
+    fig = plt.figure(figsize=(16.5, 10.6), facecolor="white")
+    gs = fig.add_gridspec(2, 2, hspace=0.40, wspace=0.26)
+
+    ax_edge = fig.add_subplot(gs[0, 0])
+    ax_trl = fig.add_subplot(gs[0, 1])
+    ax_uw = fig.add_subplot(gs[1, 0])
+
+    edge_meta = _plot_afml_statistical_edge_panel(ax_edge, summary_dict, confidence=confidence)
+    trl_meta = _plot_afml_track_record_panel(ax_trl, summary_dict, confidence=confidence, periods_per_year=periods_per_year)
+    dd_meta = _plot_afml_underwater_tuw_panel(ax_uw, corr_s, periods_per_year=periods_per_year)
+    badges_meta = _plot_afml_concentration_regime_panel(fig, gs[1, 1], summary_dict, regime_stats=regime_stats)
+
+    fig.suptitle(
+        f"AFML Backtest Statistical Credibility Story — {title}",
+        fontsize=14.5,
+        fontweight="bold",
+        color="#0f172a",
+        y=0.975,
+    )
+    fig.subplots_adjust(left=0.08, right=0.97, top=0.90, bottom=0.08)
+
+    if save_path is not None:
+        out_path = Path(save_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=140)
+    plt.show()
+
+    return {
+        "title": str(title),
+        "psr_status": edge_meta["psr_status"],
+        "dsr_status": edge_meta["dsr_status"],
+        "track_record_sufficient": trl_meta["sufficient"],
+        "more_years_needed": trl_meta["more_years_needed"],
+        "max_drawdown": float(dd_meta.get("max_drawdown", 0.0)),
+        "tuw_max_eras": int(dd_meta.get("tuw_max_eras", 0)),
+        "tuw_max_years": float(dd_meta.get("tuw_max_years", 0.0)),
+        "regime_badges": badges_meta,
     }

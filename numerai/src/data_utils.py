@@ -1028,6 +1028,203 @@ def _polars_cast_features_to_int8(pl_df: Any, feature_columns: List[str]) -> Any
     return pl_df.with_columns(cast_exprs)
 
 
+def _scan_parquet_polars(path: Path, *, parallel_prefiltered: bool = False) -> Any:
+    """Open a Polars lazy Parquet scan, using `parallel='prefiltered'` when supported with clean fallback."""
+    if parallel_prefiltered:
+        try:
+            return pl.scan_parquet(path, parallel="prefiltered")
+        except (TypeError, ValueError):
+            return pl.scan_parquet(path)
+    return pl.scan_parquet(path)
+
+
+def _pl_is_in_values(col_expr: Any, values: Any, dtype: Any) -> Any:
+    """Build a Polars `is_in` filter expression with exact dtype matching and zero deprecation warnings."""
+    val_series = values if isinstance(values, pl.Series) else pl.Series(values, dtype=dtype)
+    if val_series.dtype != dtype:
+        val_series = val_series.cast(dtype)
+    rhs = val_series.implode() if hasattr(val_series, "implode") else val_series
+    return col_expr.is_in(rhs)
+
+
+def _pl_non_null_target_mask(target_col: str) -> Any:
+    """Polars predicate matching Pandas `dropna(subset=[target_col])` for both SQL nulls and float NaNs."""
+    t_col = pl.col(target_col)
+    return t_col.is_not_null() & t_col.cast(pl.Float32, strict=False).is_not_nan()
+
+
+def _scan_split_metadata_polars(
+    path: Path,
+    available_cols: Sequence[str],
+    target_col: str,
+    *,
+    filter_validation_type: bool,
+) -> Tuple[Any, Optional[Any]]:
+    """Pass 1: Scan only lightweight metadata/index columns (`_row_idx`, `era`/`date`, `data_type`, `target_col`).
+
+    Returns `(filtered_meta_pl, raw_era_dtype)` where `raw_era_dtype` is the native Parquet dtype of `'era'`
+    when present (used to enable native row-group statistics pushdown in Pass 2).
+    """
+    avail_set = set(available_cols)
+    meta_cols = [c for c in ("era", "date", "data_type") if c in avail_set]
+    scan_cols = list(dict.fromkeys(meta_cols + [target_col]))
+
+    lf = _scan_parquet_polars(path, parallel_prefiltered=False)
+    schema = lf.collect_schema() if hasattr(lf, "collect_schema") else lf.schema
+    raw_era_dtype = schema.get("era") if "era" in avail_set else None
+
+    meta_pl = (
+        lf.with_row_index("_row_idx")
+        .select(["_row_idx"] + scan_cols)
+        .filter(_pl_non_null_target_mask(target_col))
+        .collect()
+    )
+    if filter_validation_type and "data_type" in meta_pl.columns:
+        val_mask = meta_pl.get_column("data_type").cast(pl.Utf8).str.to_lowercase() == "validation"
+        if bool(val_mask.any()):
+            meta_pl = meta_pl.filter(val_mask)
+
+    keep_meta_cols = [c for c in ("_row_idx", "era", "date") if c in meta_pl.columns]
+    return meta_pl.select(keep_meta_cols), raw_era_dtype
+
+
+def _is_polars_integer_dtype(dtype: Any) -> bool:
+    """True when a Polars dtype is a native signed or unsigned integer type."""
+    if dtype is None or pl is None:
+        return False
+    return dtype in (
+        pl.Int8,
+        pl.Int16,
+        pl.Int32,
+        pl.Int64,
+        pl.UInt8,
+        pl.UInt16,
+        pl.UInt32,
+        pl.UInt64,
+    )
+
+
+def _select_split_keep_metadata(
+    meta_pl: Any,
+    *,
+    era_stride: int,
+    downsample_mode: Optional[str],
+    downsample_frac: float,
+    random_state: int,
+) -> Tuple[Any, Optional[List[int]], bool]:
+    """Apply chronological sort, optional `era_stride`, and deterministic downsampling on Pass 1 metadata.
+
+    Uses the exact same `np.random.default_rng(random_state)` helpers as `downsample_panel_data`
+    so Pass 2 loads the bit-for-bit identical row subset as the Pandas fallback path.
+    Returns `(kept_meta_pl, kept_eras, is_era_subset)`.
+    """
+    mode = _normalize_downsample_mode(downsample_mode)
+    if mode is not None and mode not in VALID_DOWNSAMPLE_MODES:
+        raise ValueError(
+            f"downsample_mode must be None or one of {VALID_DOWNSAMPLE_MODES}, got {downsample_mode!r}"
+        )
+    frac = float(downsample_frac)
+    if not (0.0 < frac <= 1.0):
+        raise ValueError(f"downsample_frac must be in (0.0, 1.0], got {downsample_frac!r}")
+
+    sorted_meta = meta_pl.select(["_row_idx", "era"]).sort("era", maintain_order=True)
+    if len(sorted_meta) == 0:
+        return sorted_meta, [], True
+
+    all_unique_eras = sorted(sorted_meta.get_column("era").unique().to_list())
+    n_total_eras = len(all_unique_eras)
+
+    if int(era_stride) > 1:
+        strided_eras = all_unique_eras[:: int(era_stride)]
+        sorted_meta = sorted_meta.filter(_pl_is_in_values(pl.col("era"), strided_eras, pl.Int32))
+
+    if mode is not None and frac < 1.0 and len(sorted_meta) > 0:
+        rng = np.random.default_rng(int(random_state))
+        era_vals = sorted_meta.get_column("era").to_numpy()
+        if mode == "within_era":
+            keep_mask = _build_within_era_keep_mask(era_vals, frac, rng)
+            sorted_meta = sorted_meta.filter(pl.Series(keep_mask))
+        else:
+            unique_eras = np.sort(pd.unique(era_vals))
+            n_keep_eras = max(1, int(round(len(unique_eras) * frac)))
+            if n_keep_eras < len(unique_eras):
+                chosen_eras = _select_downsampled_eras(unique_eras, mode, n_keep_eras, rng)
+                sorted_meta = sorted_meta.filter(
+                    _pl_is_in_values(pl.col("era"), [int(e) for e in chosen_eras], pl.Int32)
+                )
+
+    kept_eras = sorted(int(e) for e in sorted_meta.get_column("era").unique().to_list())
+    is_era_subset = len(kept_eras) < n_total_eras
+    return sorted_meta, kept_eras, is_era_subset
+
+
+def _load_filtered_split_polars(
+    path: Path,
+    req_cols: List[str],
+    feature_columns: List[str],
+    target_col: str,
+    kept_meta_pl: Any,
+    *,
+    kept_eras: Optional[List[int]],
+    era_is_native_int: bool,
+    pushdown_era_filter: bool,
+    raw_era_dtype: Any,
+) -> pd.DataFrame:
+    """Pass 2: Push down `_row_idx` (and native `era` when applicable) before selecting `req_cols` and casting to Int8."""
+    has_orig_era = "era" in req_cols
+    final_cols = list(req_cols) if has_orig_era else list(req_cols) + ["era"]
+
+    if len(kept_meta_pl) == 0:
+        empty_pl = (
+            _scan_parquet_polars(path, parallel_prefiltered=False)
+            .select(req_cols)
+            .head(0)
+            .collect()
+            .with_columns(pl.col(target_col).cast(pl.Float32))
+        )
+        if not has_orig_era:
+            empty_pl = empty_pl.with_columns(pl.lit(None, dtype=pl.Int32).alias("era"))
+        else:
+            empty_pl = empty_pl.with_columns(pl.col("era").cast(pl.Int32))
+        empty_pl = _polars_cast_features_to_int8(empty_pl, feature_columns)
+        return empty_pl.select(final_cols).to_pandas()
+
+    row_idx_series = kept_meta_pl.get_column("_row_idx").sort()
+    filter_expr = _pl_is_in_values(pl.col("_row_idx"), row_idx_series, row_idx_series.dtype)
+    if (
+        pushdown_era_filter
+        and era_is_native_int
+        and kept_eras is not None
+        and len(kept_eras) > 0
+        and _is_polars_integer_dtype(raw_era_dtype)
+    ):
+        era_filter = _pl_is_in_values(pl.col("era"), kept_eras, raw_era_dtype)
+        filter_expr = era_filter & filter_expr
+
+    split_pl = (
+        _scan_parquet_polars(path, parallel_prefiltered=True)
+        .with_row_index("_row_idx")
+        .filter(filter_expr)
+        .select(["_row_idx"] + req_cols)
+        .collect()
+    )
+
+    if era_is_native_int and has_orig_era:
+        split_pl = split_pl.with_columns(pl.col("era").cast(pl.Int32))
+    else:
+        era_lookup = kept_meta_pl.select(["_row_idx", pl.col("era").cast(pl.Int32).alias("_unified_era_")])
+        split_pl = split_pl.join(era_lookup, on="_row_idx", how="inner")
+        if has_orig_era:
+            split_pl = split_pl.with_columns(pl.col("_unified_era_").alias("era")).drop("_unified_era_")
+        else:
+            split_pl = split_pl.rename({"_unified_era_": "era"})
+
+    split_pl = split_pl.with_columns(pl.col(target_col).cast(pl.Float32))
+    split_pl = _polars_cast_features_to_int8(split_pl, feature_columns)
+    split_pl = split_pl.sort(["era", "_row_idx"]).select(final_cols)
+    return split_pl.to_pandas()
+
+
 def _load_and_clean_splits_polars(
     train_path: Path,
     validation_path: Path,
@@ -1037,31 +1234,104 @@ def _load_and_clean_splits_polars(
     target_col: str,
     *,
     apply_era_stride_early: Optional[int] = None,
+    two_pass: bool = True,
+    downsample_mode: Optional[str] = None,
+    downsample_frac: float = 1.0,
+    val_downsample_mode: Optional[str] = None,
+    val_downsample_frac: Optional[float] = None,
+    random_state: int = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Fast multi-threaded Polars Parquet reader with predicate pushdown, parallel Int8 casting, and era unification."""
-    train_pl = pl.scan_parquet(train_path).select(train_cols).filter(pl.col(target_col).is_not_null()).collect()
-    val_pl = pl.scan_parquet(validation_path).select(val_cols).filter(pl.col(target_col).is_not_null()).collect()
+    """Fast multi-threaded Polars Parquet reader with feature-set-agnostic two-pass predicate pushdown, Int8 casting, and era unification."""
+    if not two_pass:
+        train_pl = (
+            _scan_parquet_polars(train_path, parallel_prefiltered=False)
+            .select(train_cols)
+            .filter(_pl_non_null_target_mask(target_col))
+            .collect()
+        )
+        val_pl = (
+            _scan_parquet_polars(validation_path, parallel_prefiltered=False)
+            .select(val_cols)
+            .filter(_pl_non_null_target_mask(target_col))
+            .collect()
+        )
 
-    if "data_type" in val_pl.columns:
-        val_mask = val_pl.get_column("data_type").cast(pl.Utf8).str.to_lowercase() == "validation"
-        if bool(val_mask.any()):
-            val_pl = val_pl.filter(val_mask)
+        if "data_type" in val_pl.columns:
+            val_mask = val_pl.get_column("data_type").cast(pl.Utf8).str.to_lowercase() == "validation"
+            if bool(val_mask.any()):
+                val_pl = val_pl.filter(val_mask)
 
-    train_pl = train_pl.with_columns(pl.col(target_col).cast(pl.Float32))
-    val_pl = val_pl.with_columns(pl.col(target_col).cast(pl.Float32))
-    train_pl, val_pl = _unify_polars_split_eras(train_pl, val_pl)
+        train_pl = train_pl.with_columns(pl.col(target_col).cast(pl.Float32))
+        val_pl = val_pl.with_columns(pl.col(target_col).cast(pl.Float32))
+        train_pl, val_pl = _unify_polars_split_eras(train_pl, val_pl)
 
-    train_pl = train_pl.sort("era", maintain_order=True)
-    val_pl = val_pl.sort("era", maintain_order=True)
+        train_pl = train_pl.sort("era", maintain_order=True)
+        val_pl = val_pl.sort("era", maintain_order=True)
 
-    # Apply era_stride early before Int8 casting / Pandas conversion when pre-stride ticker features are not requested
-    if apply_era_stride_early is not None and int(apply_era_stride_early) > 1:
-        kept_eras = sorted(train_pl.get_column("era").unique().to_list())[:: int(apply_era_stride_early)]
-        train_pl = train_pl.filter(pl.col("era").is_in(kept_eras))
+        if apply_era_stride_early is not None and int(apply_era_stride_early) > 1:
+            kept_eras = sorted(train_pl.get_column("era").unique().to_list())[:: int(apply_era_stride_early)]
+            train_pl = train_pl.filter(_pl_is_in_values(pl.col("era"), kept_eras, pl.Int32))
 
-    train_pl = _polars_cast_features_to_int8(train_pl, feature_columns)
-    val_pl = _polars_cast_features_to_int8(val_pl, feature_columns)
-    return train_pl.to_pandas(), val_pl.to_pandas()
+        train_pl = _polars_cast_features_to_int8(train_pl, feature_columns)
+        val_pl = _polars_cast_features_to_int8(val_pl, feature_columns)
+        return train_pl.to_pandas(), val_pl.to_pandas()
+
+    # Pass 1: Metadata-only scan (independent of feature_set width)
+    resolved_val_mode, resolved_val_frac = _resolve_val_downsample_config(
+        downsample_mode=downsample_mode,
+        downsample_frac=downsample_frac,
+        val_downsample_mode=val_downsample_mode,
+        val_downsample_frac=val_downsample_frac,
+    )
+    train_meta_pl, train_raw_era_dtype = _scan_split_metadata_polars(
+        train_path, train_cols, target_col, filter_validation_type=False
+    )
+    val_meta_pl, val_raw_era_dtype = _scan_split_metadata_polars(
+        validation_path, val_cols, target_col, filter_validation_type=True
+    )
+    train_meta_pl, val_meta_pl = _unify_polars_split_eras(train_meta_pl, val_meta_pl)
+
+    train_stride = int(apply_era_stride_early) if apply_era_stride_early is not None else 1
+    train_keep_meta, train_kept_eras, train_is_era_subset = _select_split_keep_metadata(
+        train_meta_pl,
+        era_stride=train_stride,
+        downsample_mode=downsample_mode,
+        downsample_frac=downsample_frac,
+        random_state=random_state,
+    )
+    val_keep_meta, val_kept_eras, val_is_era_subset = _select_split_keep_metadata(
+        val_meta_pl,
+        era_stride=1,
+        downsample_mode=resolved_val_mode,
+        downsample_frac=resolved_val_frac,
+        random_state=random_state,
+    )
+
+    # Pass 2: Prefiltered scan pulling only req_cols for the active feature_set and selected rows
+    era_is_native_int = _is_polars_integer_dtype(train_raw_era_dtype) and _is_polars_integer_dtype(val_raw_era_dtype)
+    train_df = _load_filtered_split_polars(
+        train_path,
+        train_cols,
+        feature_columns,
+        target_col,
+        train_keep_meta,
+        kept_eras=train_kept_eras,
+        era_is_native_int=era_is_native_int,
+        pushdown_era_filter=train_is_era_subset and era_is_native_int,
+        raw_era_dtype=train_raw_era_dtype,
+    )
+    val_df = _load_filtered_split_polars(
+        validation_path,
+        val_cols,
+        feature_columns,
+        target_col,
+        val_keep_meta,
+        kept_eras=val_kept_eras,
+        era_is_native_int=era_is_native_int,
+        pushdown_era_filter=val_is_era_subset and era_is_native_int,
+        raw_era_dtype=val_raw_era_dtype,
+    )
+    return train_df, val_df
 
 
 def _unify_pandas_split_eras(
@@ -1246,19 +1516,42 @@ def load_unity_numerai_data(
     )
 
     want_ticker_ts = ticker_timeseries_features not in (None, False, "None", "none", "null", "")
-    strided_early = False
+    resolved_val_mode, resolved_val_frac = _resolve_val_downsample_config(
+        downsample_mode=downsample_mode,
+        downsample_frac=downsample_frac,
+        val_downsample_mode=val_downsample_mode,
+        val_downsample_frac=val_downsample_frac,
+    )
+    filtered_early = False
     if POLARS_AVAILABLE and pl is not None:
-        early_stride = int(era_stride) if (not want_ticker_ts and int(era_stride) > 1) else None
-        train_df, validation_df = _load_and_clean_splits_polars(
-            train_path,
-            validation_path,
-            train_req_cols,
-            val_req_cols,
-            feature_columns,
-            target_col,
-            apply_era_stride_early=early_stride,
-        )
-        strided_early = early_stride is not None
+        if not want_ticker_ts:
+            train_df, validation_df = _load_and_clean_splits_polars(
+                train_path,
+                validation_path,
+                train_req_cols,
+                val_req_cols,
+                feature_columns,
+                target_col,
+                apply_era_stride_early=int(era_stride),
+                two_pass=True,
+                downsample_mode=downsample_mode,
+                downsample_frac=downsample_frac,
+                val_downsample_mode=resolved_val_mode,
+                val_downsample_frac=resolved_val_frac,
+                random_state=random_state,
+            )
+            filtered_early = True
+        else:
+            train_df, validation_df = _load_and_clean_splits_polars(
+                train_path,
+                validation_path,
+                train_req_cols,
+                val_req_cols,
+                feature_columns,
+                target_col,
+                apply_era_stride_early=None,
+                two_pass=False,
+            )
     else:
         train_df, validation_df = _load_and_clean_splits_pandas(
             train_path, validation_path, train_req_cols, val_req_cols, feature_columns, target_col
@@ -1275,30 +1568,25 @@ def load_unity_numerai_data(
             ticker_top_n_features=ticker_top_n_features,
         )
 
-    if not strided_early and int(era_stride) > 1:
-        kept_train_eras = sorted(train_df["era"].unique())[:: int(era_stride)]
-        train_df = train_df.loc[train_df["era"].isin(kept_train_eras)]
+    if not filtered_early:
+        if int(era_stride) > 1:
+            kept_train_eras = sorted(train_df["era"].unique())[:: int(era_stride)]
+            train_df = train_df.loc[train_df["era"].isin(kept_train_eras)]
 
-    resolved_val_mode, resolved_val_frac = _resolve_val_downsample_config(
-        downsample_mode=downsample_mode,
-        downsample_frac=downsample_frac,
-        val_downsample_mode=val_downsample_mode,
-        val_downsample_frac=val_downsample_frac,
-    )
-    train_df = downsample_panel_data(
-        train_df,
-        downsample_mode=downsample_mode,
-        downsample_frac=downsample_frac,
-        era_col="era",
-        random_state=random_state,
-    )
-    validation_df = downsample_panel_data(
-        validation_df,
-        downsample_mode=resolved_val_mode,
-        downsample_frac=resolved_val_frac,
-        era_col="era",
-        random_state=random_state,
-    )
+        train_df = downsample_panel_data(
+            train_df,
+            downsample_mode=downsample_mode,
+            downsample_frac=downsample_frac,
+            era_col="era",
+            random_state=random_state,
+        )
+        validation_df = downsample_panel_data(
+            validation_df,
+            downsample_mode=resolved_val_mode,
+            downsample_frac=resolved_val_frac,
+            era_col="era",
+            random_state=random_state,
+        )
 
     assert not any(
         column in FORBIDDEN_FEATURE_COLS or column == target_col or column.startswith("target")
@@ -1335,6 +1623,11 @@ def _build_processed_cache_key_payload(
     feature_set: str,
     era_stride: int,
     target_col: str,
+    downsample_mode: Optional[str] = None,
+    downsample_frac: float = 1.0,
+    val_downsample_mode: Optional[str] = None,
+    val_downsample_frac: Optional[float] = None,
+    random_state: int = 42,
     ticker_timeseries_features: Optional[str],
     ticker_rolling_windows: Sequence[int],
     ticker_lag_steps: Optional[Sequence[int]],
@@ -1343,11 +1636,25 @@ def _build_processed_cache_key_payload(
     source_fp: Optional[List[List[Any]]],
 ) -> Dict[str, Any]:
     """Assemble the canonical JSON-serializable payload defining a processed dataset cache key."""
+    norm_train_mode = _normalize_downsample_mode(downsample_mode)
+    norm_train_frac = 1.0 if norm_train_mode is None else round(float(downsample_frac), 12)
+    resolved_val_mode, resolved_val_frac = _resolve_val_downsample_config(
+        downsample_mode=downsample_mode,
+        downsample_frac=downsample_frac,
+        val_downsample_mode=val_downsample_mode,
+        val_downsample_frac=val_downsample_frac,
+    )
+    norm_val_frac = 1.0 if resolved_val_mode is None else round(float(resolved_val_frac), 12)
     return {
         "data_version": str(data_version),
         "feature_set": str(feature_set),
         "era_stride": int(era_stride),
         "target_col": str(target_col),
+        "downsample_mode": norm_train_mode,
+        "downsample_frac": norm_train_frac,
+        "val_downsample_mode": resolved_val_mode,
+        "val_downsample_frac": norm_val_frac,
+        "random_state": int(random_state),
         "ticker_timeseries_features": ticker_timeseries_features,
         "ticker_rolling_windows": list(ticker_rolling_windows) if ticker_rolling_windows is not None else None,
         "ticker_lag_steps": list(ticker_lag_steps) if ticker_lag_steps is not None else None,
@@ -1456,8 +1763,10 @@ def load_unity_numerai_data_cached(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], Dict[str, Any]]:
     """Cached wrapper around `load_unity_numerai_data` persisting processed Parquets & metadata in `<workspace>/<data_folder>/processed_cache/`.
 
-    Caches the full strided `(train_df, validation_df)` and applies downsampling in-memory to `train_df`
-    and (when `val_downsample_mode` is set) `validation_df`, so changing any downsample knob reuses the cache.
+    Keys the disk cache by `(feature_set, era_stride, target_col, downsample_mode, downsample_frac,
+    val_downsample_mode, val_downsample_frac, random_state, ...)` and passes all downsampling knobs
+    directly into `load_unity_numerai_data(...)` so two-pass Polars skips unused rows on cache miss
+    and only the already-downsampled lightweight Parquets are written to disk.
     """
     resolved_val_mode, resolved_val_frac = _resolve_val_downsample_config(
         downsample_mode=downsample_mode,
@@ -1473,6 +1782,11 @@ def load_unity_numerai_data_cached(
         feature_set=feature_set,
         era_stride=era_stride,
         target_col=target_col,
+        downsample_mode=downsample_mode,
+        downsample_frac=downsample_frac,
+        val_downsample_mode=resolved_val_mode,
+        val_downsample_frac=resolved_val_frac,
+        random_state=random_state,
         ticker_timeseries_features=ticker_timeseries_features,
         ticker_rolling_windows=ticker_rolling_windows,
         ticker_lag_steps=ticker_lag_steps,
@@ -1487,45 +1801,30 @@ def load_unity_numerai_data_cached(
         cached_result = _try_load_cached_unity_splits(train_cache, val_cache, meta_cache, key_payload, target_col)
 
     if cached_result is not None:
-        train_df, validation_df, feature_columns, feature_metadata = cached_result
-    else:
-        train_df, validation_df, feature_columns, feature_metadata = load_unity_numerai_data(
-            data_version=data_version,
-            data_folder=data_folder,
-            kaggle_dataset=kaggle_dataset,
-            feature_set=feature_set,
-            target_col=target_col,
-            era_stride=era_stride,
-            downsample_mode=None,
-            downsample_frac=1.0,
-            val_downsample_mode=None,
-            val_downsample_frac=None,
-            random_state=random_state,
-            ticker_timeseries_features=ticker_timeseries_features,
-            ticker_rolling_windows=ticker_rolling_windows,
-            ticker_lag_steps=ticker_lag_steps,
-            ticker_top_n_features=ticker_top_n_features,
-            workspace_root=workspace_root,
-            auto_download=auto_download,
-            use_numerapi_fallback=use_numerapi_fallback,
-        )
-        key_payload["source_fp"] = _source_files_fingerprint(data_version, data_folder, kaggle_dataset, workspace_dir)
-        _write_cached_unity_splits(cache_dir, key_payload, train_df, validation_df, feature_columns, feature_metadata)
+        return cached_result
 
-    train_df = downsample_panel_data(
-        train_df,
+    train_df, validation_df, feature_columns, feature_metadata = load_unity_numerai_data(
+        data_version=data_version,
+        data_folder=data_folder,
+        kaggle_dataset=kaggle_dataset,
+        feature_set=feature_set,
+        target_col=target_col,
+        era_stride=era_stride,
         downsample_mode=downsample_mode,
         downsample_frac=downsample_frac,
-        era_col="era",
+        val_downsample_mode=resolved_val_mode,
+        val_downsample_frac=resolved_val_frac,
         random_state=random_state,
+        ticker_timeseries_features=ticker_timeseries_features,
+        ticker_rolling_windows=ticker_rolling_windows,
+        ticker_lag_steps=ticker_lag_steps,
+        ticker_top_n_features=ticker_top_n_features,
+        workspace_root=workspace_root,
+        auto_download=auto_download,
+        use_numerapi_fallback=use_numerapi_fallback,
     )
-    validation_df = downsample_panel_data(
-        validation_df,
-        downsample_mode=resolved_val_mode,
-        downsample_frac=resolved_val_frac,
-        era_col="era",
-        random_state=random_state,
-    )
+    key_payload["source_fp"] = _source_files_fingerprint(data_version, data_folder, kaggle_dataset, workspace_dir)
+    _write_cached_unity_splits(cache_dir, key_payload, train_df, validation_df, feature_columns, feature_metadata)
     return train_df, validation_df, feature_columns, feature_metadata
 
 

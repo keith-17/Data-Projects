@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -11,6 +16,8 @@ from _fixtures import make_synthetic_numerai_panel
 from afml_utils import (
     CombinatorialPurgedEraCV,
     PurgedEraKFold,
+    _find_longest_underwater_span,
+    build_compact_afml_reference_table,
     build_era_cv_splits,
     cluster_features_onc,
     compute_clustered_mda,
@@ -26,6 +33,7 @@ from afml_utils import (
     compute_strategy_risk,
     compute_variation_of_information_matrix,
     neutralize_predictions,
+    plot_afml_backtest_story,
     purge_train_before_validation,
     summarize_afml_backtest_diagnostics,
 )
@@ -290,6 +298,51 @@ class TestNeutralizationAndSharpeDiagnostics(unittest.TestCase):
             "strategy_fail_prob",
         ):
             self.assertIn(key, summary)
+
+    def test_plot_afml_backtest_story_and_compact_reference_table(self) -> None:
+        dd_series = pd.Series([0.0, 0.02, 0.05, 0.01, 0.0, 0.03, 0.0], index=np.arange(1, 8))
+        span_start, span_end, span_len = _find_longest_underwater_span(dd_series)
+        self.assertEqual((span_start, span_end, span_len), (1, 3, 3))
+
+        rng = np.random.default_rng(77)
+        era_corrs = pd.Series(rng.normal(0.025, 0.018, size=60), index=np.arange(901, 961))
+        summary = summarize_afml_backtest_diagnostics(
+            era_corrs,
+            trial_srs=[0.6, 0.9, 1.3],
+            label="Model [Tuned]",
+            random_state=42,
+        )
+        afml_df = pd.DataFrame([
+            {**summary, "variant": "Model [Default]"},
+            summary,
+        ])
+        compact_df = build_compact_afml_reference_table(afml_df, best_variant_name="Model [Tuned]")
+        self.assertEqual(compact_df.loc[0, "variant"], "[WINNER] Model [Tuned]")
+        self.assertLessEqual(len(compact_df.columns), 12)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            story_png = Path(tmp) / "afml_story.png"
+            story_meta = plot_afml_backtest_story(
+                era_corrs,
+                summary,
+                regime_stats={
+                    "adf_pvalue": 0.008,
+                    "ljung_box_pvalue": 0.24,
+                    "arch_lm_pvalue": 0.61,
+                },
+                title="Model [Tuned]",
+                save_path=story_png,
+            )
+            self.assertTrue(story_png.is_file())
+            self.assertEqual(len(story_meta["regime_badges"]), 4)
+            self.assertIn(story_meta["psr_status"], ("PASS", "BORDERLINE", "FAIL"))
+
+            # Edge case: negative-Sharpe / infinite MinTRL / zero-drawdown series
+            neg_corrs = pd.Series(np.full(12, -0.01), index=np.arange(1, 13))
+            neg_summary = summarize_afml_backtest_diagnostics(neg_corrs, label="Weak")
+            neg_meta = plot_afml_backtest_story(neg_corrs, neg_summary, title="Weak")
+            self.assertFalse(neg_meta["track_record_sufficient"])
+        plt.close("all")
 
 
 if __name__ == "__main__":
