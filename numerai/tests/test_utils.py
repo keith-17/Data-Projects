@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -547,6 +549,50 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
         self.assertEqual(cfg["embargo_eras"], 3)
         self.assertEqual(cfg["score_version"], "v1_skepta")
         self.assertEqual(cfg["downsample_mode"], "recent")
+        self.assertIsNone(cfg["val_downsample_mode"])
+        self.assertEqual(cfg["val_downsample_frac"], 1.0)
+
+        cfg_both = build_experiment_setup(
+            target_col="target",
+            era_stride=4,
+            downsample_mode="within_era",
+            downsample_frac=0.05,
+            val_downsample_mode="same",
+        )
+        self.assertEqual(cfg_both["val_downsample_mode"], "within_era")
+        self.assertEqual(cfg_both["val_downsample_frac"], 0.05)
+
+        # era_stride='auto' / None auto-syncs with target_horizon_eras and suppresses [Overlap Notice]
+        buf_60d = io.StringIO()
+        with contextlib.redirect_stdout(buf_60d):
+            cfg_auto_60 = build_experiment_setup(target_col="target", era_stride="auto")
+        self.assertEqual(cfg_auto_60["era_stride"], 12)
+        self.assertEqual(cfg_auto_60["target_horizon_eras"], 12)
+        self.assertEqual(cfg_auto_60["embargo_eras"], 1)
+        self.assertEqual(cfg_auto_60["era_tag"], "all_eras_stride12")
+        self.assertIn("era_stride=12 (auto-matched to horizon=12)", buf_60d.getvalue())
+        self.assertNotIn("[Overlap Notice]", buf_60d.getvalue())
+
+        buf_20d = io.StringIO()
+        with contextlib.redirect_stdout(buf_20d):
+            cfg_auto_20 = build_experiment_setup(target_col="target_jupiter_20", era_stride="auto")
+        self.assertEqual(cfg_auto_20["era_stride"], 4)
+        self.assertEqual(cfg_auto_20["target_horizon_eras"], 4)
+        self.assertEqual(cfg_auto_20["embargo_eras"], 1)
+        self.assertEqual(cfg_auto_20["era_tag"], "all_eras_stride4")
+        self.assertNotIn("[Overlap Notice]", buf_20d.getvalue())
+
+        cfg_none_stride = build_experiment_setup(target_col="target", era_stride=None)
+        self.assertEqual(cfg_none_stride["era_stride"], 12)
+        self.assertEqual(cfg_none_stride["embargo_eras"], 1)
+
+        buf_overlap = io.StringIO()
+        with contextlib.redirect_stdout(buf_overlap):
+            cfg_explicit_4 = build_experiment_setup(target_col="target", era_stride=4)
+        self.assertEqual(cfg_explicit_4["era_stride"], 4)
+        self.assertEqual(cfg_explicit_4["target_horizon_eras"], 12)
+        self.assertEqual(cfg_explicit_4["embargo_eras"], 3)
+        self.assertIn("[Overlap Notice]", buf_overlap.getvalue())
 
         invalid_kwargs = [
             {"baseline_mode": "invalid"},
@@ -554,8 +600,14 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
             {"score_version": "v99"},
             {"cv_strategy": "kfold"},
             {"cv_split": 1.0},
+            {"era_stride": 0},
+            {"era_stride": -2},
+            {"era_stride": "bad_stride"},
+            {"era_stride": True},
             {"downsample_mode": "unknown"},
             {"downsample_frac": 0.0},
+            {"val_downsample_mode": "unknown"},
+            {"val_downsample_frac": 0.0},
             {"eval_mode": "invalid"},
             {"walk_forward_window": "invalid"},
             {"era_weighting": "invalid"},

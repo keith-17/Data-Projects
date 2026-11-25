@@ -429,6 +429,38 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
             self.assertEqual(len(tr2["era"].unique()), 4)
             self.assertEqual(len(val2), len(val1))
 
+            # Third call downsampling BOTH train and validation MUST also hit cache
+            with patch.object(data_utils, "load_unity_numerai_data", side_effect=AssertionError("Should have hit cache!")):
+                tr3, val3, _, _ = load_unity_numerai_data_cached(
+                    data_version="v6.0",
+                    feature_set="small",
+                    era_stride=1,
+                    downsample_mode="within_era",
+                    downsample_frac=0.5,
+                    val_downsample_mode="same",
+                    val_downsample_frac=0.5,
+                    workspace_root=ws,
+                    auto_download=False,
+                )
+            self.assertEqual(len(tr3), len(tr1) // 2)
+            self.assertEqual(len(val3), len(val1) // 2)
+
+            # Explicit independent validation downsampling mode (recent eras on val, within_era on train)
+            with patch.object(data_utils, "load_unity_numerai_data", side_effect=AssertionError("Should have hit cache!")):
+                tr4, val4, _, _ = load_unity_numerai_data_cached(
+                    data_version="v6.0",
+                    feature_set="small",
+                    era_stride=1,
+                    downsample_mode="within_era",
+                    downsample_frac=0.5,
+                    val_downsample_mode="recent",
+                    val_downsample_frac=0.5,
+                    workspace_root=ws,
+                    auto_download=False,
+                )
+            self.assertEqual(len(tr4["era"].unique()), 8)
+            self.assertEqual(len(val4["era"].unique()), 2)
+
             # force_reload=True bypasses cache
             with patch.object(data_utils, "load_unity_numerai_data", wraps=load_unity_numerai_data) as spy:
                 load_unity_numerai_data_cached(

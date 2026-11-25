@@ -1767,6 +1767,7 @@ def infer_target_horizon_eras(target_col: str) -> int:
 
 
 VALID_DOWNSAMPLE_MODES = (None, "within_era", "recent", "earliest", "uniform", "random_eras")
+VALID_VAL_DOWNSAMPLE_MODES = VALID_DOWNSAMPLE_MODES + ("same",)
 VALID_SCORE_VERSIONS = ("v0_default", "v1_skepta", "v2_skepta_mmc")
 
 
@@ -1774,7 +1775,7 @@ def build_experiment_setup(
     *,
     target_col: str = "target",
     feature_set: str = "small",
-    era_stride: int = 4,
+    era_stride: Union[str, int, None] = "auto",
     model_tag: str = "baselines_ae",
     baseline_mode: Optional[str] = None,
     search_mode: str = "bayes",
@@ -1784,6 +1785,8 @@ def build_experiment_setup(
     cv_split: float = 0.8,
     downsample_mode: Optional[str] = None,
     downsample_frac: float = 1.0,
+    val_downsample_mode: Optional[str] = None,
+    val_downsample_frac: Optional[float] = None,
     n_iter: int = 37,
     n_jobs: int = -1,
     save_results: bool = True,
@@ -1832,8 +1835,14 @@ def build_experiment_setup(
         if downsample_mode in (None, False, "None", "none", "null", "")
         else str(downsample_mode).strip().lower()
     )
+    clean_val_downsample_mode = (
+        None
+        if val_downsample_mode in (None, False, "None", "none", "null", "")
+        else str(val_downsample_mode).strip().lower()
+    )
     cv_split_val = float(cv_split)
     downsample_frac_val = float(downsample_frac)
+    val_downsample_frac_raw = None if val_downsample_frac is None else float(val_downsample_frac)
 
     if clean_baseline is not None and clean_baseline not in ("baseline_a", "baseline_e", "persistence", "both", "all"):
         raise ValueError("baseline_mode must be 'baseline_a', 'baseline_e', 'persistence', 'both', or 'all'")
@@ -1854,6 +1863,22 @@ def build_experiment_setup(
         )
     if not (0.0 < downsample_frac_val <= 1.0):
         raise ValueError(f"downsample_frac must be in (0.0, 1.0], got {downsample_frac!r}")
+    if clean_val_downsample_mode not in VALID_VAL_DOWNSAMPLE_MODES:
+        raise ValueError(
+            f"val_downsample_mode must be one of {VALID_VAL_DOWNSAMPLE_MODES}, got {val_downsample_mode!r}"
+        )
+    if val_downsample_frac_raw is not None and not (0.0 < val_downsample_frac_raw <= 1.0):
+        raise ValueError(f"val_downsample_frac must be in (0.0, 1.0], got {val_downsample_frac!r}")
+    if clean_val_downsample_mode is None:
+        resolved_val_downsample_mode = None
+        resolved_val_downsample_frac = 1.0 if val_downsample_frac_raw is None else val_downsample_frac_raw
+    else:
+        resolved_val_downsample_mode = (
+            clean_downsample_mode if clean_val_downsample_mode == "same" else clean_val_downsample_mode
+        )
+        resolved_val_downsample_frac = (
+            downsample_frac_val if val_downsample_frac_raw is None else val_downsample_frac_raw
+        )
     if clean_eval not in ("static", "walk_forward", "both"):
         raise ValueError("eval_mode must be 'static', 'walk_forward', or 'both'")
     if clean_wf_win not in ("expanding", "sliding"):
@@ -1864,8 +1889,22 @@ def build_experiment_setup(
         )
 
     horizon = int(target_horizon_eras) if target_horizon_eras is not None else infer_target_horizon_eras(target_col)
-    embargo = int(np.ceil(horizon / max(1, int(era_stride))))
-    resolved_era_tag = era_tag if era_tag is not None else f"all_eras_stride{int(era_stride)}"
+    if era_stride is None or (isinstance(era_stride, str) and era_stride.strip().lower() in ("auto", "none", "")):
+        resolved_era_stride = max(1, int(horizon))
+        era_stride_auto = True
+    else:
+        if isinstance(era_stride, bool):
+            raise ValueError(f"era_stride must be 'auto' or an integer >= 1, got {era_stride!r}")
+        try:
+            resolved_era_stride = int(era_stride)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"era_stride must be 'auto' or an integer >= 1, got {era_stride!r}") from exc
+        if resolved_era_stride < 1:
+            raise ValueError(f"era_stride must be >= 1, got {era_stride!r}")
+        era_stride_auto = False
+
+    embargo = max(1, int(np.ceil(horizon / resolved_era_stride)))
+    resolved_era_tag = era_tag if era_tag is not None else f"all_eras_stride{resolved_era_stride}"
     experiment_name = f"numerai_{data_version}_{resolved_era_tag}_{model_tag}"
     results_dir = Path(workspace_root) / f"results_{experiment_name}_{target_col}_{clean_search}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1889,28 +1928,36 @@ def build_experiment_setup(
         "group_column": [era_col],
         "target_column": [target_col],
         "target_horizon_eras": [horizon],
-        "era_stride": [int(era_stride)],
+        "era_stride": [resolved_era_stride],
         "embargo_eras": [embargo],
         "cv_split": [cv_split_val],
         "downsample_mode": [clean_downsample_mode],
         "downsample_frac": [downsample_frac_val],
+        "val_downsample_mode": [resolved_val_downsample_mode],
+        "val_downsample_frac": [resolved_val_downsample_frac],
     }
 
     mode_str = f"baseline_mode={clean_baseline}" if clean_baseline is not None else f"model={model_tag}"
-    ds_str = (
-        f" | downsample={clean_downsample_mode}@{downsample_frac_val:.2f}"
-        if clean_downsample_mode is not None and downsample_frac_val < 1.0
-        else ""
+    ds_parts = []
+    if clean_downsample_mode is not None and downsample_frac_val < 1.0:
+        ds_parts.append(f"train={clean_downsample_mode}@{downsample_frac_val:.2f}")
+    if resolved_val_downsample_mode is not None and resolved_val_downsample_frac < 1.0:
+        ds_parts.append(f"val={resolved_val_downsample_mode}@{resolved_val_downsample_frac:.2f}")
+    ds_str = f" | downsample({', '.join(ds_parts)})" if ds_parts else ""
+    stride_str = (
+        f"era_stride={resolved_era_stride} (auto-matched to horizon={horizon})"
+        if era_stride_auto
+        else f"era_stride={resolved_era_stride}"
     )
     print(
         f"Experiment: {experiment_name} | {mode_str} | search_mode={clean_search} | "
         f"cv_strategy={clean_cv} (cv_split={cv_split_val}) | ERA_COL={era_col} | TARGET_COL={target_col} | "
-        f"horizon={horizon} | embargo={embargo}{ds_str}"
+        f"{stride_str} | horizon={horizon} | embargo={embargo}{ds_str}"
     )
-    if int(era_stride) < horizon:
+    if resolved_era_stride < horizon:
         print(
             f"[Overlap Notice] TARGET_COL='{target_col}' has horizon={horizon} eras while "
-            f"era_stride={int(era_stride)} (~{horizon / max(1, int(era_stride)):.1f}x label overlap). "
+            f"era_stride={resolved_era_stride} (~{horizon / resolved_era_stride:.1f}x label overlap). "
             f"Consider era_stride={horizon} or era_weighting='uniqueness'."
         )
 
@@ -1923,7 +1970,7 @@ def build_experiment_setup(
         "TICKER_COL": ticker_col,
         "TARGET_COL": target_col,
         "feature_set": feature_set,
-        "era_stride": int(era_stride),
+        "era_stride": resolved_era_stride,
         "ticker_timeseries_features": ticker_timeseries_features,
         "ticker_rolling_windows": ticker_rolling_windows,
         "ticker_lag_steps": ticker_lag_steps,
@@ -1936,6 +1983,8 @@ def build_experiment_setup(
         "cv_split": cv_split_val,
         "downsample_mode": clean_downsample_mode,
         "downsample_frac": downsample_frac_val,
+        "val_downsample_mode": resolved_val_downsample_mode,
+        "val_downsample_frac": resolved_val_downsample_frac,
         "target_horizon_eras": horizon,
         "embargo_eras": embargo,
         "eval_mode": clean_eval,

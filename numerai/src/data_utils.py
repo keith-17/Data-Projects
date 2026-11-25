@@ -548,29 +548,62 @@ VALID_DOWNSAMPLE_MODES: Tuple[str, ...] = (
 )
 
 
-def downsample_training_data(
-    train_df: pd.DataFrame,
+def _normalize_downsample_mode(downsample_mode: Optional[str]) -> Optional[str]:
+    if downsample_mode in (None, False, "None", "none", "null", ""):
+        return None
+    return str(downsample_mode).strip().lower()
+
+
+def _resolve_val_downsample_config(
+    *,
+    downsample_mode: Optional[str],
+    downsample_frac: float,
+    val_downsample_mode: Optional[str],
+    val_downsample_frac: Optional[float],
+) -> Tuple[Optional[str], float]:
+    """Validate and resolve validation downsampling knobs (`None`, `'same'`, or any `VALID_DOWNSAMPLE_MODES`)."""
+    train_mode = _normalize_downsample_mode(downsample_mode)
+    raw_val_mode = _normalize_downsample_mode(val_downsample_mode)
+    if raw_val_mode is not None and raw_val_mode != "same" and raw_val_mode not in VALID_DOWNSAMPLE_MODES:
+        raise ValueError(
+            f"val_downsample_mode must be None, 'same', or one of {VALID_DOWNSAMPLE_MODES}, got {val_downsample_mode!r}"
+        )
+    if val_downsample_frac is not None:
+        v_frac = float(val_downsample_frac)
+        if not (0.0 < v_frac <= 1.0):
+            raise ValueError(f"val_downsample_frac must be in (0.0, 1.0], got {val_downsample_frac!r}")
+    else:
+        v_frac = None
+
+    if raw_val_mode is None:
+        return None, 1.0 if v_frac is None else v_frac
+
+    resolved_mode = train_mode if raw_val_mode == "same" else raw_val_mode
+    resolved_frac = float(downsample_frac) if v_frac is None else v_frac
+    if not (0.0 < resolved_frac <= 1.0):
+        raise ValueError(f"val_downsample_frac must be in (0.0, 1.0], got {resolved_frac!r}")
+    return resolved_mode, resolved_frac
+
+
+def downsample_panel_data(
+    df: pd.DataFrame,
     *,
     downsample_mode: Optional[str] = None,
     downsample_frac: float = 1.0,
     era_col: str = "era",
     random_state: int = 42,
 ) -> pd.DataFrame:
-    """Deterministically downsample `train_df` (never `validation_df`) while preserving chronological era order.
+    """Deterministically downsample a Numerai panel DataFrame (train or validation) while preserving chronological era order.
 
     Supported modes:
       - `None`: keep 100% of rows.
       - `'within_era'`: keep every era, randomly sampling `downsample_frac` of rows within each era.
       - `'recent'`: keep the most recent `downsample_frac` fraction of unique eras.
       - `'earliest'`: keep the earliest `downsample_frac` fraction of unique eras.
-      - `'uniform'`: keep evenly spaced eras spanning the full training range.
+      - `'uniform'`: keep evenly spaced eras spanning the full range.
       - `'random_eras'`: randomly sample `downsample_frac` of unique eras without replacement.
     """
-    mode = (
-        None
-        if downsample_mode in (None, False, "None", "none", "null", "")
-        else str(downsample_mode).strip().lower()
-    )
+    mode = _normalize_downsample_mode(downsample_mode)
     if mode is not None and mode not in VALID_DOWNSAMPLE_MODES:
         raise ValueError(
             f"downsample_mode must be None or one of {VALID_DOWNSAMPLE_MODES}, got {downsample_mode!r}"
@@ -578,19 +611,19 @@ def downsample_training_data(
     frac = float(downsample_frac)
     if not (0.0 < frac <= 1.0):
         raise ValueError(f"downsample_frac must be in (0.0, 1.0], got {downsample_frac!r}")
-    if mode is None or frac >= 1.0 or len(train_df) == 0:
-        return train_df
-    if era_col not in train_df.columns:
-        raise KeyError(f"Column '{era_col}' not found in train_df.")
+    if mode is None or frac >= 1.0 or len(df) == 0:
+        return df
+    if era_col not in df.columns:
+        raise KeyError(f"Column '{era_col}' not found in DataFrame.")
 
     rng = np.random.default_rng(int(random_state))
-    era_vals = train_df[era_col].to_numpy()
+    era_vals = df[era_col].to_numpy()
 
     if mode == "within_era":
         order = np.argsort(era_vals, kind="stable")
         sorted_eras = era_vals[order]
         _, start_indices, counts = np.unique(sorted_eras, return_index=True, return_counts=True)
-        keep_mask = np.zeros(len(train_df), dtype=bool)
+        keep_mask = np.zeros(len(df), dtype=bool)
         for start, count in zip(start_indices, counts):
             positions = order[start : start + count]
             n_keep = max(1, int(round(int(count) * frac)))
@@ -599,13 +632,13 @@ def downsample_training_data(
             else:
                 chosen = rng.choice(positions, size=n_keep, replace=False)
                 keep_mask[chosen] = True
-        return train_df.loc[keep_mask].copy()
+        return df.loc[keep_mask].copy()
 
     unique_eras = np.sort(pd.unique(era_vals))
     n_eras = len(unique_eras)
     n_keep_eras = max(1, int(round(n_eras * frac)))
     if n_keep_eras >= n_eras:
-        return train_df
+        return df
 
     if mode == "recent":
         kept_eras = unique_eras[-n_keep_eras:]
@@ -619,7 +652,25 @@ def downsample_training_data(
     else:  # pragma: no cover - already validated above
         raise ValueError(f"Unsupported downsample_mode '{mode}'.")
 
-    return train_df.loc[train_df[era_col].isin(kept_eras)].copy()
+    return df.loc[df[era_col].isin(kept_eras)].copy()
+
+
+def downsample_training_data(
+    train_df: pd.DataFrame,
+    *,
+    downsample_mode: Optional[str] = None,
+    downsample_frac: float = 1.0,
+    era_col: str = "era",
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Backward-compatible alias for `downsample_panel_data` applied to `train_df`."""
+    return downsample_panel_data(
+        train_df,
+        downsample_mode=downsample_mode,
+        downsample_frac=downsample_frac,
+        era_col=era_col,
+        random_state=random_state,
+    )
 
 
 def _polars_cast_features_to_int8(pl_df: Any, feature_columns: List[str]) -> Any:
@@ -744,6 +795,8 @@ def load_unity_numerai_data(
     era_stride: int = 4,
     downsample_mode: Optional[str] = None,
     downsample_frac: float = 1.0,
+    val_downsample_mode: Optional[str] = None,
+    val_downsample_frac: Optional[float] = None,
     random_state: int = 42,
     ticker_timeseries_features: Optional[str] = None,
     ticker_rolling_windows: Sequence[int] = (4, 12),
@@ -1007,11 +1060,24 @@ def load_unity_numerai_data(
         kept_train_eras = sorted(train_df["era"].unique())[:: int(era_stride)]
         train_df = train_df.loc[train_df["era"].isin(kept_train_eras)]
 
-    # 7. Optional training-only downsampling (validation_df is never downsampled)
-    train_df = downsample_training_data(
+    # 7. Optional training & validation downsampling
+    resolved_val_mode, resolved_val_frac = _resolve_val_downsample_config(
+        downsample_mode=downsample_mode,
+        downsample_frac=downsample_frac,
+        val_downsample_mode=val_downsample_mode,
+        val_downsample_frac=val_downsample_frac,
+    )
+    train_df = downsample_panel_data(
         train_df,
         downsample_mode=downsample_mode,
         downsample_frac=downsample_frac,
+        era_col="era",
+        random_state=random_state,
+    )
+    validation_df = downsample_panel_data(
+        validation_df,
+        downsample_mode=resolved_val_mode,
+        downsample_frac=resolved_val_frac,
         era_col="era",
         random_state=random_state,
     )
@@ -1062,6 +1128,8 @@ def load_unity_numerai_data_cached(
     era_stride: int = 4,
     downsample_mode: Optional[str] = None,
     downsample_frac: float = 1.0,
+    val_downsample_mode: Optional[str] = None,
+    val_downsample_frac: Optional[float] = None,
     random_state: int = 42,
     ticker_timeseries_features: Optional[str] = None,
     ticker_rolling_windows: Sequence[int] = (4, 12),
@@ -1074,9 +1142,15 @@ def load_unity_numerai_data_cached(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], Dict[str, Any]]:
     """Cached wrapper around `load_unity_numerai_data` persisting processed Parquets & metadata in `<workspace>/<data_folder>/processed_cache/`.
 
-    Caches the full strided `(train_df, validation_df)` and applies `downsample_training_data(...)`
-    in-memory to `train_df` only so changing `downsample_mode` / `downsample_frac` reuses the cache.
+    Caches the full strided `(train_df, validation_df)` and applies downsampling in-memory to `train_df`
+    and (when `val_downsample_mode` is set) `validation_df`, so changing any downsample knob reuses the cache.
     """
+    resolved_val_mode, resolved_val_frac = _resolve_val_downsample_config(
+        downsample_mode=downsample_mode,
+        downsample_frac=downsample_frac,
+        val_downsample_mode=val_downsample_mode,
+        val_downsample_frac=val_downsample_frac,
+    )
     workspace_dir = Path(workspace_root).resolve() if workspace_root is not None else Path.cwd().resolve()
     if workspace_dir.name.lower() == "notebooks":
         workspace_dir = workspace_dir.parent
@@ -1121,10 +1195,17 @@ def load_unity_numerai_data_cached(
                     and validation_df[target_col].dtype == np.float32
                 )
                 if valid_hit:
-                    train_df = downsample_training_data(
+                    train_df = downsample_panel_data(
                         train_df,
                         downsample_mode=downsample_mode,
                         downsample_frac=downsample_frac,
+                        era_col="era",
+                        random_state=random_state,
+                    )
+                    validation_df = downsample_panel_data(
+                        validation_df,
+                        downsample_mode=resolved_val_mode,
+                        downsample_frac=resolved_val_frac,
                         era_col="era",
                         random_state=random_state,
                     )
@@ -1141,6 +1222,8 @@ def load_unity_numerai_data_cached(
         era_stride=era_stride,
         downsample_mode=None,
         downsample_frac=1.0,
+        val_downsample_mode=None,
+        val_downsample_frac=None,
         random_state=random_state,
         ticker_timeseries_features=ticker_timeseries_features,
         ticker_rolling_windows=ticker_rolling_windows,
@@ -1177,10 +1260,17 @@ def load_unity_numerai_data_cached(
     except OSError as cache_err:
         warnings.warn(f"Could not write processed data cache ({cache_err}); continuing without cache.")
 
-    train_df = downsample_training_data(
+    train_df = downsample_panel_data(
         train_df,
         downsample_mode=downsample_mode,
         downsample_frac=downsample_frac,
+        era_col="era",
+        random_state=random_state,
+    )
+    validation_df = downsample_panel_data(
+        validation_df,
+        downsample_mode=resolved_val_mode,
+        downsample_frac=resolved_val_frac,
         era_col="era",
         random_state=random_state,
     )
