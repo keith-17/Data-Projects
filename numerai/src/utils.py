@@ -3274,6 +3274,8 @@ def simulate_stake_pnl_monte_carlo(
             "mc_p95_money_drawdown_pct": 0.0,
             "final_stakes": np.empty(0, dtype=np.float64),
             "money_drawdowns_pct": np.empty(0, dtype=np.float64),
+            "sim_equity_paths": np.empty((0, 0), dtype=np.float64),
+            "actual_equity_path": np.empty(0, dtype=np.float64),
             "staking_mode": clean_mode,
             "example_losing_path": None,
             "example_winning_path": None,
@@ -3369,6 +3371,8 @@ def simulate_stake_pnl_monte_carlo(
         "mc_p95_money_drawdown_pct": p95_dd,
         "final_stakes": final_wallets,
         "money_drawdowns_pct": worst_dds_pct,
+        "sim_equity_paths": sim_paths,
+        "actual_equity_path": actual_eq,
         "n_sims": n_s,
         "block_size": b_size,
         "concurrent_rounds": int(concurrent_rounds),
@@ -3616,10 +3620,12 @@ def plot_stake_pnl_monte_carlo(
     else:
         banner_bg, banner_edge, banner_fg = "#f8fafc", "#64748b", "#334155"
 
-    fig, (ax_hist, ax_paths) = plt.subplots(
-        1, 2, figsize=(16.5, 6.8), facecolor="white", gridspec_kw={"width_ratios": [1.15, 1.0]}
-    )
-    for ax in (ax_hist, ax_paths):
+    fig = plt.figure(figsize=(16.5, 11.4), facecolor="white")
+    gs = fig.add_gridspec(2, 2, width_ratios=[1.15, 1.0], height_ratios=[1.0, 1.08], hspace=0.34, wspace=0.18)
+    ax_hist = fig.add_subplot(gs[0, 0])
+    ax_paths = fig.add_subplot(gs[0, 1])
+    ax_fan = fig.add_subplot(gs[1, :])
+    for ax in (ax_hist, ax_paths, ax_fan):
         ax.set_facecolor("white")
         ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
         ax.spines["top"].set_visible(False)
@@ -3726,6 +3732,85 @@ def plot_stake_pnl_monte_carlo(
     ax_paths.set_title("Drawdown (Mid-Path Dip) vs Final Balance — Example Paths", fontsize=11.5, fontweight="bold", pad=8)
     ax_paths.legend(loc="best", frameon=True, facecolor="white", framealpha=0.92, fontsize=8.3)
 
+    # --- Bottom Full-Width Panel: Cleaner Monte Carlo Simulation Graph (Cumulative P&L £, can go negative) ---
+    from matplotlib.ticker import FuncFormatter
+
+    sim_eq_paths = np.asarray(mc.get("sim_equity_paths", np.empty((0, 0))), dtype=np.float64)
+    actual_eq_path = np.asarray(mc.get("actual_equity_path", np.empty(0)), dtype=np.float64)
+    if sim_eq_paths.ndim == 2 and sim_eq_paths.shape[0] > 0 and sim_eq_paths.shape[1] > 0:
+        # Convert wallet equity to Cumulative P&L (£) relative to start_cap so losses go negative (< £0)
+        pnl_paths = np.hstack([np.zeros((sim_eq_paths.shape[0], 1), dtype=np.float64), sim_eq_paths - start_cap])
+        steps_fan = np.arange(pnl_paths.shape[1], dtype=np.int64)
+
+        # Faded neutral background paths to show full range without visual clutter
+        ax_fan.plot(steps_fan, pnl_paths.T, color="#94a3b8", alpha=0.14, linewidth=0.75, zorder=1)
+        ax_fan.plot([], [], color="#94a3b8", alpha=0.55, linewidth=1.2, label=f"All {mc['n_sims']:,} Simulated Paths")
+
+        p25_curve = np.percentile(pnl_paths, 25.0, axis=0)
+        p50_curve = np.percentile(pnl_paths, 50.0, axis=0)
+        p75_curve = np.percentile(pnl_paths, 75.0, axis=0)
+
+        p25_end, p50_end, p75_end = float(p25_curve[-1]), float(p50_curve[-1]), float(p75_curve[-1])
+
+        ax_fan.axhline(0.0, color="#0f172a", linestyle="--", linewidth=1.3, zorder=3, label="Break-even (£0 P&L)")
+        if len(actual_eq_path) == sim_eq_paths.shape[1]:
+            actual_pnl_curve = np.concatenate(([0.0], actual_eq_path - start_cap))
+            actual_pnl_end = float(actual_pnl_curve[-1])
+            ax_fan.plot(
+                steps_fan,
+                actual_pnl_curve,
+                color="#7c3aed",
+                linestyle="-.",
+                linewidth=1.5,
+                alpha=0.85,
+                zorder=4,
+                label=f"Actual Path (£{actual_pnl_end:+,.2f})",
+            )
+
+        ax_fan.plot(steps_fan, p75_curve, color="#059669", linewidth=2.2, zorder=5, label=f"75th Percentile (£{p75_end:+,.2f})")
+        ax_fan.plot(steps_fan, p50_curve, color="#1d4ed8", linewidth=2.6, zorder=6, label=f"Median / 50th Pct (£{p50_end:+,.2f})")
+        ax_fan.plot(steps_fan, p25_curve, color="#dc2626", linewidth=2.2, zorder=5, label=f"25th Percentile (£{p25_end:+,.2f})")
+
+        y_min = float(np.min(pnl_paths))
+        y_max = float(np.max(pnl_paths))
+        y_span = max(y_max - y_min, start_cap * 0.05)
+        y_lo = min(y_min, 0.0) - 0.08 * y_span
+        y_hi = max(y_max, 0.0) + 0.08 * y_span
+        if y_lo < 0.0:
+            ax_fan.axhspan(y_lo, 0.0, color="#fee2e2", alpha=0.22, zorder=0)
+        ax_fan.set_ylim(y_lo, y_hi)
+        ax_fan.set_xlim(0, max(1, int(steps_fan[-1])) * 1.07)
+
+        for y_end, color, tag in (
+            (p75_end, "#059669", "75th"),
+            (p50_end, "#1d4ed8", "Median"),
+            (p25_end, "#dc2626", "25th"),
+        ):
+            ax_fan.annotate(
+                f"{tag}: £{y_end:+,.0f}",
+                xy=(steps_fan[-1], y_end),
+                xytext=(6, 0),
+                textcoords="offset points",
+                va="center",
+                ha="left",
+                fontsize=8.2,
+                fontweight="bold",
+                color=color,
+            )
+
+        ax_fan.yaxis.set_major_formatter(
+            FuncFormatter(lambda val, _pos: f"-£{abs(val):,.0f}" if val < -1e-6 else (f"+£{val:,.0f}" if val > 1e-6 else "£0"))
+        )
+        ax_fan.set_xlabel("Simulated Week (Era Step)")
+        ax_fan.set_ylabel("Cumulative P&L (£)")
+        ax_fan.set_title(
+            f"Cleaner Monte Carlo Simulation Paths — Cumulative P&L (£) Across {mc['n_sims']:,} Runs (25th / Median / 75th)",
+            fontsize=11.5,
+            fontweight="bold",
+            pad=8,
+        )
+        ax_fan.legend(loc="upper left", ncol=3, frameon=True, facecolor="white", framealpha=0.92, fontsize=8.3)
+
     # --- Top Suptitle, Plain-English Verdict Banner, & Bottom Drawdown Footnote ---
     import textwrap
 
@@ -3758,7 +3843,7 @@ def plot_stake_pnl_monte_carlo(
         fontsize=8.2,
         color="#334155",
     )
-    plt.tight_layout(rect=(0.0, 0.055, 1.0, 0.835))
+    fig.subplots_adjust(left=0.06, right=0.95, top=0.835, bottom=0.075)
     if save_path is not None:
         out_path = Path(save_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3878,7 +3963,8 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
         df = df.sort_values("rank_test_score", kind="stable").reset_index(drop=True)
     if trials_era_corrs_map:
         trials_df = pd.DataFrame({f"trial_{cid}": s for cid, s in sorted(trials_era_corrs_map.items())}).sort_index()
-        df.attrs["trials_era_corrs_df"] = trials_df
+        # Store as plain nested dict so pandas DataFrame.attrs == attrs in to_string()/concat() never raises ValueError
+        df.attrs["trials_era_corrs_df"] = trials_df.to_dict(orient="dict")
     return df
 
 

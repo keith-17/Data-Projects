@@ -149,6 +149,8 @@ def test_one_wallet_plots() -> None:
     assert "mean_ending_capital" not in dash_res and "window_outcomes_df" not in dash_res
     mc_res = plot_stake_pnl_monte_carlo(vol_corrs, total_capital=1000.0, n_sims=50, title="Test One-Wallet MC")
     assert "window_mc_df" not in mc_res and len(mc_res["final_stakes"]) == 50
+    assert mc_res["sim_equity_paths"].shape == (50, len(vol_corrs))
+    assert float(np.min(mc_res["sim_equity_paths"] - mc_res["start_capital"])) < 0.0
     plt.close("all")
     print("[PASS] Check 5: One-wallet dashboard & Monte Carlo plots verified.")
 

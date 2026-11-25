@@ -928,11 +928,22 @@ def compute_onc_clusters(
     }
 
 
+def _coerce_trials_matrix_df(
+    trials_matrix: Union[pd.DataFrame, Dict[str, Any], np.ndarray],
+) -> pd.DataFrame:
+    """Normalize a trials era-CORR matrix from DataFrame, nested dict, or ndarray to a DataFrame."""
+    if isinstance(trials_matrix, pd.DataFrame):
+        return trials_matrix.copy()
+    if isinstance(trials_matrix, dict):
+        return pd.DataFrame.from_dict(trials_matrix).sort_index()
+    return pd.DataFrame(np.asarray(trials_matrix, dtype=np.float64))
+
+
 def compute_deflated_sharpe_ratio(
     era_corrs: Any,
     trial_srs: Optional[Sequence[float]] = None,
     *,
-    trials_matrix: Optional[Union[pd.DataFrame, np.ndarray]] = None,
+    trials_matrix: Optional[Union[pd.DataFrame, Dict[str, Any], np.ndarray]] = None,
     alpha: float = 0.05,
     adjust_autocorr: bool = False,
     random_state: int = 42,
@@ -960,11 +971,7 @@ def compute_deflated_sharpe_ratio(
     used_onc = False
 
     if trials_matrix is not None:
-        mat_df = (
-            trials_matrix.copy()
-            if isinstance(trials_matrix, pd.DataFrame)
-            else pd.DataFrame(np.asarray(trials_matrix, dtype=np.float64))
-        )
+        mat_df = _coerce_trials_matrix_df(trials_matrix)
         # Drop constant or nearly empty columns before ONC clustering
         nonconst_cols = [
             c for c in mat_df.columns
@@ -1036,7 +1043,7 @@ def compute_deflated_sharpe_ratio(
 
 
 def compute_pbo_cscv(
-    trials_matrix: Union[pd.DataFrame, np.ndarray],
+    trials_matrix: Union[pd.DataFrame, Dict[str, Any], np.ndarray],
     *,
     n_submatrices: int = 12,
     max_combinations: int = 2000,
@@ -1046,11 +1053,7 @@ def compute_pbo_cscv(
 
     `trials_matrix` has shape `(T_eras, N_trials)` containing per-era CORR series across all evaluated trials.
     """
-    mat = (
-        trials_matrix.to_numpy(dtype=np.float64, copy=False)
-        if isinstance(trials_matrix, pd.DataFrame)
-        else np.asarray(trials_matrix, dtype=np.float64)
-    )
+    mat = _coerce_trials_matrix_df(trials_matrix).to_numpy(dtype=np.float64, copy=False)
     if mat.ndim != 2 or mat.shape[0] < 4 or mat.shape[1] < 2:
         return {
             "pbo": float(np.nan),
