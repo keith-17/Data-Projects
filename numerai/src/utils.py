@@ -39,6 +39,28 @@ from sklearn.preprocessing import KBinsDiscretizer, StandardScaler
 from statsmodels.stats.diagnostic import acorr_ljungbox, acorr_lm
 from statsmodels.tsa.stattools import adfuller
 
+from afml_utils import (
+    CombinatorialPurgedEraCV,
+    PurgedEraKFold,
+    build_era_cv_splits,
+    cluster_features_onc,
+    compute_clustered_mda,
+    compute_deflated_sharpe_ratio,
+    compute_drawdown_and_tuw,
+    compute_hhi_concentration,
+    compute_lo_adjusted_sharpe,
+    compute_min_track_record_length,
+    compute_onc_clusters,
+    compute_pbo_cscv,
+    compute_per_era_fnc,
+    compute_probabilistic_sharpe_ratio,
+    compute_strategy_risk,
+    compute_variation_of_information_matrix,
+    neutralize_predictions,
+    purge_train_before_validation,
+    summarize_afml_backtest_diagnostics,
+)
+
 _ADFULLER_HAS_RESULT_OBJECT = "result_object" in inspect.signature(adfuller).parameters
 _ACORR_LM_HAS_RESULT_OBJECT = "result_object" in inspect.signature(acorr_lm).parameters
 
@@ -736,22 +758,33 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
         q_strat = str(self.quantize_strategy or "zscore").strip().lower()
         arr = np.asarray(values, dtype=np.float64).ravel()
         if scope == "train_fit":
-            scalers: Dict[str, StandardScaler] = getattr(self, "signal_scalers_", {})
-            scaler = scalers.get(signal_key)
-            if scaler is None and getattr(self, "_is_fitting_", False):
-                finite = np.isfinite(arr)
-                clean = np.where(finite, arr, np.nanmedian(arr[finite]) if finite.any() else 0.0)
-                scaler = StandardScaler().fit(clean.reshape(-1, 1))
-                scalers[signal_key] = scaler
-                self.signal_scalers_ = scalers
-            if scaler is not None:
-                return quantize_to_5bins(arr, strategy=q_strat, quantize_scope="train_fit", fitted_scaler=scaler)
+            return self._quantize_signal_frozen(arr, signal_key)
         return quantize_to_5bins(
             arr,
             strategy=q_strat,
             eras=era_vals.to_numpy() if era_vals is not None else None,
             quantize_scope=scope,
         )
+
+    def _quantize_signal_frozen(self, values: np.ndarray, signal_key: str) -> np.ndarray:
+        """Leak-free quantization using a StandardScaler frozen strictly during `fit()` (never looks ahead across val eras)."""
+        q_strat = str(self.quantize_strategy or "zscore").strip().lower()
+        arr = np.asarray(values, dtype=np.float64).ravel()
+        scalers: Dict[str, StandardScaler] = getattr(self, "signal_scalers_", {})
+        scaler = scalers.get(signal_key)
+        if scaler is None and getattr(self, "_is_fitting_", False):
+            finite = np.isfinite(arr)
+            clean = np.where(finite, arr, np.nanmedian(arr[finite]) if finite.any() else 0.0)
+            scaler = StandardScaler().fit(clean.reshape(-1, 1))
+            scalers[signal_key] = scaler
+            self.signal_scalers_ = scalers
+        if scaler is not None:
+            return quantize_to_5bins(arr, strategy=q_strat, quantize_scope="train_fit", fitted_scaler=scaler)
+        # Fallback if transform was called without fitting this signal: causal constant-center zscore without refitting
+        finite = np.isfinite(arr)
+        if not finite.any():
+            return np.full(len(arr), 2, dtype=np.int8)
+        return quantize_to_5bins(arr, strategy=q_strat, quantize_scope="global")
 
     def fit(self, X: pd.DataFrame, y: Any = None) -> "NumeraiExtractions":
         X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
@@ -833,6 +866,7 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
 
         # Optional sparse multivariate selector (`SelectFromModel` with `Lasso` or `ElasticNet`)
         self.sparse_selector_: Optional[SelectFromModel] = None
+        self.sparse_scaler_: Optional[StandardScaler] = None
         if (
             self.sparse_selector not in (None, False, "None", "none", "null", "")
             and target_vec is not None
@@ -849,8 +883,10 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
                 raise ValueError(f"Unsupported sparse_selector '{self.sparse_selector}'; use None, 'lasso', or 'elasticnet'.")
             sfm = SelectFromModel(base_sparse)
             fit_target_arr = (target_vec.loc[fit_mask] if use_filter else target_vec).to_numpy(dtype=np.float32, copy=False)
+            sparse_raw = fit_clean_df[selected_cols].to_numpy(dtype=np.float32, copy=False)
+            self.sparse_scaler_ = StandardScaler().fit(sparse_raw)
             sfm.fit(
-                fit_clean_df[selected_cols].to_numpy(dtype=np.float32, copy=False),
+                self.sparse_scaler_.transform(sparse_raw),
                 fit_target_arr,
             )
             sparse_support = sfm.get_support()
@@ -860,6 +896,7 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
             self.sparse_selector_ = sfm
 
         self.pca_: Optional[PCA] = None
+        self.pca_scaler_: Optional[StandardScaler] = None
         if (
             self.pca_n_components not in (None, False, "None", "none", "null", "", 0)
             and len(selected_cols) >= 2
@@ -870,8 +907,10 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
                 n_comp: Any = float(raw_pca)
             else:
                 n_comp = min(max(1, int(raw_pca)), len(selected_cols), len(fit_clean_df))
+            pca_raw = fit_clean_df[selected_cols].to_numpy(dtype=np.float32, copy=False)
+            self.pca_scaler_ = StandardScaler().fit(pca_raw)
             self.pca_ = PCA(n_components=n_comp, random_state=42)
-            self.pca_.fit(fit_clean_df[selected_cols].to_numpy(dtype=np.float32, copy=False))
+            self.pca_.fit(self.pca_scaler_.transform(pca_raw))
 
         self.feature_names_in_ = np.asarray(raw_cols, dtype=object)
         self.n_features_in_ = len(raw_cols)
@@ -879,7 +918,17 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
         self.selected_feature_names_ = selected_cols
         self.selected_corrs_ = corr_series.reindex(selected_cols).fillna(0.0).to_numpy(dtype=np.float64)
         self.signal_scalers_ = {}
-        if str(self.quantize_scope or "era").strip().lower() == "train_fit":
+        self.era_means_tail_: Optional[pd.DataFrame] = None
+        self.ticker_tail_df_: Optional[pd.DataFrame] = None
+
+        # Always run a strictly training-only fitting pass whenever frozen scalers or causal tail buffers are needed
+        need_fit_pass = (
+            str(self.quantize_scope or "era").strip().lower() == "train_fit"
+            or bool(self.include_rolling_era)
+            or bool(self.include_lag_diff)
+            or (self.ticker_features not in (None, False, "None", "none", "null", ""))
+        )
+        if need_fit_pass:
             self._is_fitting_ = True
             try:
                 _ = self.transform(X_df.loc[fit_mask])
@@ -980,8 +1029,39 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
                     temp_ticker_in = base_features[top_ticker_cols].copy()
                     temp_ticker_in[self.era_col] = era_vals
                     temp_ticker_in[self.ticker_col] = X_df[self.ticker_col].astype(str)
+                    is_fit_call = bool(getattr(self, "_is_fitting_", False))
+                    max_t_lookback = max(t_windows + (t_lags if t_lags else []) + [12])
+
+                    if is_fit_call:
+                        # Save strictly training trailing eras as causal warm-up tail buffer for unseen validation/test eras
+                        uniq_fit_eras = sorted(era_vals.unique())
+                        keep_tail_eras = set(uniq_fit_eras[-max_t_lookback:])
+                        self.ticker_tail_df_ = temp_ticker_in.loc[era_vals.isin(keep_tail_eras)].copy()
+                        ticker_work_in = temp_ticker_in
+                        used_tail = False
+                    else:
+                        saved_tail = getattr(self, "ticker_tail_df_", None)
+                        if saved_tail is not None and len(saved_tail) > 0 and len(era_vals) > 0:
+                            min_cur_era = int(era_vals.min())
+                            causal_tail = saved_tail.loc[saved_tail[self.era_col] < min_cur_era]
+                            if len(causal_tail) > 0:
+                                tail_part = causal_tail.copy()
+                                tail_part["_is_query_row_"] = False
+                                query_part = temp_ticker_in.copy()
+                                query_part["_is_query_row_"] = True
+                                ticker_work_in = pd.concat([tail_part, query_part], axis=0, ignore_index=True)
+                                used_tail = True
+                            else:
+                                ticker_work_in = temp_ticker_in
+                                used_tail = False
+                        else:
+                            ticker_work_in = temp_ticker_in
+                            used_tail = False
+
+                    # Never silently fall back to look-ahead 'global' when scope == 'train_fit'
+                    eff_ticker_qscope = "global" if scope == "global" else "era"
                     temp_ticker_out, added_ticker_cols = compute_per_ticker_timeseries_features(
-                        temp_ticker_in,
+                        ticker_work_in,
                         top_ticker_cols,
                         ticker_col=self.ticker_col,
                         era_col=self.era_col,
@@ -989,8 +1069,10 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
                         ticker_windows=t_windows,
                         ticker_lag_steps=t_lags,
                         top_n_cols=len(top_ticker_cols),
-                        quantize_scope="era" if scope == "era" else "global",
+                        quantize_scope=eff_ticker_qscope,
                     )
+                    if used_tail:
+                        temp_ticker_out = temp_ticker_out.loc[temp_ticker_out["_is_query_row_"]]
                     for col_name in added_ticker_cols:
                         extra_cols[col_name] = temp_ticker_out[col_name].to_numpy(dtype=np.int8)
 
@@ -1014,39 +1096,60 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
             need_era_means = rolling_active or lag_active
             era_means = base_features[top_cols].groupby(era_vals, sort=True).mean() if (need_era_means and top_cols) else None
 
-            if rolling_active and era_means is not None:
+            if need_era_means and era_means is not None:
                 windows = [int(w) for w in raw_windows] if isinstance(raw_windows, (list, tuple)) else [4, 12]
-                for window in windows:
-                    if window <= 1:
-                        continue
-                    rolling_means = era_means.rolling(window=window, min_periods=1).mean()
-                    for col in top_cols:
-                        mapped = era_vals.map(rolling_means[col]).to_numpy(dtype=np.float64)
-                        # Era-level scalar series is constant within a single era, so use train_fit or global across eras
-                        era_scope = "train_fit" if scope == "train_fit" else "global"
-                        extra_cols[f"{col}_era_roll{window}"] = (
-                            self._quantize_signal(mapped, None, f"{col}_era_roll{window}")
-                            if era_scope == "train_fit"
-                            else quantize_to_5bins(mapped, quantize_scope="global")
-                        )
-
-            if lag_active and era_means is not None:
                 lags = [int(l_val) for l_val in raw_lags] if isinstance(raw_lags, (list, tuple)) else [1, 2, 4]
-                for lag_step in lags:
-                    if lag_step <= 0:
-                        continue
-                    diff_means = era_means.diff(periods=lag_step).fillna(0.0)
-                    for col in top_cols:
-                        mapped = era_vals.map(diff_means[col]).to_numpy(dtype=np.float64)
-                        era_scope = "train_fit" if scope == "train_fit" else "global"
-                        extra_cols[f"{col}_era_diff{lag_step}"] = (
-                            self._quantize_signal(mapped, None, f"{col}_era_diff{lag_step}")
-                            if era_scope == "train_fit"
-                            else quantize_to_5bins(mapped, quantize_scope="global")
+                max_era_hist = max(windows + lags + [1])
+                is_fit_call = bool(getattr(self, "_is_fitting_", False))
+                if is_fit_call:
+                    self.era_means_tail_ = era_means.tail(max_era_hist).copy()
+                    combined_era_means = era_means
+                else:
+                    saved_em = getattr(self, "era_means_tail_", None)
+                    if saved_em is not None and len(saved_em) > 0 and len(era_means) > 0:
+                        min_cur_e = era_means.index.min()
+                        causal_em = saved_em.loc[saved_em.index < min_cur_e]
+                        combined_era_means = (
+                            pd.concat([causal_em, era_means], axis=0).sort_index()
+                            if len(causal_em) > 0
+                            else era_means
                         )
+                    else:
+                        combined_era_means = era_means
+
+                if rolling_active:
+                    for window in windows:
+                        if window <= 1:
+                            continue
+                        rolling_means = combined_era_means.rolling(window=window, min_periods=1).mean()
+                        for col in top_cols:
+                            mapped = era_vals.map(rolling_means[col]).to_numpy(dtype=np.float64)
+                            # Era-level scalar series is constant within an era: ALWAYS use frozen train-fit scaler
+                            # (unless scope=='global' was explicitly requested), eliminating val/test look-ahead bias!
+                            extra_cols[f"{col}_era_roll{window}"] = (
+                                quantize_to_5bins(mapped, quantize_scope="global")
+                                if scope == "global"
+                                else self._quantize_signal_frozen(mapped, f"{col}_era_roll{window}")
+                            )
+
+                if lag_active:
+                    for lag_step in lags:
+                        if lag_step <= 0:
+                            continue
+                        diff_means = combined_era_means.diff(periods=lag_step).fillna(0.0)
+                        for col in top_cols:
+                            mapped = era_vals.map(diff_means[col]).to_numpy(dtype=np.float64)
+                            extra_cols[f"{col}_era_diff{lag_step}"] = (
+                                quantize_to_5bins(mapped, quantize_scope="global")
+                                if scope == "global"
+                                else self._quantize_signal_frozen(mapped, f"{col}_era_diff{lag_step}")
+                            )
 
         if getattr(self, "pca_", None) is not None:
-            pca_scores = self.pca_.transform(base_features.to_numpy(dtype=np.float32, copy=False))
+            pca_in = base_features.to_numpy(dtype=np.float32, copy=False)
+            if getattr(self, "pca_scaler_", None) is not None:
+                pca_in = self.pca_scaler_.transform(pca_in)
+            pca_scores = self.pca_.transform(pca_in)
             pca_cols = {
                 f"pca_comp_{comp_idx}": self._quantize_signal(
                     pca_scores[:, comp_idx], era_vals, f"pca_comp_{comp_idx}"
@@ -1128,13 +1231,16 @@ def compute_feature_exposure(
     features_df: pd.DataFrame,
     predictions: Any,
     feature_columns: Optional[Sequence[str]] = None,
-) -> float:
-    """Compute Feature Exposure (`np.std([spearmanr(prediction, f)[0] for f in all_features])`) matching the Numerai starter notebook."""
+    *,
+    eras: Optional[Any] = None,
+    return_per_era: bool = False,
+) -> Union[float, Tuple[float, pd.Series]]:
+    """Compute Feature Exposure (`std([spearman(pred, f)])`): per-era mean when `eras` is supplied, pooled otherwise."""
     if feature_columns is not None and len(feature_columns) == 0:
-        return float(np.nan)
+        return (float(np.nan), pd.Series(dtype=np.float64)) if return_per_era else float(np.nan)
     preds = np.asarray(predictions, dtype=np.float64).ravel()
     if len(preds) < 3 or _is_constant_1d(preds):
-        return 0.0
+        return (0.0, pd.Series(dtype=np.float64)) if return_per_era else 0.0
     cols = (
         list(feature_columns)
         if feature_columns is not None
@@ -1142,9 +1248,38 @@ def compute_feature_exposure(
     )
     valid_cols = [col for col in cols if col in features_df.columns]
     if not valid_cols:
-        return float(np.nan)
+        return (float(np.nan), pd.Series(dtype=np.float64)) if return_per_era else float(np.nan)
+
+    if eras is not None:
+        era_arr = np.asarray(eras).ravel()
+        if len(era_arr) == len(preds) and len(np.unique(era_arr)) >= 1:
+            era_exposures: Dict[Any, float] = {}
+            sub_df = features_df[valid_cols]
+            order = np.argsort(era_arr, kind="stable")
+            sorted_eras = era_arr[order]
+            change = np.empty(len(era_arr), dtype=bool)
+            change[0] = True
+            if len(era_arr) > 1:
+                change[1:] = sorted_eras[1:] != sorted_eras[:-1]
+            starts = np.flatnonzero(change)
+            ends = np.append(starts[1:], len(era_arr))
+            row_labels = sub_df.index.to_numpy()
+            for s, e in zip(starts, ends):
+                idx = order[s:e]
+                era_key = sorted_eras[s]
+                p_e = preds[idx]
+                if len(idx) < 3 or _is_constant_1d(p_e):
+                    era_exposures[era_key] = 0.0
+                    continue
+                fc = _pooled_pearson_corr(sub_df.loc[row_labels[idx]], p_e, rank_columns=True)
+                era_exposures[era_key] = float(np.std(fc)) if len(fc) else 0.0
+            per_era_s = pd.Series(era_exposures, dtype=np.float64, name="feature_exposure")
+            mean_fe = float(np.round(per_era_s.mean(), 4)) if len(per_era_s) else 0.0
+            return (mean_fe, per_era_s) if return_per_era else mean_fe
+
     feature_corrs = _pooled_pearson_corr(features_df[valid_cols], preds, rank_columns=True)
-    return float(np.round(np.std(feature_corrs), 4)) if len(feature_corrs) else 0.0
+    pooled_fe = float(np.round(np.std(feature_corrs), 4)) if len(feature_corrs) else 0.0
+    return (pooled_fe, pd.Series([pooled_fe], dtype=np.float64)) if return_per_era else pooled_fe
 
 
 def evaluate_numerai_predictions(
@@ -1154,22 +1289,31 @@ def evaluate_numerai_predictions(
     *,
     features_df: Optional[pd.DataFrame] = None,
     feature_columns: Optional[Sequence[str]] = None,
+    compute_fnc: Optional[bool] = None,
     label: Optional[str] = None,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """Evaluate predictions using official `numerai_corr`, tutorial metrics (Spearman, Payout, Sharpe, MAE, Feature Exposure), and the `[0.005, 0.04]` CORR sanity tripwire."""
+    """Evaluate predictions using official `numerai_corr`, Numerai Forum #1454 diagnostics (Era Consistency > 0.002, FNC, per-era Feature Exposure), AFML risk stats (PSR, Lo-Sharpe, MinTRL, TuW, HHI), and the `[0.005, 0.04]` CORR sanity tripwire."""
     targets = np.asarray(y_true, dtype=np.float64).ravel()
     preds = np.asarray(y_pred, dtype=np.float64).ravel()
 
     spearman_era_corrs = compute_per_era_spearman_corr(targets, preds, eras=eras)
     numerai_era_corrs = compute_per_era_numerai_corr(targets, preds, eras=eras)
 
+    # Legacy tutorial Spearman payout proxy (not official v6.0 NCORR/NMMC staking payout; see simulate_stake_pnl)
     payout_raw = (spearman_era_corrs / 0.2).clip(-1.0, 1.0)
     spearman_mean = float(np.round(spearman_era_corrs.mean(), 4)) if len(spearman_era_corrs) else 0.0
     numerai_corr_mean = float(np.round(numerai_era_corrs.mean(), 4)) if len(numerai_era_corrs) else 0.0
     payout_mean = float(np.round(payout_raw.mean(), 4)) if len(payout_raw) else 0.0
     spearman_sharpe = float(np.round(sharpe_ratio(spearman_era_corrs), 4))
     numerai_sharpe = float(np.round(sharpe_ratio(numerai_era_corrs), 4))
+    validation_psr = float(np.round(compute_probabilistic_sharpe_ratio(numerai_era_corrs, benchmark_sr=0.0), 4))
+    lo_info = compute_lo_adjusted_sharpe(numerai_era_corrs)
+    lo_sharpe = float(np.round(lo_info["sr_lo"], 4))
+    min_trl = compute_min_track_record_length(numerai_era_corrs, benchmark_sr=0.0, confidence=0.95)
+    min_trl_out = float(np.round(min_trl, 1)) if np.isfinite(min_trl) else float(np.inf)
+    hhi_info = compute_hhi_concentration(numerai_era_corrs)
+    tuw_info = compute_drawdown_and_tuw(numerai_era_corrs, is_returns=True)
     mae_val = float(np.round(mean_absolute_error(targets, preds), 4)) if len(targets) else 0.0
     forecast_bias = float(np.round(np.mean(targets - preds), 4)) if len(targets) else 0.0
     raw_lag1_acf = _safe_autocorr(numerai_era_corrs.to_numpy(dtype=np.float64), lag=1) if len(numerai_era_corrs) >= 3 else 0.0
@@ -1224,7 +1368,8 @@ def evaluate_numerai_predictions(
         jarque_bera_pvalue = 1.0
 
     if len(targets):
-        pred_center = 0.5 if (0.15 <= float(np.mean(preds)) <= 0.85) else float(np.mean(preds))
+        in_unit_scale = (float(np.nanmin(preds)) >= -0.05) and (float(np.nanmax(preds)) <= 1.05) and (0.15 <= float(np.mean(preds)) <= 0.85)
+        pred_center = 0.5 if in_unit_scale else float(np.nanmedian(preds))
         non_neutral_mask = np.abs(targets - 0.5) > 1e-9
         if np.any(non_neutral_mask):
             directional_hit_rate = float(
@@ -1237,6 +1382,8 @@ def evaluate_numerai_predictions(
 
     numerai_corr_pct = float(np.round(numerai_corr_mean * 100.0, 2))
     positive_era_pct = float(np.round(float(np.mean(corrs_arr > 0.0)) * 100.0, 2)) if len(corrs_arr) else 0.0
+    # Numerai Forum #1454 (Posts #5-#6): Era Consistency (% of eras with CORR > 0.002)
+    era_consistency_pct = float(np.round(float(np.mean(corrs_arr > 0.002)) * 100.0, 2)) if len(corrs_arr) else 0.0
     directional_accuracy_pct = float(np.round(directional_hit_rate * 100.0, 2))
 
     cumulative_corr = numerai_era_corrs.cumsum()
@@ -1249,11 +1396,37 @@ def evaluate_numerai_predictions(
     else:
         corr_drawdown = 0.0
 
-    feature_exposure = (
-        compute_feature_exposure(features_df, preds, feature_columns=feature_columns)
-        if (features_df is not None and (feature_columns is None or len(feature_columns) > 0))
-        else np.nan
-    )
+    max_feature_exposure = float(np.nan)
+    if features_df is not None and (feature_columns is None or len(feature_columns) > 0):
+        fe_mean, fe_per_era = compute_feature_exposure(
+            features_df, preds, feature_columns=feature_columns, eras=eras, return_per_era=True
+        )
+        feature_exposure = float(fe_mean)
+        if len(fe_per_era) > 0:
+            max_feature_exposure = float(np.round(float(fe_per_era.max()), 4))
+    else:
+        feature_exposure = float(np.nan)
+
+    # Feature Neutral Correlation (FNC): automatic on small/medium feature slices or whenever compute_fnc=True
+    fnc_mean = float(np.nan)
+    fnc_sharpe = float(np.nan)
+    fnc_era_corrs = pd.Series(dtype=np.float64)
+    if features_df is not None and (feature_columns is None or len(feature_columns) > 0):
+        n_cand_cols = len(feature_columns) if feature_columns is not None else len(features_df.columns)
+        auto_run_fnc = (compute_fnc is True) or (compute_fnc is None and len(preds) <= 250_000 and n_cand_cols <= 100)
+        if auto_run_fnc:
+            fnc_res = compute_per_era_fnc(
+                targets,
+                preds,
+                features_df,
+                eras=eras,
+                feature_columns=feature_columns,
+                proportion=1.0,
+                max_neutralize_features=100,
+            )
+            fnc_mean = float(fnc_res["fnc_mean"])
+            fnc_sharpe = float(fnc_res["fnc_sharpe"])
+            fnc_era_corrs = fnc_res["fnc_era_corrs"]
 
     if numerai_corr_mean > CORR_SANITY_HIGH_THRESHOLD:
         sanity_status = "LEAKAGE_WARNING"
@@ -1279,16 +1452,23 @@ def evaluate_numerai_predictions(
             print(f"--- {label} ---")
         print(
             f"Percentage Summary | Numerai CORR: {numerai_corr_pct:+.2f}% | "
-            f"Positive Eras: {positive_era_pct:.1f}% | Directional Accuracy: {directional_accuracy_pct:.1f}%"
+            f"Positive Eras: {positive_era_pct:.1f}% | Era Consistency (>0.002): {era_consistency_pct:.1f}% | "
+            f"Directional Accuracy: {directional_accuracy_pct:.1f}%"
         )
         print(f"Numerai CORR: {numerai_corr_mean:.4f}")
         print(f"Spearman Correlation: {spearman_mean:.4f}")
-        print(f"Average Payout: {payout_mean:.4f}")
-        print(f"Sharpe Ratio (Numerai / Spearman): {numerai_sharpe:.4f} / {spearman_sharpe:.4f}")
-        print(f"Cumulative CORR Drawdown (CORR pts): {corr_drawdown:.4f}")
+        print(f"Average Payout (Legacy Spearman Proxy): {payout_mean:.4f}")
+        print(
+            f"Sharpe Ratio (Numerai / Lo-Adj / Spearman): {numerai_sharpe:.4f} / {lo_sharpe:.4f} / {spearman_sharpe:.4f} | "
+            f"PSR (SR > 0): {validation_psr:.4f} | MinTRL: {min_trl_out} eras"
+        )
+        print(
+            f"Cumulative CORR Drawdown: {corr_drawdown:.4f} pts | Max TuW: {tuw_info['tuw_max_eras']} eras "
+            f"({tuw_info['tuw_max_years']:.2f} yr) | HHI (+ / -): {hhi_info['hhi_pos']:.4f} / {hhi_info['hhi_neg']:.4f}"
+        )
         print(f"Mean Absolute Error (MAE): {mae_val:.4f}")
         print(f"Forecast Bias (mean(y - y_hat)): {forecast_bias:.4f}")
-        print(f"Directional Hit Rate (vs 0.5): {directional_hit_rate:.4f} ({directional_accuracy_pct:.1f}%)")
+        print(f"Directional Hit Rate: {directional_hit_rate:.4f} ({directional_accuracy_pct:.1f}%)")
         print(
             f"Era CORR White-Noise & Regime Tests | Lag-1 ACF: {era_corr_lag1_acf:.4f} | "
             f"Ljung-Box p: {ljung_box_pvalue:.4f} | ARCH-LM p: {arch_lm_pvalue:.4f} | ADF p: {adf_pvalue:.4f}"
@@ -1298,18 +1478,29 @@ def evaluate_numerai_predictions(
             f"Jarque-Bera p: {jarque_bera_pvalue:.4f}"
         )
         if np.isfinite(feature_exposure):
-            print(f"Feature Exposure: {feature_exposure:.4f}")
+            fe_max_str = f" (max era: {max_feature_exposure:.4f})" if np.isfinite(max_feature_exposure) else ""
+            print(f"Feature Exposure (Per-Era Mean): {feature_exposure:.4f}{fe_max_str}")
+        if np.isfinite(fnc_mean):
+            print(f"Feature Neutral Correlation (FNC): {fnc_mean:.4f} (FNC Sharpe: {fnc_sharpe:.4f})")
         print(sanity_msg)
 
     return {
         "numerai_corr": numerai_corr_mean,
         "numerai_corr_pct": numerai_corr_pct,
         "positive_era_pct": positive_era_pct,
+        "era_consistency_pct": era_consistency_pct,
         "directional_accuracy_pct": directional_accuracy_pct,
         "spearman": spearman_mean,
         "payout": payout_mean,
+        "legacy_spearman_payout": payout_mean,
         "numerai_sharpe": numerai_sharpe,
+        "lo_sharpe": lo_sharpe,
         "spearman_sharpe": spearman_sharpe,
+        "validation_psr": validation_psr,
+        "min_trl": min_trl_out,
+        "tuw_max_eras": int(tuw_info["tuw_max_eras"]),
+        "hhi_pos": float(hhi_info["hhi_pos"]),
+        "hhi_neg": float(hhi_info["hhi_neg"]),
         "mae": mae_val,
         "forecast_bias": forecast_bias,
         "directional_hit_rate": directional_hit_rate,
@@ -1322,6 +1513,10 @@ def evaluate_numerai_predictions(
         "jarque_bera_pvalue": jarque_bera_pvalue,
         "corr_drawdown": corr_drawdown,
         "feature_exposure": feature_exposure,
+        "max_feature_exposure": max_feature_exposure,
+        "feature_neutral_corr": fnc_mean,
+        "fnc_sharpe": fnc_sharpe,
+        "fnc_era_corrs": fnc_era_corrs,
         "sanity_status": sanity_status,
         "numerai_era_corrs": numerai_era_corrs,
         "spearman_era_corrs": spearman_era_corrs,
@@ -1374,16 +1569,30 @@ def walk_forward_predict(
     window_mode: str = "expanding",
     target_horizon_eras: int = 4,
     era_stride: int = 1,
+    settlement_buffer_eras: int = 0,
+    balance_era_density: bool = True,
+    random_state: int = 42,
 ) -> np.ndarray:
-    """Chronological walk-forward holdout evaluation respecting `target_horizon_eras` settlement lag and `era_stride` subsampling of settled validation eras."""
+    """Chronological walk-forward holdout evaluation respecting `target_horizon_eras` settlement lag,
+    optional `settlement_buffer_eras`, era-density equalization, double-stride prevention, and causal
+    feature-only gap context for rolling/sequence predictors."""
     train_era_arr = np.asarray(train_eras, dtype=np.int32).ravel()
     val_era_arr = np.asarray(validation_eras, dtype=np.int32).ravel()
     unique_val_eras = np.array(sorted(np.unique(val_era_arr)), dtype=np.int32)
     step = max(1, int(step_eras))
     horizon = max(1, int(target_horizon_eras))
+    buf = max(0, int(settlement_buffer_eras))
     stride = max(1, int(era_stride))
     mode = str(window_mode or "expanding").strip().lower()
     train_era_span = int(np.max(train_era_arr) - np.min(train_era_arr)) if len(train_era_arr) else 52
+    rng = np.random.default_rng(int(random_state))
+
+    # Median rows per era in X_train to detect downsampling imbalance vs 100%-density validation eras
+    if len(train_era_arr) > 0:
+        _, tr_counts = np.unique(train_era_arr, return_counts=True)
+        median_train_era_rows = int(np.median(tr_counts))
+    else:
+        median_train_era_rows = 0
 
     y_train_s = pd.Series(np.asarray(y_train, dtype=np.float32).ravel(), index=X_train.index)
     y_val_s = pd.Series(np.asarray(y_validation, dtype=np.float32).ravel(), index=X_validation.index)
@@ -1392,7 +1601,7 @@ def walk_forward_predict(
     for start_idx in range(0, len(unique_val_eras), step):
         chunk_eras = unique_val_eras[start_idx : start_idx + step]
         forecast_origin_era = int(chunk_eras[0])
-        settled_cutoff_era = forecast_origin_era - horizon
+        settled_cutoff_era = forecast_origin_era - horizon - buf
         min_sliding_era = (settled_cutoff_era - max(1, train_era_span)) if mode == "sliding" else None
 
         train_mask = train_era_arr <= settled_cutoff_era
@@ -1411,7 +1620,25 @@ def walk_forward_predict(
         if not has_train and not has_val_settled:
             # No settled historical eras exist prior to `settled_cutoff_era` — never leak unsettled `X_train`
             continue
-        elif has_train and not has_val_settled:
+
+        val_fit_mask = np.isin(val_era_arr, settled_val_eras) if has_val_settled else np.zeros(len(val_era_arr), dtype=bool)
+        # Prevent 4x-100x era-density imbalance when X_train was downsampled while X_validation is 100% density
+        if balance_era_density and has_train and has_val_settled and median_train_era_rows > 0:
+            val_fit_indices = np.flatnonzero(val_fit_mask)
+            val_fit_eras_sub = val_era_arr[val_fit_indices]
+            _, vf_counts = np.unique(val_fit_eras_sub, return_counts=True)
+            if len(vf_counts) > 0 and float(np.median(vf_counts)) > 1.5 * float(median_train_era_rows):
+                balanced_mask = np.zeros(len(val_era_arr), dtype=bool)
+                for e_id in settled_val_eras:
+                    e_pos = np.flatnonzero(val_era_arr == e_id)
+                    if len(e_pos) > median_train_era_rows:
+                        pick = rng.choice(e_pos, size=median_train_era_rows, replace=False)
+                        balanced_mask[pick] = True
+                    else:
+                        balanced_mask[e_pos] = True
+                val_fit_mask = balanced_mask
+
+        if has_train and not has_val_settled:
             if bool(np.all(train_mask)):
                 X_fit = X_train
                 y_fit = y_train_s
@@ -1419,11 +1646,9 @@ def walk_forward_predict(
                 X_fit = X_train.loc[train_mask]
                 y_fit = y_train_s.loc[train_mask]
         elif not has_train and has_val_settled:
-            val_fit_mask = np.isin(val_era_arr, settled_val_eras)
             X_fit = X_validation.loc[val_fit_mask]
             y_fit = y_val_s.loc[val_fit_mask]
         else:
-            val_fit_mask = np.isin(val_era_arr, settled_val_eras)
             X_tr_part = X_train if bool(np.all(train_mask)) else X_train.loc[train_mask]
             y_tr_part = y_train_s if bool(np.all(train_mask)) else y_train_s.loc[train_mask]
             X_fit = pd.concat([X_tr_part, X_validation.loc[val_fit_mask]], axis=0, ignore_index=True)
@@ -1439,14 +1664,36 @@ def walk_forward_predict(
 
         step_model = clone(estimator)
         chunk_params = step_model.get_params(deep=True)
+        set_overrides: Dict[str, Any] = {}
         if "estimator__walk_forward_step_eras" in chunk_params:
-            step_model.set_params(estimator__walk_forward_step_eras=None)
+            set_overrides["estimator__walk_forward_step_eras"] = None
         elif "walk_forward_step_eras" in chunk_params:
-            step_model.set_params(walk_forward_step_eras=None)
+            set_overrides["walk_forward_step_eras"] = None
+        # Prevent double-striding inside step_model when walk_forward_predict already strided settled eras
+        if stride > 1:
+            if "estimator__era_stride" in chunk_params:
+                set_overrides["estimator__era_stride"] = 1
+            elif "era_stride" in chunk_params:
+                set_overrides["era_stride"] = 1
+        if set_overrides:
+            step_model.set_params(**set_overrides)
         step_model.fit(X_fit, y_fit)
 
         val_chunk_mask = np.isin(val_era_arr, chunk_eras)
-        wf_preds[val_chunk_mask] = step_model.predict(X_validation.loc[val_chunk_mask])
+        # Provide strictly causal feature-only warm-up context for eras in (settled_cutoff_era, forecast_origin_era)
+        # so rolling / MiniRocket sequence models don't suffer a cold-start across the settlement gap
+        gap_mask = (val_era_arr > settled_cutoff_era) & (val_era_arr < forecast_origin_era)
+        if bool(np.any(gap_mask)) and isinstance(X_validation, pd.DataFrame):
+            # Strip any target column from gap+chunk to guarantee zero target access during predict()
+            non_target_cols = [c for c in X_validation.columns if not str(c).startswith("target")]
+            X_gap = X_validation.loc[gap_mask, non_target_cols]
+            X_chunk = X_validation.loc[val_chunk_mask, non_target_cols]
+            X_pred_in = pd.concat([X_gap, X_chunk], axis=0, ignore_index=True)
+            chunk_preds_full = np.asarray(step_model.predict(X_pred_in), dtype=np.float64).ravel()
+            wf_preds[val_chunk_mask] = chunk_preds_full[len(X_gap) :]
+            del X_gap, X_chunk, X_pred_in
+        else:
+            wf_preds[val_chunk_mask] = step_model.predict(X_validation.loc[val_chunk_mask])
 
         del X_fit, y_fit, step_model
     return wf_preds
@@ -1594,8 +1841,11 @@ def build_experiment_setup(
         raise ValueError("search_mode must be 'grid' or 'bayes'")
     if clean_score_version not in VALID_SCORE_VERSIONS:
         raise ValueError(f"score_version must be one of {VALID_SCORE_VERSIONS}, got {score_version!r}")
-    if clean_cv != "timeseries":
-        raise ValueError("cv_strategy must be 'timeseries' (non-chronological CV strategies removed to prevent regime leakage)")
+    if clean_cv not in ("timeseries", "purged_kfold", "cpcv"):
+        raise ValueError(
+            "cv_strategy must be 'timeseries', 'purged_kfold', or 'cpcv' "
+            "(unpurged/non-temporal CV strategies rejected to prevent leakage)"
+        )
     if not (0.0 < cv_split_val < 1.0):
         raise ValueError(f"cv_split must be strictly in (0.0, 1.0), got {cv_split!r}")
     if clean_downsample_mode not in VALID_DOWNSAMPLE_MODES:
@@ -1608,8 +1858,10 @@ def build_experiment_setup(
         raise ValueError("eval_mode must be 'static', 'walk_forward', or 'both'")
     if clean_wf_win not in ("expanding", "sliding"):
         raise ValueError("walk_forward_window must be 'expanding' or 'sliding'")
-    if clean_weight not in (None, "equal_era", "recency_linear", "recency_exp"):
-        raise ValueError("era_weighting must be None, 'equal_era', 'recency_linear', or 'recency_exp'")
+    if clean_weight not in (None, "equal_era", "recency_linear", "recency_exp", "uniqueness", "uniqueness_decay"):
+        raise ValueError(
+            "era_weighting must be None, 'equal_era', 'recency_linear', 'recency_exp', 'uniqueness', or 'uniqueness_decay'"
+        )
 
     horizon = int(target_horizon_eras) if target_horizon_eras is not None else infer_target_horizon_eras(target_col)
     embargo = int(np.ceil(horizon / max(1, int(era_stride))))
@@ -1655,6 +1907,12 @@ def build_experiment_setup(
         f"cv_strategy={clean_cv} (cv_split={cv_split_val}) | ERA_COL={era_col} | TARGET_COL={target_col} | "
         f"horizon={horizon} | embargo={embargo}{ds_str}"
     )
+    if int(era_stride) < horizon:
+        print(
+            f"[Overlap Notice] TARGET_COL='{target_col}' has horizon={horizon} eras while "
+            f"era_stride={int(era_stride)} (~{horizon / max(1, int(era_stride)):.1f}x label overlap). "
+            f"Consider era_stride={horizon} or era_weighting='uniqueness'."
+        )
 
     cfg: Dict[str, Any] = {
         "data_version": data_version,
@@ -1970,25 +2228,43 @@ def candidate_score(
         if len(fold_mmcs) == 0:
             fold_mmcs = None
 
-    score_val, effective_version, mmc_fallback = compute_versioned_candidate_score(
-        era_corrs,
-        era_mmcs=fold_mmcs,
-        score_version=score_version,
-    )
-
-    mean_corr = float(era_corrs.mean()) if len(era_corrs) else 0.0
-    mean_corr = mean_corr if np.isfinite(mean_corr) else 0.0
-    std_corr = float(era_corrs.std(ddof=1)) if len(era_corrs) >= 2 else 0.0
-    std_corr = std_corr if np.isfinite(std_corr) else 0.0
-    spearman_mean = float(spearman_era_corrs.mean()) if len(spearman_era_corrs) else 0.0
-    spearman_mean = spearman_mean if np.isfinite(spearman_mean) else 0.0
-    sharpe_val = float(sharpe_ratio(era_corrs))
-    pos_era_pct = float(np.mean(era_corrs.to_numpy(dtype=np.float64) > 0.0) * 100.0) if len(era_corrs) else 0.0
+    era_corrs_arr = era_corrs.to_numpy(dtype=np.float64) if len(era_corrs) else np.empty(0, dtype=np.float64)
+    all_zero_era_corrs = bool(len(era_corrs_arr) == 0 or float(np.max(np.abs(era_corrs_arr))) <= 1e-12)
+    is_const_pred = bool(_is_constant_1d(preds) or all_zero_era_corrs)
+    if is_const_pred:
+        _, effective_version, mmc_fallback = compute_versioned_candidate_score(
+            era_corrs,
+            era_mmcs=fold_mmcs,
+            score_version=score_version,
+        )
+        score_val = -1.0
+        mean_corr = 0.0
+        std_corr = 0.0
+        spearman_mean = 0.0
+        sharpe_val = 0.0
+        pos_era_pct = 0.0
+        era_consistency_pct = 0.0
+    else:
+        score_val, effective_version, mmc_fallback = compute_versioned_candidate_score(
+            era_corrs,
+            era_mmcs=fold_mmcs,
+            score_version=score_version,
+        )
+        mean_corr = float(era_corrs.mean()) if len(era_corrs) else 0.0
+        mean_corr = mean_corr if np.isfinite(mean_corr) else 0.0
+        std_corr = float(era_corrs.std(ddof=1)) if len(era_corrs) >= 2 else 0.0
+        std_corr = std_corr if np.isfinite(std_corr) else 0.0
+        spearman_mean = float(spearman_era_corrs.mean()) if len(spearman_era_corrs) else 0.0
+        spearman_mean = spearman_mean if np.isfinite(spearman_mean) else 0.0
+        sharpe_val = float(sharpe_ratio(era_corrs))
+        pos_era_pct = float(np.mean(era_corrs.to_numpy(dtype=np.float64) > 0.0) * 100.0) if len(era_corrs) else 0.0
+        era_consistency_pct = float(np.mean(era_corrs.to_numpy(dtype=np.float64) > 0.002) * 100.0) if len(era_corrs) else 0.0
 
     if len(targets):
         mae_val = float(mean_absolute_error(targets, preds))
         bias_val = float(np.mean(targets - preds))
-        pred_center = 0.5 if (0.15 <= float(np.mean(preds)) <= 0.85) else float(np.mean(preds))
+        in_unit_scale = (float(np.nanmin(preds)) >= -0.05) and (float(np.nanmax(preds)) <= 1.05) and (0.15 <= float(np.mean(preds)) <= 0.85)
+        pred_center = 0.5 if in_unit_scale else float(np.nanmedian(preds))
         non_neutral = np.abs(targets - 0.5) > 1e-9
         dir_acc_pct = (
             float(np.mean(np.sign(targets[non_neutral] - 0.5) == np.sign(preds[non_neutral] - pred_center)) * 100.0)
@@ -2016,10 +2292,12 @@ def candidate_score(
         "score_version": effective_version,
         "requested_score_version": str(score_version or "v0_default").strip().lower(),
         "mmc_missing_fallback": bool(mmc_fallback),
+        "is_constant_pred": bool(is_const_pred),
         "score_value": float(score_val),
         "numerai_corr": mean_corr,
         "era_corr_std": std_corr,
         "positive_era_pct": pos_era_pct,
+        "era_consistency_pct": era_consistency_pct,
         "directional_accuracy_pct": dir_acc_pct,
         "sharpe": sharpe_val,
         "spearman": spearman_mean,
@@ -2030,8 +2308,9 @@ def candidate_score(
         **bin_shares,
     })
 
+    const_tag = " [CONSTANT PRED PENALIZED -> -1.0000]" if is_const_pred else ""
     print(
-        f"  [Fold Score | {effective_version}] Score: {score_val:.4f} | "
+        f"  [Fold Score | {effective_version}] Score: {score_val:.4f}{const_tag} | "
         f"Numerai CORR: {mean_corr * 100.0:+.2f}% ({mean_corr:.4f}, std={std_corr:.4f}) | "
         f"Sharpe: {sharpe_val:.2f} | CORR DD: {corr_dd:.4f} | Positive Eras: {pos_era_pct:.1f}% | "
         f"Dir Acc: {dir_acc_pct:.1f}% | MAE: {mae_val:.4f}"
@@ -2184,8 +2463,38 @@ def compute_per_era_mmc(
 
 R1393_START_ERA = 1393
 R1399_START_ERA = 1399
+R1393_START_DATE = pd.Timestamp("2026-11-06")
+R1399_START_DATE = pd.Timestamp("2026-11-14")
 CLASSIC_CONCURRENT_ROUNDS = 64
 CLASSIC_SETTLEMENT_ROUNDS = 12
+
+
+def _resolve_era_timestamps(
+    idx: pd.Index,
+    era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
+) -> Optional[pd.DatetimeIndex]:
+    """Align optional calendar dates (Mapping/Series `era -> date`, or DatetimeIndex) onto `idx`."""
+    if era_dates is not None:
+        if isinstance(era_dates, Mapping):
+            mapped = pd.Index([era_dates.get(k, pd.NaT) for k in idx])
+            ts = pd.to_datetime(mapped, errors="coerce")
+        else:
+            s = pd.Series(era_dates)
+            if len(s) == len(idx) and s.index.equals(idx):
+                ts = pd.to_datetime(s, errors="coerce")
+            else:
+                aligned = s.reindex(idx)
+                ts = pd.to_datetime(aligned, errors="coerce")
+        if bool(pd.notna(ts).any()):
+            return pd.DatetimeIndex(ts)
+    if isinstance(idx, pd.DatetimeIndex):
+        return idx
+    # Detect ISO date-string indices (never coerce small integers as epoch nanoseconds!)
+    if not pd.api.types.is_numeric_dtype(idx):
+        parsed = pd.to_datetime(idx, errors="coerce")
+        if bool(pd.notna(parsed).any()) and int(parsed.dropna().year.min()) >= 1990:
+            return pd.DatetimeIndex(parsed)
+    return None
 
 
 def _parse_era_numbers(era_index: pd.Index) -> np.ndarray:
@@ -2240,18 +2549,19 @@ def _compute_clipped_era_returns(
     payout_rule: str = "auto",
     stride: int = 1,
     corr_multiplier: Optional[float] = None,
+    era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
 ) -> Tuple[pd.Series, Dict[str, Any]]:
-    """Compute chronologically sorted per-round Numerai Classic payout returns using era-accurate rules.
+    """Compute chronologically sorted per-round Numerai Classic payout returns using era- and date-accurate rules.
 
     Official rules (`payout_rule='auto'`):
-    - Pre-round 1393 (`era < 1393`): `clip(3 * CORR60 + 15 * MMC60, -1.0, +1.0)`.
-    - Round 1393+ (`era >= 1393`): `clip(payout_factor * (8 * NCORR + 32 * NMMC), -1.0, +2.0)` with `payout_factor=1.0`.
-    - Round 1399+ (`era >= 1399`): if `neutral_churn` is provided, positive payouts are multiplied by
-      `min(1, 2 / (1 + exp(10 * (mean_neutral_churn - 0.1))))` after multipliers and clipping; burns stay unchanged.
-      Rounds 1393–1398 have no churn penalty.
+    - Pre-round 1393 (`era < 1393` and `date < 2026-11-06`): `clip(3 * CORR60 + 15 * MMC60, -1.0, +1.0)`.
+    - Round 1393+ (`era >= 1393` OR `date >= 2026-11-06`): `clip(payout_factor * (8 * NCORR + 32 * NMMC), -1.0, +2.0)`.
+    - Round 1399+ (`era >= 1399` OR `date >= 2026-11-14`): if `neutral_churn` is provided, positive payouts are
+      multiplied by `min(1, 2 / (1 + exp(10 * (mean_neutral_churn - 0.1))))` after multipliers and clipping;
+      burns stay unchanged. Rounds 1393–1398 have no churn penalty.
 
-    Honesty rule: never pretends CORR is NCORR, never pretends missing MMC is zero, and never labels
-    BMC proxy (computed against benchmark/example predictions) as true MMC.
+    Supports both official round indices (e.g. 1393+) AND remapped v6.0 sequential eras (`1..N`) when
+    `era_dates` (era -> calendar date mapping/Series) is provided.
     """
     use_diagnostics = per_era_ncorr is not None and len(per_era_ncorr) > 0
     primary_corr = per_era_ncorr if use_diagnostics else per_era_corr
@@ -2279,18 +2589,30 @@ def _compute_clipped_era_returns(
     idx = corr_series.index
     n_eras = len(idx)
     era_nums = _parse_era_numbers(idx)
+    resolved_ts = _resolve_era_timestamps(idx, era_dates=era_dates)
     clean_rule = str(payout_rule or "auto").strip().lower()
     if clean_rule not in ("auto", "pre_1393", "r1393"):
         raise ValueError(f"payout_rule must be 'auto', 'pre_1393', or 'r1393', got {payout_rule!r}")
+
+    date_is_r1393 = (
+        np.asarray(pd.notna(resolved_ts) & (resolved_ts >= R1393_START_DATE), dtype=bool)
+        if resolved_ts is not None
+        else np.zeros(n_eras, dtype=bool)
+    )
+    date_is_r1399 = (
+        np.asarray(pd.notna(resolved_ts) & (resolved_ts >= R1399_START_DATE), dtype=bool)
+        if resolved_ts is not None
+        else np.zeros(n_eras, dtype=bool)
+    )
 
     if clean_rule == "pre_1393":
         is_r1393_mask = np.zeros(n_eras, dtype=bool)
     elif clean_rule == "r1393":
         is_r1393_mask = np.ones(n_eras, dtype=bool)
     else:
-        is_r1393_mask = np.isfinite(era_nums) & (era_nums >= float(R1393_START_ERA))
+        is_r1393_mask = (np.isfinite(era_nums) & (era_nums >= float(R1393_START_ERA))) | date_is_r1393
 
-    is_r1399_mask = np.isfinite(era_nums) & (era_nums >= float(R1399_START_ERA))
+    is_r1399_mask = (np.isfinite(era_nums) & (era_nums >= float(R1399_START_ERA))) | date_is_r1399
 
     # Multipliers and official clips per era
     eff_corr_override = float(corr_multiplier) if corr_multiplier is not None else (
@@ -2509,15 +2831,25 @@ def _simulate_single_wallet_path(
         locked_after = sum(pos[2] for pos in open_positions)
         equity_path[t] = 0.0 if wiped_out else max(0.0, free_cash + locked_after)
 
-    # 3. Settle all remaining open positions chronologically so final balance reflects all opened rounds
+    # 3. Settle remaining open positions step-by-step chronologically so intermediate unwind drawdowns
+    #    are faithfully tracked (no artificial lump-sum masking at the end of the validation period)
+    unwind_equities: List[float] = []
     if not wiped_out and open_positions:
         open_positions.sort(key=lambda item: item[0])
+        remaining_locked = sum(pos[2] for pos in open_positions)
         for _, o_step, pos_stake, pos_ret in open_positions:
             payout = max(0.0, pos_stake * (1.0 + pos_ret))
             free_cash += payout
+            remaining_locked -= pos_stake
             round_pnls[o_step] = payout - pos_stake
+            step_eq = max(0.0, free_cash + max(0.0, remaining_locked))
+            if step_eq <= 1e-12:
+                wiped_out = True
+                free_cash = 0.0
+                step_eq = 0.0
+            unwind_equities.append(step_eq)
         open_positions.clear()
-        final_eq = max(0.0, free_cash)
+        final_eq = 0.0 if wiped_out else max(0.0, free_cash)
         if final_eq <= 1e-12:
             wiped_out = True
             final_eq = 0.0
@@ -2531,9 +2863,17 @@ def _simulate_single_wallet_path(
     equity_path = np.where(ruin_mask, 0.0, equity_path)
     wiped_out = bool(wiped_out or bool(ruin_mask[-1]))
 
-    # Money drawdown: (lowest - peak) / peak * 100, always in [-100, 0]
-    running_peak = np.maximum.accumulate(np.maximum(init_cap, equity_path))
-    dd_val = equity_path - running_peak
+    # Track true money drawdown including intermediate terminal unwind steps (always in [-100, 0])
+    full_eval_path = (
+        np.concatenate([equity_path[:-1], np.asarray(unwind_equities, dtype=np.float64)])
+        if unwind_equities and not bool(ruin_mask[-1])
+        else equity_path
+    )
+    full_eval_path = np.maximum(0.0, full_eval_path)
+    full_ruin = np.maximum.accumulate(full_eval_path <= 1e-12)
+    full_eval_path = np.where(full_ruin, 0.0, full_eval_path)
+    running_peak = np.maximum.accumulate(np.maximum(init_cap, full_eval_path))
+    dd_val = full_eval_path - running_peak
     dd_pct = np.where(running_peak > 0.0, (dd_val / running_peak) * 100.0, 0.0)
     dd_pct = np.clip(dd_pct, -100.0, 0.0)
 
@@ -2683,18 +3023,20 @@ def simulate_stake_pnl(
     nmr_gbp_rate: Optional[float] = None,
     nmr_gbp_prices: Optional[pd.Series] = None,
     corr_multiplier: Optional[float] = None,
+    era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
 ) -> Dict[str, Any]:
     """One-wallet Numerai Classic overlapping-rounds staking simulator (no window resets, no margin).
 
     - Starts with one wallet at `total_capital` (default £1,000, or `initial_stake` alias).
-    - Sizes each weekly round at `TVL / R` (`R = 64` concurrent rounds for Classic); locked capital
-      stays locked for `settlement_rounds` (~60 trading days = 12 weekly eras) and cannot be reused.
-    - Uses era-accurate Numerai Classic rules (`payout_rule='auto'`):
-        * Pre-1393: `3 * CORR60 + 15 * MMC60`, clipped `[-100%, +100%]`.
-        * R1393+: `8 * NCORR + 32 * NMMC`, clipped `[-100%, +200%]`, `payout_factor=1.0`.
-        * R1399+: neutral churn retention `min(1, 2 / (1 + exp(10 * (churn - 0.1))))` on positive payouts only.
-    - Keeps NMR and GBP separate: simulates staking in NMR, then converts to GBP via `nmr_gbp_prices`
-      or `nmr_gbp_rate` (or labels constant-FX GBP-equivalent if no FX series/rate is supplied).
+    - Sizes each weekly round at `TVL / R` (`R = 64` concurrent rounds for Classic, or `R = 12` for
+      100% weekly capital utilization via `simulate_live_staking_scenarios`); locked capital stays
+      locked for `settlement_rounds` (~60 trading days = 12 weekly eras) and cannot be reused.
+    - Uses era- and date-accurate Numerai Classic rules (`payout_rule='auto'`, passing `era_dates` for v6.0):
+        * Pre-1393 (`< 2026-11-06`): `3 * CORR60 + 15 * MMC60`, clipped `[-100%, +100%]`.
+        * R1393+ (`>= 2026-11-06`): `8 * NCORR + 32 * NMMC`, clipped `[-100%, +200%]`.
+        * R1399+ (`>= 2026-11-14`): neutral churn retention `min(1, 2 / (1 + exp(10 * (churn - 0.1))))` on positive payouts only.
+    - Keeps NMR and GBP separate: simulates staking in NMR, marks equity to market via `nmr_gbp_prices`
+      and converts realized round PnL using settlement-week FX (`t + settlement_rounds`).
     - Equity can never go below 0; `money_drawdown_pct` is always in `[-100, 0]`.
     """
     start_cap_gbp = max(0.0, float(total_capital if total_capital is not None else initial_stake))
@@ -2718,6 +3060,7 @@ def simulate_stake_pnl(
         payout_rule=payout_rule,
         stride=stride,
         corr_multiplier=corr_multiplier,
+        era_dates=era_dates,
     )
 
     if len(era_returns) == 0:
@@ -2785,7 +3128,7 @@ def simulate_stake_pnl(
         fx_arr = np.ones(len(idx), dtype=np.float64)
         fx_status = "no NMR/GBP FX series provided (constant-FX GBP-equivalent)"
 
-    eq_nmr, round_pnls_nmr, _, max_dd_nmr, worst_round_nmr, wiped_out = _simulate_single_wallet_path(
+    eq_nmr, round_pnls_nmr, nmr_dd_pct, max_dd_nmr, worst_round_nmr, wiped_out = _simulate_single_wallet_path(
         ret_arr,
         start_nmr,
         staking_mode=clean_mode,
@@ -2794,9 +3137,12 @@ def simulate_stake_pnl(
     )
 
     eq_gbp = np.maximum(0.0, eq_nmr * fx_arr)
-    round_pnls_gbp = round_pnls_nmr * fx_arr
+    # Convert realized round PnL at settlement-week FX (t + settlement_rounds) rather than open-week FX
+    settle_lag = max(1, int(settlement_rounds))
+    settle_fx_idx = np.minimum(len(fx_arr) - 1, np.arange(len(fx_arr), dtype=np.int64) + settle_lag)
+    round_pnls_gbp = round_pnls_nmr * fx_arr[settle_fx_idx]
 
-    # Wallet drawdown in GBP (always in [-100, 0])
+    # Wallet drawdown in GBP (always in [-100, 0]; incorporate unwind drawdown when FX is constant)
     running_peak_gbp = np.maximum.accumulate(np.maximum(start_cap_gbp, eq_gbp))
     dd_gbp_arr = eq_gbp - running_peak_gbp
     dd_pct_arr = np.where(running_peak_gbp > 0.0, (dd_gbp_arr / running_peak_gbp) * 100.0, 0.0)
@@ -2805,8 +3151,9 @@ def simulate_stake_pnl(
     end_cap_gbp = float(eq_gbp[-1])
     total_profit_gbp = end_cap_gbp - start_cap_gbp
     total_return_pct = (total_profit_gbp / start_cap_gbp) * 100.0 if start_cap_gbp > 1e-12 else 0.0
-    money_dd_pct = float(dd_pct_arr.min())
-    max_dd_gbp = float(dd_gbp_arr.min())
+    const_fx = bool(np.allclose(fx_arr, fx_arr[0]))
+    money_dd_pct = float(min(float(dd_pct_arr.min()), float(nmr_dd_pct))) if const_fx else float(dd_pct_arr.min())
+    max_dd_gbp = float(min(float(dd_gbp_arr.min()), float(max_dd_nmr * fx_arr[0]))) if const_fx else float(dd_gbp_arr.min())
     worst_round_gbp = float(round_pnls_gbp.min())
 
     end_nmr = float(eq_nmr[-1])
@@ -2868,16 +3215,16 @@ def simulate_stake_pnl_monte_carlo(
     staking_mode: str = "compound",
     stride: int = 1,
     n_sims: int = 500,
-    block_size: int = 4,
+    block_size: int = 12,
     random_state: int = 42,
     title: str = "Model",
+    era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
 ) -> Dict[str, Any]:
-    """One-wallet block-bootstrap Monte Carlo simulator under Numerai Classic overlapping-rounds staking.
+    """One-wallet circular block-bootstrap Monte Carlo simulator under Numerai Classic overlapping-rounds staking.
 
-    Resamples blocks of per-round returns over the full validation horizon and simulates one continuous
-    wallet per path (TVL / 64 per round, no resets, no margin, equity >= 0). Also captures one example
-    losing path and one example winning path (with peak, trough, drawdown, and final markers) plus
-    plain-English verdict and drawdown explanations.
+    Uses circular block resampling (`block_size=12` default matching 60D target overlap so boundary eras
+    are sampled with equal probability and autocorrelation structure is preserved) and simulates one continuous
+    wallet per path (no resets, no margin, equity >= 0).
     """
     start_cap = max(0.0, float(total_capital if total_capital is not None else initial_stake))
     clean_mode = str(staking_mode or "compound").strip().lower()
@@ -2899,6 +3246,7 @@ def simulate_stake_pnl_monte_carlo(
         churn_penalty=churn_penalty,
         payout_rule=payout_rule,
         stride=stride,
+        era_dates=era_dates,
     )
     if len(era_returns) == 0:
         report = _build_mc_plain_english_report(
@@ -2940,9 +3288,10 @@ def simulate_stake_pnl_monte_carlo(
     n_blocks = int(np.ceil(float(n_t) / float(b_size)))
     rng = np.random.default_rng(int(random_state))
 
-    starts = rng.integers(0, max(1, n_t - b_size + 1), size=(n_s, n_blocks))
+    # Circular block bootstrap so first/last eras have exact uniform sampling probability 1/n_t
+    starts = rng.integers(0, n_t, size=(n_s, n_blocks))
     offsets = np.arange(b_size, dtype=np.int64)[None, None, :]
-    boot_idx = (starts[:, :, None] + offsets).reshape(n_s, -1)[:, :n_t]
+    boot_idx = ((starts[:, :, None] + offsets) % n_t).reshape(n_s, -1)[:, :n_t]
     sim_rets = ret_arr[boot_idx]
 
     final_wallets = np.zeros(n_s, dtype=np.float64)
@@ -2989,7 +3338,7 @@ def simulate_stake_pnl_monte_carlo(
     med_val = float(np.percentile(final_wallets, 50.0))
     mean_val = float(np.mean(final_wallets))
     p95_val = float(np.percentile(final_wallets, 95.0))
-    prob_profit = float(np.mean(final_wallets > start_cap) * 100.0)
+    prob_profit = float(np.mean(final_wallets > start_cap + 1e-9) * 100.0)
     prob_ruin = float(np.mean(ruin_flags) * 100.0)
     p95_dd = float(np.percentile(worst_dds_pct, 5.0))
 
@@ -3039,6 +3388,7 @@ def plot_stake_pnl_dashboard(
     per_era_ncorr: Optional[pd.Series] = None,
     per_era_nmmc: Optional[pd.Series] = None,
     mmc_is_proxy: bool = False,
+    conservative_pnl: Optional[Dict[str, Any]] = None,
     title: str = "Model",
     total_capital: Optional[float] = None,
     initial_stake: float = 1000.0,
@@ -3056,9 +3406,10 @@ def plot_stake_pnl_dashboard(
     stride: int = 1,
     nmr_gbp_rate: Optional[float] = None,
     nmr_gbp_prices: Optional[pd.Series] = None,
+    era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
     save_path: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Plot a clean ONE-WALLET staking equity curve over the full validation period (clearly labeled by basis & compounding mode)."""
+    """Plot a clean ONE-WALLET staking equity curve over the full validation period (optionally overlaying Conservative Floor)."""
     import matplotlib.pyplot as plt
 
     pnl = simulate_stake_pnl(
@@ -3083,6 +3434,7 @@ def plot_stake_pnl_dashboard(
         stride=stride,
         nmr_gbp_rate=nmr_gbp_rate,
         nmr_gbp_prices=nmr_gbp_prices,
+        era_dates=era_dates,
     )
     eq_series = pnl["equity_curve"]
     if not isinstance(eq_series, pd.Series) or len(eq_series) == 0:
@@ -3102,7 +3454,24 @@ def plot_stake_pnl_dashboard(
     y_vals = eq_series.to_numpy(dtype=np.float64)
     line_color = "#059669" if end_cap >= start_cap else "#dc2626"
 
-    ax.plot(x_vals, y_vals, color=line_color, linewidth=2.2, label=f"One Wallet ({mode_label}, £)")
+    has_cons = (
+        isinstance(conservative_pnl, dict)
+        and isinstance(conservative_pnl.get("equity_curve"), pd.Series)
+        and len(conservative_pnl["equity_curve"]) > 0
+    )
+    primary_label = f"Realistic Live ({mode_label}, £)" if has_cons else f"One Wallet ({mode_label}, £)"
+    ax.plot(x_vals, y_vals, color=line_color, linewidth=2.3, label=primary_label)
+    if has_cons and conservative_pnl is not None:
+        cons_eq = conservative_pnl["equity_curve"]
+        ax.plot(
+            cons_eq.index.to_numpy(),
+            cons_eq.to_numpy(dtype=np.float64),
+            color="#2563eb",
+            linestyle="-.",
+            linewidth=2.0,
+            alpha=0.9,
+            label="Conservative Floor (CORR only, £)",
+        )
     ax.axhline(start_cap, color="#64748b", linestyle="--", linewidth=1.2, alpha=0.85, label=f"Start (£{start_cap:,.0f})")
     ax.set_ylim(bottom=0.0)
     ax.set_xlabel("Time (Validation Era / Week)")
@@ -3112,11 +3481,25 @@ def plot_stake_pnl_dashboard(
     ax.spines["right"].set_visible(False)
     ax.legend(loc="upper left", frameon=True, facecolor="white", framealpha=0.92, fontsize=9.2)
 
-    headline_text = (
-        f"Start: £{start_cap:,.0f}     |     "
-        f"End: £{end_cap:,.2f} ({pnl['total_return_pct']:+.2f}%)     |     "
-        f"Worst peak-to-trough dip: {dd_pct:.2f}% (£{dd_gbp:,.2f})"
-    )
+    if has_cons and conservative_pnl is not None:
+        c_end = float(conservative_pnl["end_capital"])
+        c_ret = float(conservative_pnl["total_return_pct"])
+        c_dd = float(conservative_pnl["money_drawdown_pct"])
+        headline_text = (
+            f"Realistic Live: £{start_cap:,.0f} -> £{end_cap:,.2f} ({pnl['total_return_pct']:+.2f}%) | Dip: {dd_pct:.2f}% (£{dd_gbp:,.2f})\n"
+            f"Conservative Floor (CORR only): £{start_cap:,.0f} -> £{c_end:,.2f} ({c_ret:+.2f}%) | Dip: {c_dd:.2f}%"
+        )
+        headline_fs = 10.5
+        rect_top = 0.835
+    else:
+        headline_text = (
+            f"Start: £{start_cap:,.0f}     |     "
+            f"End: £{end_cap:,.2f} ({pnl['total_return_pct']:+.2f}%)     |     "
+            f"Worst peak-to-trough dip: {dd_pct:.2f}% (£{dd_gbp:,.2f})"
+        )
+        headline_fs = 12.0
+        rect_top = 0.865
+
     fig.suptitle(
         f"One-Wallet Staking ({mode_label}) — {title}  [{pnl['score_basis']}]",
         fontsize=13.0,
@@ -3125,19 +3508,20 @@ def plot_stake_pnl_dashboard(
     )
     fig.text(
         0.5,
-        0.925,
+        0.93,
         headline_text,
         ha="center",
         va="top",
-        fontsize=12.0,
+        fontsize=headline_fs,
         fontweight="bold",
         color="#0f172a",
         bbox={"boxstyle": "round,pad=0.38", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
     )
+    pf_label = f"{float(payout_factor):g}" if not isinstance(payout_factor, pd.Series) else "series"
     fig.text(
         0.5,
         0.02,
-        f"Basis: {pnl['score_basis']} | Worst single round: £{worst_round:+,.2f} | "
+        f"Basis: {pnl['score_basis']} | PF={pf_label} | Worst single round: £{worst_round:+,.2f} | "
         f"Stake: TVL/{concurrent_rounds} (£{pnl['per_round_stake_initial']:.2f} initial, {settlement_rounds}-era lock, {mode_label}) | "
         f"{pnl['payout_rule_summary']} | FX: {pnl['fx_status']}",
         ha="center",
@@ -3145,7 +3529,7 @@ def plot_stake_pnl_dashboard(
         fontsize=8.4,
         color="#475569",
     )
-    plt.tight_layout(rect=(0.0, 0.055, 1.0, 0.865))
+    plt.tight_layout(rect=(0.0, 0.055, 1.0, rect_top))
     if save_path is not None:
         out_path = Path(save_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3177,8 +3561,9 @@ def plot_stake_pnl_monte_carlo(
     staking_mode: str = "compound",
     stride: int = 1,
     n_sims: int = 500,
-    block_size: int = 4,
+    block_size: int = 12,
     random_state: int = 42,
+    era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
     save_path: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Plot a plain-English 2-panel ONE-WALLET Monte Carlo risk chart with a verdict-first banner and example paths."""
@@ -3208,6 +3593,7 @@ def plot_stake_pnl_monte_carlo(
         block_size=block_size,
         random_state=random_state,
         title=title,
+        era_dates=era_dates,
     )
     finals = np.asarray(mc["final_stakes"], dtype=np.float64)
     if len(finals) == 0:
@@ -3396,11 +3782,20 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
         [col for col in df.columns if col.startswith("split") and col.endswith("_test_score")],
         key=lambda c: int(c[len("split") : c.index("_test_score")]),
     )
+    trials_era_corrs_map: Dict[int, pd.Series] = {}
     if _CV_FOLD_METRIC_LOG and split_cols:
+        expected_entries = len(df) * len(split_cols)
+        if len(_CV_FOLD_METRIC_LOG) < expected_entries:
+            print(
+                f"  [CV Metric Log Notice] Captured {len(_CV_FOLD_METRIC_LOG)}/{expected_entries} fold records "
+                "(multi-process n_jobs != 1 does not share in-memory _CV_FOLD_METRIC_LOG across workers; "
+                "use n_jobs=1 for complete per-trial OOF matrices)."
+            )
         metric_specs = (
             ("mean_numerai_corr", "numerai_corr", 4),
             ("mean_era_corr_std", "era_corr_std", 4),
             ("mean_positive_era_pct", "positive_era_pct", 2),
+            ("mean_era_consistency_pct", "era_consistency_pct", 2),
             ("mean_directional_accuracy_pct", "directional_accuracy_pct", 2),
             ("mean_accurate_pct", "accurate_pct", 2),
             ("mean_underforecast_pct", "underforecast_pct", 2),
@@ -3456,6 +3851,7 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
             if fold_era_corrs:
                 stitched_oof = pd.concat(fold_era_corrs).sort_index()
                 stitched_oof = stitched_oof.loc[~stitched_oof.index.duplicated(keep="last")]
+                trials_era_corrs_map[row_idx] = stitched_oof
                 oof_pnl = simulate_stake_pnl(stitched_oof)
                 for k in pnl_scalar_keys:
                     pnl_cols[k].append(round(float(oof_pnl[k]), 2))
@@ -3480,6 +3876,9 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
     df.insert(0, "candidate_id", np.arange(len(df), dtype=int))
     if "rank_test_score" in df.columns:
         df = df.sort_values("rank_test_score", kind="stable").reset_index(drop=True)
+    if trials_era_corrs_map:
+        trials_df = pd.DataFrame({f"trial_{cid}": s for cid, s in sorted(trials_era_corrs_map.items())}).sort_index()
+        df.attrs["trials_era_corrs_df"] = trials_df
     return df
 
 
@@ -4076,3 +4475,150 @@ def run_numereval_diagnostics(
             "(informational alongside official numerai_tools v6.0 metrics; NOT official v6.0 NCORR/NMMC):"
         )
     return metrics_df
+
+
+def simulate_live_staking_scenarios(
+    per_era_corr: pd.Series,
+    *,
+    per_era_mmc: Optional[pd.Series] = None,
+    mmc_is_proxy: bool = True,
+    total_capital: float = 1000.0,
+    settlement_rounds: int = 12,
+    weekly_concurrent_rounds: int = 12,
+    conservative_payout_factor: float = 0.5,
+    live_payout_factor: float = 0.5,
+    bmc_proxy_haircut: float = 0.5,
+    n_sims: int = 500,
+    block_size: int = 12,
+    random_state: int = 42,
+    title: str = "Model",
+    era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
+) -> Dict[str, Any]:
+    """Run dual-scenario realistic live staking simulations (Conservative Floor vs. Realistic Live Estimate).
+
+    1. `conservative_floor`: CORR only (`per_era_mmc=None`), `payout_factor=conservative_payout_factor` (default 0.5),
+       `concurrent_rounds=weekly_concurrent_rounds` (default 12 for 100% weekly capital utilization).
+    2. `realistic_live`: CORR + haircutted contribution (`per_era_mmc * bmc_proxy_haircut` when `mmc_is_proxy=True`,
+       or `1.0x` if true Meta Model), `payout_factor=live_payout_factor` (default 0.5), `concurrent_rounds=weekly_concurrent_rounds`.
+    3. `optimistic_raw_proxy`: Un-haircutted reference at `payout_factor=1.0` and `concurrent_rounds=64`.
+    """
+    eff_haircut = float(bmc_proxy_haircut) if bool(mmc_is_proxy) else 1.0
+    haircutted_mmc: Optional[pd.Series] = None
+    if per_era_mmc is not None and len(pd.Series(per_era_mmc).dropna()) > 0:
+        haircutted_mmc = pd.Series(per_era_mmc, dtype=np.float64) * eff_haircut
+        haircutted_mmc.name = "bmc_proxy" if bool(mmc_is_proxy) else "mmc"
+
+    cons_pnl = simulate_stake_pnl(
+        per_era_corr,
+        per_era_mmc=None,
+        mmc_is_proxy=False,
+        total_capital=total_capital,
+        concurrent_rounds=weekly_concurrent_rounds,
+        settlement_rounds=settlement_rounds,
+        payout_factor=conservative_payout_factor,
+        payout_rule="auto",
+        staking_mode="compound",
+        era_dates=era_dates,
+    )
+    cons_mc = simulate_stake_pnl_monte_carlo(
+        per_era_corr,
+        per_era_mmc=None,
+        mmc_is_proxy=False,
+        total_capital=total_capital,
+        concurrent_rounds=weekly_concurrent_rounds,
+        settlement_rounds=settlement_rounds,
+        payout_factor=conservative_payout_factor,
+        payout_rule="auto",
+        staking_mode="compound",
+        n_sims=n_sims,
+        block_size=block_size,
+        random_state=random_state,
+        title=f"{title} [Conservative Floor]",
+        era_dates=era_dates,
+    )
+
+    live_pnl = simulate_stake_pnl(
+        per_era_corr,
+        per_era_mmc=haircutted_mmc,
+        mmc_is_proxy=bool(mmc_is_proxy),
+        total_capital=total_capital,
+        concurrent_rounds=weekly_concurrent_rounds,
+        settlement_rounds=settlement_rounds,
+        payout_factor=live_payout_factor,
+        payout_rule="auto",
+        staking_mode="compound",
+        era_dates=era_dates,
+    )
+    live_mc = simulate_stake_pnl_monte_carlo(
+        per_era_corr,
+        per_era_mmc=haircutted_mmc,
+        mmc_is_proxy=bool(mmc_is_proxy),
+        total_capital=total_capital,
+        concurrent_rounds=weekly_concurrent_rounds,
+        settlement_rounds=settlement_rounds,
+        payout_factor=live_payout_factor,
+        payout_rule="auto",
+        staking_mode="compound",
+        n_sims=n_sims,
+        block_size=block_size,
+        random_state=random_state,
+        title=f"{title} [Realistic Live]",
+        era_dates=era_dates,
+    )
+
+    opt_pnl = simulate_stake_pnl(
+        per_era_corr,
+        per_era_mmc=per_era_mmc,
+        mmc_is_proxy=bool(mmc_is_proxy),
+        total_capital=total_capital,
+        concurrent_rounds=CLASSIC_CONCURRENT_ROUNDS,
+        settlement_rounds=settlement_rounds,
+        payout_factor=1.0,
+        payout_rule="auto",
+        staking_mode="compound",
+        era_dates=era_dates,
+    )
+
+    return {
+        "title": title,
+        "conservative_floor": {"pnl": cons_pnl, "mc": cons_mc},
+        "realistic_live": {"pnl": live_pnl, "mc": live_mc},
+        "optimistic_raw_proxy": {"pnl": opt_pnl},
+        "meta": {
+            "payout_factor": float(live_payout_factor),
+            "conservative_payout_factor": float(conservative_payout_factor),
+            "bmc_haircut": float(eff_haircut),
+            "concurrent_rounds": int(weekly_concurrent_rounds),
+            "settlement_rounds": int(settlement_rounds),
+            "mmc_is_proxy": bool(mmc_is_proxy),
+        },
+    }
+
+
+def build_live_staking_scenarios_df(
+    scenarios_by_variant: Mapping[str, Dict[str, Any]],
+) -> pd.DataFrame:
+    """Build a side-by-side Conservative Floor vs. Realistic Live Estimate staking comparison table."""
+    rows: List[Dict[str, Any]] = []
+    for variant_name, bundle in scenarios_by_variant.items():
+        c_pnl = bundle["conservative_floor"]["pnl"]
+        c_mc = bundle["conservative_floor"]["mc"]
+        l_pnl = bundle["realistic_live"]["pnl"]
+        l_mc = bundle["realistic_live"]["mc"]
+        m = bundle["meta"]
+        rows.append({
+            "variant": str(variant_name),
+            "conservative_end_gbp": round(float(c_pnl["end_capital"]), 2),
+            "conservative_return_pct": round(float(c_pnl["total_return_pct"]), 2),
+            "conservative_worst_dip_pct": round(float(c_pnl["money_drawdown_pct"]), 2),
+            "conservative_mc_p_profit_pct": round(float(c_mc["mc_prob_profit_pct"]), 1),
+            "realistic_live_end_gbp": round(float(l_pnl["end_capital"]), 2),
+            "realistic_live_return_pct": round(float(l_pnl["total_return_pct"]), 2),
+            "realistic_live_worst_dip_pct": round(float(l_pnl["money_drawdown_pct"]), 2),
+            "realistic_live_mc_p_profit_pct": round(float(l_mc["mc_prob_profit_pct"]), 1),
+            "realistic_live_mc_median_gbp": round(float(l_mc["mc_median_final_stake"]), 2),
+            "payout_factor": round(float(m["payout_factor"]), 2),
+            "bmc_haircut": round(float(m["bmc_haircut"]), 2),
+            "concurrent_rounds": int(m["concurrent_rounds"]),
+        })
+    return pd.DataFrame(rows)

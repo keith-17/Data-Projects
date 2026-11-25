@@ -81,8 +81,13 @@ class _NumpyMiniRocketTransformer:
         channel_combos: Sequence[np.ndarray],
         kernel_indices: np.ndarray,
         padding_flags: np.ndarray,
-    ) -> np.ndarray:
-        """Compute convolutions for one dilation over a batch `(B, C, L)` -> `(B, n_k, L_out)`."""
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute convolutions for one dilation over a batch `(B, C, L)`.
+
+        Returns `(conv_out, valid_lengths)` where `conv_out` has shape `(B, n_k, out_len)` and
+        `valid_lengths` has shape `(n_k,)` giving the exact number of valid convolution positions
+        per kernel (preventing unpadded convolutions from biasing quantiles/PPV with dummy zeros).
+        """
         b_size, _, seq_len = X_batch.shape
         span = 8 * dilation + 1
         pad = 4 * dilation
@@ -92,10 +97,10 @@ class _NumpyMiniRocketTransformer:
             pad_needed = pad
 
         X_padded = np.pad(X_batch, ((0, 0), (0, 0), (pad_needed, pad_needed)), mode="constant", constant_values=0.0)
-        # Window indices for each kernel position 0..8
         n_k = len(kernel_indices)
         out_len = seq_len if pad_needed == pad else (X_padded.shape[2] - span + 1)
         conv_out = np.empty((b_size, n_k, out_len), dtype=np.float32)
+        valid_lengths = np.empty(n_k, dtype=np.int64)
 
         for idx in range(n_k):
             k_id = int(kernel_indices[idx])
@@ -115,7 +120,6 @@ class _NumpyMiniRocketTransformer:
 
             # Extract 9 strided slices of length `n_pos`
             n_pos = cur_len - span + 1
-            # Vectorized sum over all 9 positions and the 3 positive (+2) positions:
             # 2 * sum(pos3) - 1 * sum(other6) = 3 * sum(pos3) - sum(all9)
             i0, i1, i2 = _MINIROCKET_KERNEL_TRIPLETS[k_id]
             s_all = np.zeros((b_size, n_pos), dtype=np.float32)
@@ -130,10 +134,12 @@ class _NumpyMiniRocketTransformer:
             res = 3.0 * s_pos - s_all
             if n_pos >= out_len:
                 conv_out[:, idx, :] = res[:, :out_len]
+                valid_lengths[idx] = out_len
             else:
                 conv_out[:, idx, :n_pos] = res
-                conv_out[:, idx, n_pos:] = 0.0
-        return conv_out
+                conv_out[:, idx, n_pos:] = np.nan
+                valid_lengths[idx] = n_pos
+        return conv_out, valid_lengths
 
     def fit(self, X_sample: np.ndarray) -> "_NumpyMiniRocketTransformer":
         X_arr = np.asarray(X_sample, dtype=np.float32)
@@ -181,17 +187,18 @@ class _NumpyMiniRocketTransformer:
 
             # Compute convolutions on the sampled examples in one batch
             unique_sample_idx, inv_idx = np.unique(sample_indices, return_inverse=True)
-            conv_unique = self._convolve_batch_for_dilation(
+            conv_unique, valid_lengths = self._convolve_batch_for_dilation(
                 X_arr[unique_sample_idx],
                 dilation=int(dilation),
                 channel_combos=channel_combos,
                 kernel_indices=kernel_ids,
                 padding_flags=padding_flags,
-            )  # (U, 84, L_out)
+            )  # (U, 84, L_out), (84,)
 
             biases = np.empty((_NUM_BASE_KERNELS, int(n_feat_d)), dtype=np.float32)
             for k_id in range(_NUM_BASE_KERNELS):
-                c_vec = conv_unique[inv_idx[k_id], k_id, :]
+                v_len = int(valid_lengths[k_id])
+                c_vec = conv_unique[inv_idx[k_id], k_id, :v_len]
                 biases[k_id, :] = np.quantile(c_vec, quantiles).astype(np.float32)
                 for b_idx in range(int(n_feat_d)):
                     self.feature_meta_.append({
@@ -220,20 +227,28 @@ class _NumpyMiniRocketTransformer:
         out = np.empty((b_size, self.n_output_features_), dtype=np.float32)
         col_offset = 0
         for spec in self.dilation_specs_:
-            conv = self._convolve_batch_for_dilation(
+            conv, valid_lengths = self._convolve_batch_for_dilation(
                 X_arr,
                 dilation=spec["dilation"],
                 channel_combos=spec["channel_combos"],
                 kernel_indices=spec["kernel_indices"],
                 padding_flags=spec["padding_flags"],
-            )  # (B, 84, L_out)
+            )  # (B, 84, L_out), (84,)
             biases = spec["biases"]  # (84, n_feat_d)
             n_feat_d = biases.shape[1]
-            # PPV: fraction of time positions strictly greater than bias
-            for b_idx in range(n_feat_d):
-                ppv = (conv > biases[None, :, b_idx : b_idx + 1]).mean(axis=2, dtype=np.float32)
-                out[:, col_offset : col_offset + _NUM_BASE_KERNELS] = ppv
-                col_offset += _NUM_BASE_KERNELS
+            # Compute PPV strictly over valid positions [:v_len] and emit columns in exact (k_id, b_idx) order
+            # matching `self.feature_meta_` (fixes both unpadded zero-fill bias and column transposition!)
+            ppv_all = np.empty((b_size, _NUM_BASE_KERNELS, n_feat_d), dtype=np.float32)
+            for v_len in np.unique(valid_lengths):
+                v_int = int(v_len)
+                k_mask = valid_lengths == v_len
+                c_sub = conv[:, k_mask, :v_int]  # (B, K_sub, v_int)
+                b_sub = biases[k_mask, :]  # (K_sub, n_feat_d)
+                # Broadcast (B, K_sub, 1, v_int) > (1, K_sub, n_feat_d, 1) -> mean over v_int
+                ppv_all[:, k_mask, :] = (c_sub[:, :, None, :] > b_sub[None, :, :, None]).mean(axis=3, dtype=np.float32)
+            width = _NUM_BASE_KERNELS * n_feat_d
+            out[:, col_offset : col_offset + width] = ppv_all.reshape(b_size, width)
+            col_offset += width
         return out
 
 
@@ -371,7 +386,33 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         # Sort by (ticker, era) stably via lexsort (last key is primary)
         order = np.lexsort((eras_arr, tickers_arr))
         sorted_tickers = tickers_arr[order]
+        sorted_eras = eras_arr[order]
         sorted_feats = clean_mat[order]
+
+        # Detect physical era spacing during fit so denser validation eras (e.g. step=1 vs train stride=4)
+        # sample the exact same physical lookback horizon without 4x time-scale compression
+        if is_fit:
+            uniq_fit_eras = np.unique(sorted_eras)
+            if len(uniq_fit_eras) >= 2:
+                e_diffs = np.diff(uniq_fit_eras)
+                pos_diffs = e_diffs[e_diffs > 0]
+                self.train_era_step_ = max(1, int(round(float(np.median(pos_diffs))))) if len(pos_diffs) else 1
+            else:
+                self.train_era_step_ = 1
+        train_step = max(1, int(getattr(self, "train_era_step_", 1)))
+
+        # Detect whether prediction query eras are denser than training era spacing
+        if not is_fit:
+            uniq_q_eras = np.unique(sorted_eras)
+            if len(uniq_q_eras) >= 2:
+                q_diffs = np.diff(uniq_q_eras)
+                pos_q = q_diffs[q_diffs > 0]
+                query_step = max(1, int(round(float(np.median(pos_q))))) if len(pos_q) else 1
+            else:
+                query_step = 1
+            need_era_resampling = (train_step > 1) and (query_step < train_step)
+        else:
+            need_era_resampling = False
 
         # Find contiguous ticker boundaries
         change_mask = np.empty(n_rows, dtype=bool)
@@ -382,39 +423,79 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         ends = np.append(starts[1:], n_rows)
 
         out_tensor = np.empty((n_rows, n_cols, seq_len), dtype=np.float32)
-        tail_buffer: Dict[str, np.ndarray] = {} if is_fit else getattr(self, "ticker_tail_buffer_", {})
+        tail_buffer: Dict[str, Tuple[np.ndarray, np.ndarray]] = {} if is_fit else getattr(self, "ticker_tail_buffer_", {})
+        lag_offsets = (np.arange(seq_len - 1, -1, -1, dtype=np.int64)) * int(train_step)
 
         for s, e in zip(starts, ends):
             t_key = str(sorted_tickers[s])
+            grp_eras = sorted_eras[s:e]  # (T,)
             grp_feats = sorted_feats[s:e]  # (T, C)
             orig_positions = order[s:e]
             t_len = grp_feats.shape[0]
 
+            hist_eras: Optional[np.ndarray] = None
+            hist_feats: Optional[np.ndarray] = None
             if not is_fit and t_key in tail_buffer:
-                hist = tail_buffer[t_key]  # (H, C), H <= seq_len - 1
-                combined = np.vstack([hist, grp_feats])
-                need_pad = max(0, (seq_len - 1) - hist.shape[0])
-            else:
-                combined = grp_feats
-                need_pad = seq_len - 1
-
-            if need_pad > 0:
-                if pad_mode == "neutral":
-                    pad_block = np.full((need_pad, n_cols), 2.0, dtype=np.float32)
+                raw_entry = tail_buffer[t_key]
+                if isinstance(raw_entry, tuple) and len(raw_entry) == 2:
+                    h_e, h_f = raw_entry
+                    # Strictly causal: only prepend historical eras strictly earlier than the first query era
+                    c_mask = h_e < int(grp_eras[0])
+                    if bool(np.any(c_mask)):
+                        hist_eras = h_e[c_mask]
+                        hist_feats = h_f[c_mask]
                 else:
-                    pad_block = np.repeat(combined[:1, :], need_pad, axis=0)
-                padded = np.vstack([pad_block, combined])
-            else:
-                padded = combined
+                    hist_feats = np.asarray(raw_entry, dtype=np.float32)
 
-            # sliding_window_view over axis=0 -> (T, C, seq_len)
-            windows = sliding_window_view(padded, window_shape=seq_len, axis=0)[-t_len:]
-            out_tensor[orig_positions] = windows
+            if need_era_resampling:
+                # Era-aligned causal lookback: for each query era e_t, fetch observations at
+                # [e_t - (seq_len-1)*train_step, ..., e_t - train_step, e_t] via strictly causal searchsorted
+                if hist_feats is not None and hist_eras is not None:
+                    comb_eras = np.concatenate([hist_eras, grp_eras])
+                    comb_feats = np.vstack([hist_feats, grp_feats])
+                else:
+                    comb_eras = grp_eras
+                    comb_feats = grp_feats
+
+                target_eras = grp_eras[:, None] - lag_offsets[None, :]  # (T, seq_len)
+                pos_idx = np.searchsorted(comb_eras, target_eras, side="right") - 1  # (T, seq_len)
+                missing_mask = pos_idx < 0
+                safe_idx = np.maximum(pos_idx, 0)
+                gathered = comb_feats[safe_idx]  # (T, seq_len, C)
+                if bool(np.any(missing_mask)):
+                    if pad_mode == "neutral":
+                        gathered[missing_mask] = 2.0
+                    else:
+                        first_val = comb_feats[0]  # (C,)
+                        gathered[missing_mask] = first_val
+                # Transpose (T, seq_len, C) -> (T, C, seq_len)
+                out_tensor[orig_positions] = np.transpose(gathered, (0, 2, 1))
+            else:
+                if hist_feats is not None:
+                    combined = np.vstack([hist_feats, grp_feats])
+                    need_pad = max(0, (seq_len - 1) - hist_feats.shape[0])
+                else:
+                    combined = grp_feats
+                    need_pad = seq_len - 1
+
+                if need_pad > 0:
+                    if pad_mode == "neutral":
+                        pad_block = np.full((need_pad, n_cols), 2.0, dtype=np.float32)
+                    else:
+                        pad_block = np.repeat(combined[:1, :], need_pad, axis=0)
+                    padded = np.vstack([pad_block, combined])
+                else:
+                    padded = combined
+
+                # sliding_window_view over axis=0 -> (T, C, seq_len)
+                windows = sliding_window_view(padded, window_shape=seq_len, axis=0)[-t_len:]
+                out_tensor[orig_positions] = windows
 
             if is_fit:
-                keep_tail = min(seq_len - 1, t_len)
+                # Retain enough timestamped trailing history for full stride-aligned validation warm-up
+                keep_tail = min(max(seq_len - 1, (seq_len - 1) + 2), t_len)
                 if keep_tail > 0:
-                    tail_buffer[t_key] = grp_feats[-keep_tail:].copy()
+                    tail_buffer[t_key] = (grp_eras[-keep_tail:].copy(), grp_feats[-keep_tail:].copy())
 
         if is_fit:
             self.ticker_tail_buffer_ = tail_buffer
@@ -537,9 +618,11 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
             y_norm_sq = float(np.dot(w_f64, y_centered * y_centered))
             best_alpha = float(_DEFAULT_RIDGE_CV_ALPHAS[0])
             best_gcv = np.inf
-            eff_n = max(float(n_rows), 2.0)
+            # Kish effective sample size for weighted observations + explicit +1.0 intercept df in GCV
+            w_sq_sum = float(np.dot(w_f64, w_f64))
+            n_eff = max((w_sum * w_sum) / max(w_sq_sum, 1e-12), 2.0)
             for cand_alpha in _DEFAULT_RIDGE_CV_ALPHAS:
-                a_val = float(cand_alpha) * (w_sum / eff_n)
+                a_val = float(cand_alpha) * (w_sum / max(float(n_rows), 1.0))
                 denom = eigvals + a_val
                 coef_eig = ut_xty / np.maximum(denom, 1e-12)
                 # RSS = ||y||^2 - 2 w^T Xty + w^T XtX w
@@ -547,8 +630,8 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
                     1e-12,
                     y_norm_sq - 2.0 * float(np.dot(coef_eig, ut_xty)) + float(np.dot(coef_eig * coef_eig, eigvals)),
                 )
-                df_trace = float(np.sum(eigvals / np.maximum(denom, 1e-12)))
-                gcv_denom = max(1e-6, 1.0 - df_trace / eff_n)
+                df_trace = 1.0 + float(np.sum(eigvals / np.maximum(denom, 1e-12)))
+                gcv_denom = max(1e-6, 1.0 - df_trace / n_eff)
                 gcv_score = rss / (gcv_denom * gcv_denom)
                 if gcv_score < best_gcv:
                     best_gcv = gcv_score
@@ -622,14 +705,16 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
                 random_state=int(self.random_state),
             )
 
-        # Pass 2: batched partial_fit (2 epochs for convergence)
+        # Pass 2: batched partial_fit (2 epochs with deterministic shuffling to avoid chronological recency bias)
+        rng_sgd = np.random.default_rng(int(self.random_state))
         for _ in range(2):
+            perm = rng_sgd.permutation(n_rows)
             for start in range(0, n_rows, bs):
-                end = min(n_rows, start + bs)
-                Z = self._transform_batch(X_tensor[start:end]).astype(np.float64, copy=False)
+                batch_idx = perm[start : min(n_rows, start + bs)]
+                Z = self._transform_batch(X_tensor[batch_idx]).astype(np.float64, copy=False)
                 Z_std = (Z - mean_x) / scale_x
-                wb = w_f64[start:end] if w_f64 is not None else None
-                sgd.partial_fit(Z_std, y_f64[start:end], sample_weight=wb)
+                wb = w_f64[batch_idx] if w_f64 is not None else None
+                sgd.partial_fit(Z_std, y_f64[batch_idx], sample_weight=wb)
                 del Z, Z_std
 
         coef_std = np.asarray(sgd.coef_, dtype=np.float64).ravel()

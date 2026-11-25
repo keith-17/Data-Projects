@@ -79,7 +79,7 @@ def test_constant_corr_single_digit_return() -> None:
     const_52_pre = pd.Series(np.full(52, 0.005), index=np.arange(1000, 1052))
     res_pre = simulate_stake_pnl(const_52_pre, total_capital=1000.0, staking_mode="compound")
     assert 0.5 < res_pre["total_return_pct"] < 5.0, f"Pre-1393 1yr return: {res_pre['total_return_pct']}"
-    assert res_pre["score_basis"] == "CORR only (missing MMC)"
+    assert res_pre["score_basis"] == "CORR only (no True MMC / NMMC)"
     assert res_pre["mmc_status"] == "missing"
 
     const_52_r1393 = pd.Series(np.full(52, 0.005), index=np.arange(1393, 1445))
@@ -153,6 +153,65 @@ def test_one_wallet_plots() -> None:
     print("[PASS] Check 5: One-wallet dashboard & Monte Carlo plots verified.")
 
 
+def test_date_aware_r1393_unwind_drawdown_fx_lag_and_circular_mc() -> None:
+    # 1. Date-aware R1393+ & R1399+ switching on v6.0 remapped sequential eras (< 1393!)
+    remapped_corrs = pd.Series([0.05, 0.05, 0.05], index=[1230, 1245, 1247])
+    era_dates = pd.Series(
+        ["2026-08-21", "2026-11-06", "2026-11-14"],
+        index=[1230, 1245, 1247],
+    )
+    rets_date, meta_date = utils._compute_clipped_era_returns(
+        remapped_corrs,
+        neutral_churn=0.2,
+        payout_rule="auto",
+        era_dates=era_dates,
+    )
+    assert meta_date["n_pre_1393_eras"] == 1
+    assert meta_date["n_r1393_eras"] == 2
+    assert meta_date["n_r1399_eras"] == 1
+    assert abs(rets_date.loc[1230] - 0.15) < 1e-12  # Pre-1393: 3 * 0.05
+    assert abs(rets_date.loc[1245] - 0.40) < 1e-12  # R1393 (2026-11-06): 8 * 0.05, no churn
+    assert abs(rets_date.loc[1247] - (0.40 * compute_r1399_churn_retention(0.2))) < 1e-12  # R1399 (2026-11-14)
+
+    # 2. Terminal unwind drawdown captured chronologically (burns then recovery during final 12 open rounds)
+    tail_burn_then_recover = pd.Series(
+        np.concatenate([np.full(12, 0.0), np.full(6, -0.33), np.full(6, 0.33)]),
+        index=np.arange(1000, 1024),
+    )
+    res_unwind = simulate_stake_pnl(
+        tail_burn_then_recover,
+        total_capital=1000.0,
+        concurrent_rounds=12,
+        settlement_rounds=12,
+        staking_mode="constant",
+    )
+    # Final net PnL is ~0, but the 6 consecutive burns during unwind must register a real drawdown!
+    assert res_unwind["money_drawdown_pct"] < -15.0, f"Unwind drawdown masked: {res_unwind['money_drawdown_pct']}"
+
+    # 3. Settlement-week FX conversion lag (round_pnls_gbp uses fx[t + settlement_rounds], not fx[t])
+    const_corrs = pd.Series(np.full(20, 0.05), index=np.arange(1000, 1020))
+    fx_step = pd.Series([10.0] * 12 + [30.0] * 8, index=np.arange(1000, 1020))
+    res_fx_lag = simulate_stake_pnl(
+        const_corrs,
+        total_capital=1000.0,
+        concurrent_rounds=12,
+        settlement_rounds=12,
+        staking_mode="constant",
+        nmr_gbp_prices=fx_step,
+    )
+    # Round 0 opens at t=0 (FX=10) and settles at t=12 (FX=30) -> GBP PnL reflects settlement FX=30!
+    expected_nmr_pnl_0 = (100.0 / 12.0) * (3.0 * 0.05)
+    assert abs(res_fx_lag["round_pnls_gbp"].loc[1000] - expected_nmr_pnl_0 * 30.0) < 1e-6
+
+    # 4. Circular block bootstrap default block_size=12
+    mc_default = utils.simulate_stake_pnl_monte_carlo(
+        pd.Series(np.random.default_rng(3).normal(0.01, 0.02, size=60), index=np.arange(1000, 1060)),
+        n_sims=40,
+    )
+    assert mc_default["block_size"] == 12
+    print("[PASS] Check 6: Date-aware R1393/R1399, unwind DD, settlement FX lag, and circular block_size=12 verified.")
+
+
 if __name__ == "__main__":
     test_coding_standards()
     test_equity_and_drawdown_bounds()
@@ -160,4 +219,5 @@ if __name__ == "__main__":
     test_r1399_churn_and_nmr_gbp_separation()
     test_versioned_candidate_scoring_and_drawdown_split()
     test_one_wallet_plots()
-    print("ALL ACCEPTANCE CHECKS 1-5 PASSED!")
+    test_date_aware_r1393_unwind_drawdown_fx_lag_and_circular_mc()
+    print("ALL ACCEPTANCE CHECKS 1-6 PASSED!")

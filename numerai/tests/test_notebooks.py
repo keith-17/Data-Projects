@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import builtins
 import json
 import re
 import unittest
@@ -37,7 +39,7 @@ from minirocket_utils import (
     _NumpyMiniRocketTransformer,
     _compute_dilations_and_counts,
 )
-from utils import NumeraiExtractions, reset_cv_metric_log
+from utils import NumeraiExtractions, build_experiment_setup, reset_cv_metric_log
 
 
 UNITY_NOTEBOOKS = (
@@ -503,6 +505,140 @@ class TestMiniRocketNotebookUtils(unittest.TestCase):
         preds = cloned.predict(self.val_df[self.input_cols])
         self.assertEqual(len(preds), len(self.val_df))
         self.assertTrue(np.all(np.isfinite(preds)))
+
+    def test_numpy_minirocket_column_order_matches_feature_meta_and_no_unpadded_zero_bias(self) -> None:
+        """Regression test: Z[:, j] must match feature_meta_[j] (kernel_id, dilation, bias, channels) strictly over valid positions."""
+        rng = np.random.default_rng(123)
+        X_arr = rng.normal(1.5, 1.0, size=(12, 3, 16)).astype(np.float32)
+        tr = _NumpyMiniRocketTransformer(num_kernels=252, max_dilations_per_kernel=2, random_state=42).fit(X_arr)
+        Z = tr.transform(X_arr)
+        self.assertEqual(Z.shape, (12, len(tr.feature_meta_)))
+
+        # Independently recompute PPV for every feature directly from feature_meta_ and dilation_specs_
+        spec_by_dilation = {int(s["dilation"]): s for s in tr.dilation_specs_}
+        for j, meta in enumerate(tr.feature_meta_):
+            dil = int(meta["dilation"])
+            k_id = int(meta["kernel_id"])
+            bias = float(meta["bias"])
+            spec = spec_by_dilation[dil]
+            conv, valid_lengths = tr._convolve_batch_for_dilation(
+                X_arr,
+                dilation=dil,
+                channel_combos=spec["channel_combos"],
+                kernel_indices=spec["kernel_indices"],
+                padding_flags=spec["padding_flags"],
+            )
+            v_len = int(valid_lengths[k_id])
+            expected_ppv = (conv[:, k_id, :v_len] > bias).mean(axis=1, dtype=np.float32)
+            np.testing.assert_allclose(Z[:, j], expected_ppv, atol=1e-6)
+
+    def test_minirocket_stride4_train_to_dense_val_era_alignment(self) -> None:
+        """Regression test: training on stride=4 eras and predicting on step=1 dense validation eras aligns physical lookback."""
+        # Build single-ticker deterministic ramp where feature value == era number
+        tr_eras = np.arange(4, 52, 4, dtype=np.int32)  # 12 strided eras: 4, 8, ..., 48
+        va_eras = np.arange(49, 61, 1, dtype=np.int32)  # 12 dense eras: 49..60
+        tr_mat = tr_eras[:, None].astype(np.float32)
+        va_mat = va_eras[:, None].astype(np.float32)
+        tr_tk = np.array(["T0"] * len(tr_eras), dtype=object)
+        va_tk = np.array(["T0"] * len(va_eras), dtype=object)
+
+        est = MiniRocketNumeraiEstimator(seq_len=9, pad_mode="first")
+        _ = est._build_sequence_tensor(tr_mat, tr_eras, tr_tk, mode="ticker_sequence", is_fit=True)
+        self.assertEqual(est.train_era_step_, 4)
+
+        val_tensor = est._build_sequence_tensor(va_mat, va_eras, va_tk, mode="ticker_sequence", is_fit=False)
+        # For query era 60 (last row), lookback with train_era_step_=4 must sample eras [28, 32, 36, 40, 44, 48, 52, 56, 60]!
+        expected_era60 = np.array([28, 32, 36, 40, 44, 48, 52, 56, 60], dtype=np.float32)
+        np.testing.assert_allclose(val_tensor[-1, 0, :], expected_era60, atol=1e-6)
+
+        # Strict causality on dense validation: perturbing era 60 must not alter era 56's sequence
+        va_mat_pert = va_mat.copy()
+        va_mat_pert[-1, 0] = 999.0
+        val_tensor_pert = est._build_sequence_tensor(va_mat_pert, va_eras, va_tk, mode="ticker_sequence", is_fit=False)
+        np.testing.assert_array_equal(val_tensor[:-1], val_tensor_pert[:-1])
+
+
+class TestPhase1ModelAndNotebookRegressions(unittest.TestCase):
+    """Phase 1 regression tests: cache fingerprinting, BinSnapping symmetry, LagReversal weights, and notebook AST hygiene."""
+
+    def test_extraction_cache_key_distinguishes_feature_values(self) -> None:
+        df1, feat_cols = make_synthetic_numerai_panel(n_eras=6, n_tickers=8, n_features=4, seed=1)
+        df2 = df1.copy()
+        df2[feat_cols[0]] = (4 - df2[feat_cols[0]]).astype(np.int8)
+        ext = NumeraiExtractions(top_k=3)
+        k1 = _build_extraction_cache_key(ext, df1, df1["era"].to_numpy(), df1["target"].to_numpy())
+        k2 = _build_extraction_cache_key(ext, df2, df2["era"].to_numpy(), df2["target"].to_numpy())
+        self.assertNotEqual(k1, k2)
+
+    def test_bin_snapping_n_bins_3_rescales_symmetrically(self) -> None:
+        # Bins 0..4 with target increasing linearly in feature -> n_bins=3 must separate 2 from 4 symmetrically!
+        f0 = np.tile(np.array([0, 1, 2, 3, 4], dtype=np.int8), 20)
+        y = f0.astype(np.float32) / 4.0
+        df = pd.DataFrame({"era": np.repeat(np.arange(1, 11), 10), "f0": f0})
+        est = BinSnappingEstimator(n_bins=3, top_k=1, correlation_method="pandas_mean", smoothing=0.0).fit(df, y)
+        preds = est.predict(pd.DataFrame({"era": [11, 11, 11], "f0": [0, 2, 4]}))
+        # Bin 0 < Bin 1 < Bin 2 strictly (previously 2, 3, 4 all clipped into bin 2!)
+        self.assertLess(float(preds[0]), float(preds[1]))
+        self.assertLess(float(preds[1]), float(preds[2]))
+
+    def test_lag_reversal_honors_sample_weights_and_uniqueness_decay(self) -> None:
+        df, feat_cols = make_synthetic_numerai_panel(n_eras=10, n_tickers=12, n_features=5, seed=19)
+        X = df[["era"] + feat_cols]
+        y = df["target"]
+        w_unweighted = BaseNumeraiEstimator(era_weighting="uniqueness_decay", target_horizon_eras=4)._compute_era_weights(
+            df["era"].to_numpy(), None, len(df)
+        )
+        self.assertIsNotNone(w_unweighted)
+        self.assertAlmostEqual(float(np.mean(w_unweighted)), 1.0, places=5)
+
+        est_plain = LagReversalEstimator(lag=1, top_k=5, era_weighting=None).fit(X, y)
+        est_decay = LagReversalEstimator(lag=1, top_k=5, era_weighting="uniqueness_decay", recency_decay=0.5).fit(X, y)
+        self.assertFalse(np.allclose(est_plain.feature_means_, est_decay.feature_means_))
+
+    def test_all_unity_notebooks_have_zero_undefined_names(self) -> None:
+        """AST static check across all Unity notebooks to prevent NameErrors (e.g. missing Cell 1 imports)."""
+        setup_globals = set(build_experiment_setup(baseline_mode="all").keys())
+        builtin_names = set(dir(builtins)) | {"__name__", "__file__", "display", "get_ipython"}
+
+        for nb_name in UNITY_NOTEBOOKS:
+            with self.subTest(notebook=nb_name):
+                nb = json.loads((NOTEBOOKS_DIR / nb_name).read_text(encoding="utf-8"))
+                defined = set(builtin_names) | setup_globals
+                undefined_refs = []
+
+                for cell_idx, cell in enumerate(nb.get("cells", [])):
+                    if cell.get("cell_type") != "code":
+                        continue
+                    src = "".join(cell.get("source", []))
+                    if not src.strip():
+                        continue
+                    tree = ast.parse(src, filename=f"{nb_name}:cell_{cell_idx}")
+
+                    # Collect names bound inside this cell (imports, assignments, loop vars, comprehension targets, except names)
+                    cell_bound = set()
+                    for node in ast.walk(tree):
+                        if isinstance(node, (ast.Import, ast.ImportFrom)):
+                            for alias in node.names:
+                                cell_bound.add((alias.asname or alias.name).split(".")[0])
+                        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                            cell_bound.add(node.id)
+                        elif isinstance(node, ast.ExceptHandler) and node.name:
+                            cell_bound.add(node.name)
+                        elif isinstance(node, ast.arg):
+                            cell_bound.add(node.arg)
+
+                    scope = defined | cell_bound
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                            if node.id not in scope:
+                                undefined_refs.append((cell_idx, node.id))
+                    defined |= cell_bound
+
+                self.assertEqual(
+                    undefined_refs,
+                    [],
+                    f"Undefined names detected in {nb_name}: {undefined_refs}",
+                )
 
 
 if __name__ == "__main__":

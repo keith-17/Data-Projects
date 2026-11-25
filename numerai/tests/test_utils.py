@@ -375,6 +375,37 @@ class TestCorrelationsAndNumeraiExtractions(unittest.TestCase):
         cloned = clone(ext)
         self.assertEqual(cloned.era_lag_scales, (1, 3))
 
+    def test_numerai_extractions_strictly_causal_no_val_lookahead(self) -> None:
+        # Phase 1 regression: perturbing future validation eras MUST NOT change earlier validation eras
+        # when include_rolling_era=True, include_lag_diff=True (quantize_scope='era') or ticker_features (train_fit)
+        train_df = self.df.loc[self.df["era"] <= 5].copy()
+        val_orig = self.df.loc[self.df["era"] > 5].copy()
+        val_pert = val_orig.copy()
+        # Massively perturb the final validation era (era 10)
+        future_mask = val_pert["era"] == val_pert["era"].max()
+        for col in self.feature_cols:
+            val_pert.loc[future_mask, col] = 4
+
+        for qscope in ("era", "train_fit"):
+            with self.subTest(quantize_scope=qscope):
+                ext = NumeraiExtractions(
+                    top_k=4,
+                    include_rolling_era=True,
+                    rolling_era_windows=(2,),
+                    include_lag_diff=True,
+                    era_lag_scales=(1,),
+                    ticker_features="rolling_mean",
+                    ticker_windows=(2,),
+                    quantize_scope=qscope,
+                ).fit(train_df, train_df["target"])
+                out_orig = ext.transform(val_orig)
+                out_pert = ext.transform(val_pert)
+                early_mask = (val_orig["era"] < val_orig["era"].max()).to_numpy()
+                pd.testing.assert_frame_equal(
+                    out_orig.loc[early_mask].reset_index(drop=True),
+                    out_pert.loc[early_mask].reset_index(drop=True),
+                )
+
 
 class TestEvaluationWalkForwardAndExport(unittest.TestCase):
     """Unit tests for evaluation metrics, walk-forward prediction, MMC, and Parquet export."""
@@ -383,7 +414,8 @@ class TestEvaluationWalkForwardAndExport(unittest.TestCase):
         self.assertEqual(sharpe_ratio(pd.Series(dtype=np.float64)), 0.0)
         self.assertEqual(sharpe_ratio(pd.Series([0.02, 0.02, 0.02])), 0.0)
         s = pd.Series([0.01, 0.03, 0.02, 0.04])
-        self.assertAlmostEqual(sharpe_ratio(s), float(s.mean() / s.std()), places=10)
+        # Official numerai_tools.scoring.sharpe_ratio uses population std (ddof=0)
+        self.assertAlmostEqual(sharpe_ratio(s), float(s.mean() / s.std(ddof=0)), places=10)
 
         df, _ = make_synthetic_numerai_panel(n_eras=6, n_tickers=20, n_features=4, seed=9)
         y_true = df["target"].to_numpy()
