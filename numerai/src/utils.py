@@ -2308,12 +2308,21 @@ def candidate_score(
         **bin_shares,
     })
 
+    fold_pnl = (
+        simulate_stake_pnl(era_corrs)
+        if len(era_corrs) > 0
+        else {"end_capital": 1000.0, "total_return_pct": 0.0, "money_drawdown_pct": 0.0}
+    )
+    acc_pct = float(bin_shares.get("accurate_pct", np.nan))
+    acc_tag = f", Acc {acc_pct:.1f}%" if np.isfinite(acc_pct) else ""
     const_tag = " [CONSTANT PRED PENALIZED -> -1.0000]" if is_const_pred else ""
     print(
         f"  [Fold Score | {effective_version}] Score: {score_val:.4f}{const_tag} | "
-        f"Numerai CORR: {mean_corr * 100.0:+.2f}% ({mean_corr:.4f}, std={std_corr:.4f}) | "
-        f"Sharpe: {sharpe_val:.2f} | CORR DD: {corr_dd:.4f} | Positive Eras: {pos_era_pct:.1f}% | "
-        f"Dir Acc: {dir_acc_pct:.1f}% | MAE: {mae_val:.4f}"
+        f"Science: CORR {mean_corr * 100.0:+.2f}% (std={std_corr:.4f}), Sharpe {sharpe_val:.2f}, "
+        f"CORR DD {corr_dd:.4f}, MAE {mae_val:.4f} | "
+        f"Business: £{fold_pnl['end_capital']:,.2f} ({fold_pnl['total_return_pct']:+.2f}%, "
+        f"Dip {fold_pnl['money_drawdown_pct']:.2f}%), Pos Eras {pos_era_pct:.1f}%, "
+        f"Dir Acc {dir_acc_pct:.1f}%{acc_tag}"
     )
     return float(score_val)
 
@@ -3961,6 +3970,31 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
     df.insert(0, "candidate_id", np.arange(len(df), dtype=int))
     if "rank_test_score" in df.columns:
         df = df.sort_values("rank_test_score", kind="stable").reset_index(drop=True)
+    # Surface Business (P&L + accuracy) and Science (CORR + risk) columns first for display()
+    front_cols = [
+        c
+        for c in (
+            "candidate_id",
+            "rank_test_score",
+            "mean_test_score",
+            "score_version",
+            "end_capital",
+            "total_profit",
+            "total_return_pct",
+            "money_drawdown_pct",
+            "mean_directional_accuracy_pct",
+            "mean_accurate_pct",
+            "mean_numerai_corr",
+            "mean_sharpe",
+            "mean_positive_era_pct",
+            "mean_era_consistency_pct",
+            "mean_corr_drawdown",
+            "mean_mae",
+        )
+        if c in df.columns
+    ]
+    remaining_cols = [c for c in df.columns if c not in front_cols]
+    df = df[front_cols + remaining_cols]
     if trials_era_corrs_map:
         trials_df = pd.DataFrame({f"trial_{cid}": s for cid, s in sorted(trials_era_corrs_map.items())}).sort_index()
         # Store as plain nested dict so pandas DataFrame.attrs == attrs in to_string()/concat() never raises ValueError

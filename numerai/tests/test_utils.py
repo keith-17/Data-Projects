@@ -647,6 +647,30 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
         # Empty input returns empty DataFrame
         self.assertTrue(build_quick_results_df({}).empty)
 
+    def test_build_quick_results_df_wide_repr_with_trials_attrs(self) -> None:
+        df, _ = make_synthetic_numerai_panel(n_eras=8, n_tickers=15, n_features=4, seed=45)
+        est = _DummyMeanEstimator().fit(df, df["target"])
+
+        reset_cv_metric_log()
+        score1 = candidate_score(est, df, df["target"], score_version="v1_skepta")
+        score2 = candidate_score(est, df, df["target"], score_version="v1_skepta")
+        wide_params = {f"estimator__p{i}": float(i) for i in range(25)}
+        cv_results = {
+            "mean_test_score": [score1, score2],
+            "split0_test_score": [score1, score2],
+            "rank_test_score": [1, 2],
+            "params": [wide_params, wide_params],
+        }
+        quick_df = build_quick_results_df(cv_results)
+        self.assertGreater(len(quick_df.columns), 20)
+        self.assertIsInstance(quick_df.attrs.get("trials_era_corrs_df"), dict)
+        # Wide DataFrame repr() triggers horizontal truncation + concat(); must not raise ValueError
+        rendered = repr(quick_df)
+        self.assertGreater(len(rendered), 0)
+
+        pbo = utils.compute_pbo_cscv(quick_df.attrs["trials_era_corrs_df"], n_submatrices=4, random_state=42)
+        self.assertIn("pbo", pbo)
+
 
 if __name__ == "__main__":
     unittest.main()

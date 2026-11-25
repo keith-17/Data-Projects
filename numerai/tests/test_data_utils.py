@@ -474,6 +474,37 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
                 np.testing.assert_array_equal(tr_pl[col].to_numpy(), tr_pd[col].to_numpy())
                 np.testing.assert_array_equal(va_pl[col].to_numpy(), va_pd[col].to_numpy())
 
+    def test_polars_per_ticker_timeseries_era_quantize_no_nested_window_error(self) -> None:
+        if not POLARS_AVAILABLE:
+            self.skipTest("Polars not installed")
+        df = pd.DataFrame(
+            {
+                "era": [1, 1, 2, 2, 3, 3, 4, 4],
+                "numerai_ticker": ["A", "B", "A", "B", "A", "B", "A", "B"],
+                "f1": [0, 1, 2, 3, 4, 2, 1, 0],
+                "f2": [4.0, np.nan, 1.0, 2.0, 3.0, 4.0, 0.0, 2.0],
+            }
+        )
+        for qscope in ("era", "global"):
+            with self.subTest(quantize_scope=qscope):
+                out_df, added_cols = data_utils.compute_per_ticker_timeseries_features(
+                    df,
+                    ["f1", "f2"],
+                    ticker_col="numerai_ticker",
+                    era_col="era",
+                    ticker_features=(
+                        "rolling_mean|momentum_diff|rolling_rank|"
+                        "expanding_stats|weeks_since_change|weeks_since_high|raw_lags"
+                    ),
+                    ticker_windows=[2, 4],
+                    ticker_lag_steps=[1, 2],
+                    quantize_scope=qscope,
+                )
+                self.assertEqual(len(added_cols), 28)
+                for cname in added_cols:
+                    self.assertEqual(out_df[cname].dtype, np.int8)
+                    self.assertTrue(((out_df[cname] >= 0) & (out_df[cname] <= 4)).all())
+
 
 if __name__ == "__main__":
     unittest.main()

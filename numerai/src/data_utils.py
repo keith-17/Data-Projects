@@ -202,23 +202,31 @@ def _compute_weeks_since_change_grouped(
     return (idx - last_change_idx).astype(np.float64)
 
 
+def _pl_impute_nonfinite_expr(
+    col_name: str,
+    era_col: str,
+    quantize_scope: str,
+) -> Any:
+    """Polars expression imputing non-finite values with era or global median before quantization."""
+    scope = str(quantize_scope or "era").strip().lower()
+    raw = pl.col(col_name).cast(pl.Float64)
+    finite = raw.is_finite()
+    med = raw.filter(finite).median().over(era_col) if scope == "era" else raw.filter(finite).median()
+    return pl.when(finite).then(raw).otherwise(med).fill_null(0.0).alias(col_name)
+
+
 def _pl_quantize_to_5bins_expr(
     col_name: str,
     era_col: str,
     quantize_scope: str,
 ) -> Any:
-    """Polars expression for 5-bin (`0..4` `Int8`) z-score quantization (`'era'` or `'global'`)."""
+    """Polars expression for 5-bin (`0..4` `Int8`) z-score quantization (`'era'` or `'global'`) on finite Float64 columns."""
     scope = str(quantize_scope or "era").strip().lower()
-    raw = pl.col(col_name).cast(pl.Float64)
-    finite = raw.is_finite()
+    clean = pl.col(col_name).cast(pl.Float64)
     if scope == "era":
-        med = raw.filter(finite).median().over(era_col)
-        clean = pl.when(finite).then(raw).otherwise(med).fill_null(0.0)
         mean_e = clean.mean().over(era_col)
         std_e = clean.std(ddof=0).over(era_col)
     else:
-        med = raw.filter(finite).median()
-        clean = pl.when(finite).then(raw).otherwise(med).fill_null(0.0)
         mean_e = clean.mean()
         std_e = clean.std(ddof=0)
 
@@ -329,6 +337,8 @@ def _compute_per_ticker_timeseries_polars(
     if exprs:
         pl_df = pl_df.with_columns(exprs)
     if quantize_cols:
+        # Two-pass expressions avoid nesting .over() median inside .over() mean/std
+        pl_df = pl_df.with_columns([_pl_impute_nonfinite_expr(c, era_col, quantize_scope) for c in quantize_cols])
         pl_df = pl_df.with_columns([_pl_quantize_to_5bins_expr(c, era_col, quantize_scope) for c in quantize_cols])
 
     # Preserve exact deterministic column ordering matching the legacy Pandas path
