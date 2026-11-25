@@ -675,7 +675,7 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
         with self.assertRaises(ValueError):
             compute_era_error_envelope(y_true, y_pred[:-1], eras)
 
-    def test_plot_flight_residual_diagnostics_summary_and_exports(self) -> None:
+    def test_plot_residual_diagnostics_summary_and_exports(self) -> None:
         eras = np.repeat(np.arange(1, 7, dtype=np.int32), 25)
         rng = np.random.default_rng(77)
         y_true = rng.choice([0.0, 0.25, 0.5, 0.75, 1.0], size=len(eras))
@@ -683,8 +683,8 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
         preds_b = np.clip(y_true * 0.1 + 0.45 + rng.normal(0.0, 0.05, size=len(eras)), 0.0, 1.0)
 
         with tempfile.TemporaryDirectory() as tmp:
-            prefix = Path(tmp) / "flight_diag"
-            summary_df = utils.plot_flight_residual_diagnostics(
+            prefix = Path(tmp) / "residual_diag"
+            summary_df = utils.plot_residual_diagnostics(
                 y_true,
                 {"Model A [Tuned]": {"validation_preds": preds_a}, "Model B [Tuned]": preds_b},
                 eras,
@@ -713,7 +713,7 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
             self.assertFalse((Path(f"{prefix}_pct_error_vs_actual.png")).exists())
 
         with self.assertRaises(ValueError):
-            utils.plot_flight_residual_diagnostics(y_true, {"Bad": preds_a[:-1]}, eras)
+            utils.plot_residual_diagnostics(y_true, {"Bad": preds_a[:-1]}, eras)
 
     def test_candidate_score_and_build_quick_results_df(self) -> None:
         df, _ = make_synthetic_numerai_panel(n_eras=6, n_tickers=15, n_features=4, seed=44)

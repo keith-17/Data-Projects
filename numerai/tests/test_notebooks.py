@@ -126,9 +126,42 @@ class TestNotebookStructureAndStandards(unittest.TestCase):
                     if cleaned_src.strip():
                         compile(cleaned_src, f"{nb_name}:cell_{idx}", "exec")
 
-                # Standard workflow sections present in every Unity notebook
-                for expected_section in ("# Setup", "# Prep", "# Params", "# Train", "# Analysis"):
+                # Standard workflow header hierarchy mirrored from baseline_unity.ipynb (in order)
+                expected_sections = (
+                    "# Setup",
+                    "# Prep",
+                    "## Exploratory Data Analysis (EDA)",
+                    "# Params",
+                    "## Grid",
+                    "## Bayesian",
+                    "# Train",
+                    "# Analysis",
+                    "## General",
+                    "## AFML Backtest Overfitting, Risk & Numerai Forum #1454 Diagnostics",
+                    "## NumerAPI v6.0 Dataset Discovery & True MMC vs BMC Proxy Check",
+                    "## Simulated Numerai Staking P&L Dashboard (£)",
+                    "## Monte Carlo Block-Bootstrap Risk Analysis (£)",
+                    "## Optional Community Companion: `numereval` (Council of Elders)",
+                )
+                section_positions = []
+                for expected_section in expected_sections:
                     self.assertIn(expected_section, markdown_headings, f"{nb_name} missing {expected_section}")
+                    section_positions.append(markdown_headings.index(expected_section))
+                self.assertEqual(
+                    section_positions,
+                    sorted(section_positions),
+                    f"{nb_name} baseline header sections are out of order: {list(zip(expected_sections, section_positions))}",
+                )
+                envelope_indices = [
+                    pos for pos, heading in enumerate(markdown_headings)
+                    if heading.startswith("## Error-Direction Envelope Analysis")
+                ]
+                self.assertEqual(len(envelope_indices), 1, f"{nb_name} missing Error-Direction Envelope Analysis header")
+                self.assertGreater(envelope_indices[0], markdown_headings.index("## General"))
+                self.assertLess(
+                    envelope_indices[0],
+                    markdown_headings.index("## AFML Backtest Overfitting, Risk & Numerai Forum #1454 Diagnostics"),
+                )
 
     def test_notebook_cell1_imports_expected_model_modules(self) -> None:
         expected_symbols = {

@@ -8,6 +8,7 @@ import inspect
 import json
 from datetime import datetime
 from functools import partial
+from operator import itemgetter
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -181,6 +182,11 @@ def _safe_autocorr(values: Any, lag: int = 1) -> float:
     return val if np.isfinite(val) else 0.0
 
 
+def _quantize_era_series_group(group: pd.Series, *, strategy: str) -> np.ndarray:
+    """Quantize one era's numeric Series slice into `0..4` `np.int8` bins."""
+    return _quantize_1d_array(group.to_numpy(dtype=np.float64, copy=False), strategy=strategy)
+
+
 def quantize_to_5bins(
     values: np.ndarray,
     strategy: str = "zscore",
@@ -201,7 +207,7 @@ def quantize_to_5bins(
         if len(era_arr) == len(arr):
             s = pd.Series(arr)
             out = s.groupby(era_arr, sort=False).transform(
-                lambda grp: _quantize_1d_array(grp.to_numpy(dtype=np.float64, copy=False), strategy=strategy)
+                partial(_quantize_era_series_group, strategy=strategy)
             )
             return out.to_numpy(dtype=np.int8)
     return _quantize_1d_array(arr, strategy=strategy)
@@ -237,6 +243,12 @@ def _all_integer_dtypes(df: pd.DataFrame) -> bool:
 def _all_numeric_dtypes(df: pd.DataFrame) -> bool:
     """True when every column in `df` is already numeric (`int8`, `int16`, `int32`, `float32`, etc.)."""
     return all(pd.api.types.is_numeric_dtype(dt) for dt in df.dtypes)
+
+
+def _impute_era_series_group(series: pd.Series, *, agg_fn: str) -> pd.Series:
+    """Impute missing values in one era group using its within-era mean or median."""
+    fill_value = series.mean() if agg_fn == "mean" else series.median()
+    return series.fillna(fill_value)
 
 
 def _fill_missing_features(
@@ -307,7 +319,7 @@ def _fill_missing_features(
     if mode in ("era_mean", "era_median") and era_series is not None:
         agg_fn = "mean" if mode == "era_mean" else "median"
         era_filled = numeric_df.astype(np.float32, copy=False).groupby(era_series).transform(
-            lambda s: s.fillna(s.mean() if agg_fn == "mean" else s.median())
+            partial(_impute_era_series_group, agg_fn=agg_fn)
         )
         return era_filled.fillna(col_defaults).fillna(np.float32(2.0)).astype(np.float32, copy=False), col_defaults
 
@@ -396,6 +408,11 @@ def _canonicalize_candidate_params(candidate: Mapping[str, Any]) -> Dict[str, An
     return canon
 
 
+def _extract_skopt_dimension_categories(dim: Any) -> List[Any]:
+    """Return the category list from a skopt categorical dimension, or an empty list."""
+    return list(dim.categories) if hasattr(dim, "categories") else []
+
+
 def build_conditional_bayesian_spaces(
     space: Mapping[str, Any],
     total_n_iter: int = 12,
@@ -405,12 +422,9 @@ def build_conditional_bayesian_spaces(
     if not SKOPT_AVAILABLE or SkCategorical is None or int(total_n_iter) < 4:
         return prepared
 
-    def _cats(dim: Any) -> List[Any]:
-        return list(dim.categories) if hasattr(dim, "categories") else []
-
     # 1. PersistenceEstimator conditional split (`None` vs `last`/`expanding_mean` vs `rolling_mean`)
     if "estimator__persistence_mode" in prepared:
-        modes = _cats(prepared["estimator__persistence_mode"])
+        modes = _extract_skopt_dimension_categories(prepared["estimator__persistence_mode"])
         if len(modes) >= 2:
             subspaces: List[Tuple[Dict[str, Any], int]] = []
             zero_modes = [m for m in modes if _is_inactive(m) or str(m).strip().lower() == "zero_rule"]
@@ -454,7 +468,7 @@ def build_conditional_bayesian_spaces(
 
     # 2. Extractor-backed estimators: gate `sparse_alpha` on `sparse_selector` so continuous alpha trials aren't wasted when off
     if "estimator__extractor__sparse_selector" in prepared and "estimator__extractor__sparse_alpha" in prepared:
-        sel_cats = _cats(prepared["estimator__extractor__sparse_selector"])
+        sel_cats = _extract_skopt_dimension_categories(prepared["estimator__extractor__sparse_selector"])
         off_cats = [c for c in sel_cats if _is_inactive(c)]
         on_cats = [c for c in sel_cats if not _is_inactive(c)]
         if off_cats and on_cats:
@@ -2500,23 +2514,33 @@ def compute_per_era_mmc(
     if merged.empty:
         return None
 
-    def _safe_era_contrib(grp: pd.DataFrame) -> float:
-        p = grp["prediction"].to_numpy(dtype=np.float64, copy=False)
-        m = grp[ref_col_name].to_numpy(dtype=np.float64, copy=False)
-        t = grp[target_col].to_numpy(dtype=np.float64, copy=False)
-        if len(t) < 2 or _is_constant_1d(p) or _is_constant_1d(m) or _is_constant_1d(t):
-            return 0.0
-        val = float(
-            correlation_contribution(
-                grp[["prediction"]],
-                grp[ref_col_name].rename("numerai_meta_model"),
-                grp[target_col],
-            ).to_numpy(dtype=np.float64)[0]
-        )
-        return val if np.isfinite(val) else 0.0
-
-    contrib_series = merged.groupby(era_col, sort=True).apply(_safe_era_contrib, include_groups=False)
+    contrib_series = merged.groupby(era_col, sort=True).apply(
+        partial(_compute_single_era_contribution, ref_col_name=ref_col_name, target_col=target_col),
+        include_groups=False,
+    )
     return contrib_series.astype(np.float64).rename("bmc_proxy" if use_proxy else "mmc")
+
+
+def _compute_single_era_contribution(
+    era_frame: pd.DataFrame,
+    *,
+    ref_col_name: str,
+    target_col: str,
+) -> float:
+    """Compute finite Numerai correlation contribution (MMC/BMC proxy) for a single era group."""
+    p = era_frame["prediction"].to_numpy(dtype=np.float64, copy=False)
+    m = era_frame[ref_col_name].to_numpy(dtype=np.float64, copy=False)
+    t = era_frame[target_col].to_numpy(dtype=np.float64, copy=False)
+    if len(t) < 2 or _is_constant_1d(p) or _is_constant_1d(m) or _is_constant_1d(t):
+        return 0.0
+    val = float(
+        correlation_contribution(
+            era_frame[["prediction"]],
+            era_frame[ref_col_name].rename("numerai_meta_model"),
+            era_frame[target_col],
+        ).to_numpy(dtype=np.float64)[0]
+    )
+    return val if np.isfinite(val) else 0.0
 
 
 R1393_START_ERA = 1393
@@ -2893,7 +2917,7 @@ def _simulate_single_wallet_path(
     #    are faithfully tracked (no artificial lump-sum masking at the end of the validation period)
     unwind_equities: List[float] = []
     if not wiped_out and open_positions:
-        open_positions.sort(key=lambda item: item[0])
+        open_positions.sort(key=itemgetter(0))
         remaining_locked = sum(pos[2] for pos in open_positions)
         for _, o_step, pos_stake, pos_ret in open_positions:
             payout = max(0.0, pos_stake * (1.0 + pos_ret))
@@ -3725,53 +3749,10 @@ def plot_stake_pnl_monte_carlo(
     win_ex = mc.get("example_winning_path")
     ax_paths.axhline(start_cap, color="#0f172a", linestyle="--", linewidth=1.4, label=f"Start (£{start_cap:,.0f})")
 
-    def _plot_example_path(ex: Dict[str, Any], color: str, tag: str) -> None:
-        arr = np.asarray(ex["equity_path"], dtype=np.float64)
-        steps = np.arange(len(arr))
-        pk_i, pk_v = int(ex["peak_idx"]), float(ex["peak_val"])
-        tr_i, tr_v = int(ex["trough_idx"]), float(ex["trough_val"])
-        fn_v = float(ex["final_val"])
-        dd_v = float(ex["max_drawdown_pct"])
-        ax_paths.plot(steps, arr, color=color, linewidth=1.9, alpha=0.9, label=f"{tag}: End £{fn_v:,.0f} (Max Dip {dd_v:.1f}%)")
-        ax_paths.scatter([pk_i], [pk_v], color=color, marker="^", s=65, zorder=5)
-        ax_paths.scatter([tr_i], [tr_v], color=color, marker="v", s=65, zorder=5)
-        ax_paths.scatter([len(arr) - 1], [fn_v], color=color, marker="o", s=55, zorder=5)
-        if tr_i > pk_i and pk_v > tr_v:
-            ax_paths.plot([pk_i, tr_i], [pk_v, tr_v], color=color, linestyle=":", linewidth=1.3, alpha=0.85)
-        ax_paths.annotate(
-            f"Peak £{pk_v:,.0f}",
-            xy=(pk_i, pk_v),
-            xytext=(0, 8),
-            textcoords="offset points",
-            ha="center",
-            fontsize=7.8,
-            fontweight="bold",
-            color=color,
-        )
-        ax_paths.annotate(
-            f"Dip {dd_v:.1f}%\n(£{tr_v:,.0f})",
-            xy=(tr_i, tr_v),
-            xytext=(0, -20),
-            textcoords="offset points",
-            ha="center",
-            fontsize=7.6,
-            color=color,
-        )
-        ax_paths.annotate(
-            f"Final £{fn_v:,.0f}",
-            xy=(len(arr) - 1, fn_v),
-            xytext=(-6, 6),
-            textcoords="offset points",
-            ha="right",
-            fontsize=7.8,
-            fontweight="bold",
-            color=color,
-        )
-
     if lose_ex is not None:
-        _plot_example_path(lose_ex, "#dc2626", "Example Losing Path")
+        _plot_monte_carlo_example_path(ax_paths, lose_ex, "#dc2626", "Example Losing Path")
     if win_ex is not None:
-        _plot_example_path(win_ex, "#059669", "Example Winning Path")
+        _plot_monte_carlo_example_path(ax_paths, win_ex, "#059669", "Example Winning Path")
     if lose_ex is None and win_ex is None:
         ax_paths.text(
             0.5,
@@ -3856,9 +3837,7 @@ def plot_stake_pnl_monte_carlo(
                 color=color,
             )
 
-        ax_fan.yaxis.set_major_formatter(
-            FuncFormatter(lambda val, _pos: f"-£{abs(val):,.0f}" if val < -1e-6 else (f"+£{val:,.0f}" if val > 1e-6 else "£0"))
-        )
+        ax_fan.yaxis.set_major_formatter(FuncFormatter(_format_signed_gbp_tick))
         ax_fan.set_xlabel("Simulated Week (Era Step)")
         ax_fan.set_ylabel("Cumulative P&L (£)")
         ax_fan.set_title(
@@ -3910,6 +3889,76 @@ def plot_stake_pnl_monte_carlo(
     return mc
 
 
+def _plot_monte_carlo_example_path(
+    ax_paths: Any,
+    example_path: Dict[str, Any],
+    color: str,
+    tag: str,
+) -> None:
+    """Plot an annotated Monte Carlo example equity path showing peak, trough dip, and final balance."""
+    arr = np.asarray(example_path["equity_path"], dtype=np.float64)
+    steps = np.arange(len(arr))
+    pk_i, pk_v = int(example_path["peak_idx"]), float(example_path["peak_val"])
+    tr_i, tr_v = int(example_path["trough_idx"]), float(example_path["trough_val"])
+    fn_v = float(example_path["final_val"])
+    dd_v = float(example_path["max_drawdown_pct"])
+    ax_paths.plot(steps, arr, color=color, linewidth=1.9, alpha=0.9, label=f"{tag}: End £{fn_v:,.0f} (Max Dip {dd_v:.1f}%)")
+    ax_paths.scatter([pk_i], [pk_v], color=color, marker="^", s=65, zorder=5)
+    ax_paths.scatter([tr_i], [tr_v], color=color, marker="v", s=65, zorder=5)
+    ax_paths.scatter([len(arr) - 1], [fn_v], color=color, marker="o", s=55, zorder=5)
+    if tr_i > pk_i and pk_v > tr_v:
+        ax_paths.plot([pk_i, tr_i], [pk_v, tr_v], color=color, linestyle=":", linewidth=1.3, alpha=0.85)
+    ax_paths.annotate(
+        f"Peak £{pk_v:,.0f}",
+        xy=(pk_i, pk_v),
+        xytext=(0, 8),
+        textcoords="offset points",
+        ha="center",
+        fontsize=7.8,
+        fontweight="bold",
+        color=color,
+    )
+    ax_paths.annotate(
+        f"Dip {dd_v:.1f}%\n(£{tr_v:,.0f})",
+        xy=(tr_i, tr_v),
+        xytext=(0, -20),
+        textcoords="offset points",
+        ha="center",
+        fontsize=7.6,
+        color=color,
+    )
+    ax_paths.annotate(
+        f"Final £{fn_v:,.0f}",
+        xy=(len(arr) - 1, fn_v),
+        xytext=(-6, 6),
+        textcoords="offset points",
+        ha="right",
+        fontsize=7.8,
+        fontweight="bold",
+        color=color,
+    )
+
+
+def _format_signed_gbp_tick(value: float, _tick_pos: Any) -> str:
+    """Format a signed GBP currency axis tick allowing negative cumulative P&L values."""
+    if value < -1e-6:
+        return f"-£{abs(value):,.0f}"
+    if value > 1e-6:
+        return f"+£{value:,.0f}"
+    return "£0"
+
+
+def _extract_cv_split_index(col_name: str) -> int:
+    """Extract the integer fold index from a scikit-learn `split<N>_test_score` column name."""
+    return int(col_name[len("split") : col_name.index("_test_score")])
+
+
+def _strip_estimator_param_prefix(col_name: Any) -> str:
+    """Strip a leading `estimator__` prefix from a CV parameter column name."""
+    name_str = str(col_name)
+    return name_str[len("estimator__") :] if name_str.startswith("estimator__") else name_str
+
+
 def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
     """Build a flat candidate results table with score_version, extended CV metrics, one-wallet OOF staking P&L scalars, and hyperparameters."""
     cv_res = getattr(search_or_results, "cv_results_", search_or_results)
@@ -3923,7 +3972,7 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
     # Attach per-candidate extended metrics & one-wallet OOF staking P&L scalars logged by `candidate_score`
     split_cols = sorted(
         [col for col in df.columns if col.startswith("split") and col.endswith("_test_score")],
-        key=lambda c: int(c[len("split") : c.index("_test_score")]),
+        key=_extract_cv_split_index,
     )
     trials_era_corrs_map: Dict[int, pd.Series] = {}
     if _CV_FOLD_METRIC_LOG and split_cols:
@@ -4010,9 +4059,7 @@ def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
 
     param_prefixed = [col for col in df.columns if col.startswith("param_")]
     if "params" in df.columns:
-        params_df = pd.DataFrame(list(df["params"])).rename(
-            columns=lambda col: col[len("estimator__"):] if str(col).startswith("estimator__") else str(col)
-        )
+        params_df = pd.DataFrame(list(df["params"])).rename(columns=_strip_estimator_param_prefix)
         drop_cols = ["params"] + param_prefixed
         df = pd.concat([df.drop(columns=drop_cols, errors="ignore"), params_df], axis=1)
     df = df.loc[:, ~df.columns.duplicated()].copy()
@@ -4112,7 +4159,7 @@ def plot_era_error_envelope(
     is_best: bool = False,
     save_path: Optional[Any] = None,
 ) -> pd.DataFrame:
-    """Plot the flight-deck directional error envelope across Numerai eras (x = eras, y = data points per era, ribbon = over/under forecast share)."""
+    """Plot the directional error envelope across Numerai eras (x = eras, y = data points per era, ribbon = over/under forecast share)."""
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
@@ -4175,16 +4222,16 @@ def plot_era_error_envelope(
     ax.set_ylabel("Data points per era")
     ax.set_xlim(min_era, max_era)
     if float(np.nanmax(upper)) >= 1000.0:
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value / 1000.0:g}k"))
+        ax.yaxis.set_major_formatter(FuncFormatter(_format_thousands_count_tick))
     else:
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{int(round(value)):,}"))
+        ax.yaxis.set_major_formatter(FuncFormatter(_format_integer_count_tick))
     ax.grid(axis="y", color="#DDDDDD", linewidth=0.7)
     ax.set_axisbelow(True)
     ax.tick_params(length=0, labelsize=10)
     for spine in ax.spines.values():
         spine.set_visible(False)
 
-    # Era-block / annual (52-era) section dividers matching flight-deck quarterly markers
+    # Era-block / annual (52-era) section dividers
     era_span = max_era - min_era + 1
     block_step = 52 if era_span >= 104 else max(1, era_span // 4)
     block_starts = list(range(min_era, max_era + 1, block_step))
@@ -4260,6 +4307,44 @@ def plot_era_error_envelope(
     return envelope_df
 
 
+def _format_thousands_count_tick(value: float, _tick_pos: Any) -> str:
+    """Format a count axis tick in compact thousands (`k`) notation."""
+    return f"{value / 1000.0:g}k"
+
+
+def _format_integer_count_tick(value: float, _tick_pos: Any) -> str:
+    """Format a count axis tick as a comma-separated integer."""
+    return f"{int(round(value)):,}"
+
+
+def _build_error_waterfall_summary_row(
+    section: str,
+    period: str,
+    n_pts: int,
+    n_eras_val: int,
+    pcts_5: np.ndarray,
+    mae_val: float,
+) -> Dict[str, Any]:
+    """Build one formatted 5-bin error waterfall summary row dictionary."""
+    under_tot = float(pcts_5[0] + pcts_5[1])
+    over_tot = float(pcts_5[3] + pcts_5[4])
+    extreme_tot = float(pcts_5[0] + pcts_5[4])
+    return {
+        "section": section,
+        "period": period,
+        "eras": int(n_eras_val),
+        "data_points": int(n_pts),
+        "extreme_underforecast_pct": round(float(pcts_5[0]), 2),
+        "underforecast_pct": round(float(pcts_5[1]), 2),
+        "accurate_pct": round(float(pcts_5[2]), 2),
+        "overforecast_pct": round(float(pcts_5[3]), 2),
+        "extreme_overforecast_pct": round(float(pcts_5[4]), 2),
+        "net_bias_pct": round(over_tot - under_tot, 2),
+        "extreme_total_pct": round(extreme_tot, 2),
+        "mae": round(float(mae_val), 4),
+    }
+
+
 def compute_error_bin_waterfall(
     y_true: Any,
     y_pred: Any,
@@ -4327,31 +4412,12 @@ def compute_error_bin_waterfall(
     overall_bins = np.bincount(valid_codes, minlength=5).astype(np.float64) * (100.0 / float(overall_n))
     overall_mae = float(np.mean(valid_abs))
 
-    def _make_row(section: str, period: str, n_pts: int, n_eras_val: int, pcts_5: np.ndarray, mae_val: float) -> Dict[str, Any]:
-        under_tot = float(pcts_5[0] + pcts_5[1])
-        over_tot = float(pcts_5[3] + pcts_5[4])
-        extreme_tot = float(pcts_5[0] + pcts_5[4])
-        return {
-            "section": section,
-            "period": period,
-            "eras": int(n_eras_val),
-            "data_points": int(n_pts),
-            "extreme_underforecast_pct": round(float(pcts_5[0]), 2),
-            "underforecast_pct": round(float(pcts_5[1]), 2),
-            "accurate_pct": round(float(pcts_5[2]), 2),
-            "overforecast_pct": round(float(pcts_5[3]), 2),
-            "extreme_overforecast_pct": round(float(pcts_5[4]), 2),
-            "net_bias_pct": round(over_tot - under_tot, 2),
-            "extreme_total_pct": round(extreme_tot, 2),
-            "mae": round(float(mae_val), 4),
-        }
-
     q_pcts = (q_bin_counts.astype(np.float64) / np.maximum(q_counts[:, None], 1)) * 100.0
     q_maes = q_abs_sums / np.maximum(q_counts, 1)
 
     rows: List[Dict[str, Any]] = [
-        _make_row("Overall", "Overall (All Validation)", overall_n, overall_eras, overall_bins, overall_mae),
-        _make_row(
+        _build_error_waterfall_summary_row("Overall", "Overall (All Validation)", overall_n, overall_eras, overall_bins, overall_mae),
+        _build_error_waterfall_summary_row(
             "Quarterly Avg",
             f"Quarterly Avg ({n_quarters} Qtrs)",
             int(round(float(np.mean(q_counts)))),
@@ -4367,7 +4433,7 @@ def compute_error_bin_waterfall(
         s_mask = q_season_ids == q_idx
         if np.any(s_mask):
             rows.append(
-                _make_row(
+                _build_error_waterfall_summary_row(
                     "Seasonal Avg",
                     f"Q{q_idx} Avg ({int(s_mask.sum())} yrs)",
                     int(round(float(np.mean(q_counts[s_mask])))),
@@ -4383,7 +4449,7 @@ def compute_error_bin_waterfall(
         yr, qt = qk // 10, qk % 10
         label = f"{yr}-Q{qt}" if quarter_is_calendar else f"Y{yr}-Q{qt}"
         rows.append(
-            _make_row(
+            _build_error_waterfall_summary_row(
                 "Financial Quarter",
                 label,
                 int(q_counts[idx]),
@@ -4440,7 +4506,7 @@ def plot_error_bin_waterfall(
     title: str = "Best Model",
     save_path: Optional[Any] = None,
 ) -> None:
-    """Plot a 2-panel flight-deck Error-Bin Waterfall (Overall step-down + Financial Quarter diverging stacked bars)."""
+    """Plot a 2-panel Error-Bin Waterfall (Overall step-down + Financial Quarter diverging stacked bars)."""
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
@@ -4606,7 +4672,15 @@ def plot_error_bin_waterfall(
     plt.show()
 
 
-def plot_flight_residual_diagnostics(
+def _apply_clean_residual_axes_style(ax: Any) -> None:
+    """Apply faint horizontal grey gridlines and hide top/right spines on a residual axis."""
+    ax.yaxis.grid(True, color="grey", alpha=0.25)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+
+def plot_residual_diagnostics(
     y_true: Any,
     predictions_by_model: Mapping[str, Any],
     eras: Any,
@@ -4619,9 +4693,9 @@ def plot_flight_residual_diagnostics(
     random_state: int = 42,
     save_prefix: Optional[Any] = None,
 ) -> pd.DataFrame:
-    """Plot flight-notebook-style residual diagnostics across one or more models.
+    """Plot residual diagnostics across one or more models.
 
-    Generates two figures mirroring the flight-deck residual analysis:
+    Generates two figures:
       1. Residuals vs Actual Target (`Predicted - Actual`, below 0 = under-predicting), side-by-side per model.
       2. Actual vs Predicted Target by Era (era-mean trend) stacked above Per-Era Residual (`Predicted - Actual`).
 
@@ -4710,12 +4784,6 @@ def plot_flight_residual_diagnostics(
     is_discrete_target = 2 <= len(unique_actuals) <= 10
     jitter_half = 0.08 * float(np.min(np.diff(unique_actuals))) if is_discrete_target else 0.0
 
-    def _despine_and_grid(ax: Any) -> None:
-        ax.yaxis.grid(True, color="grey", alpha=0.25)
-        ax.set_axisbelow(True)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
     prefix_path = Path(save_prefix) if save_prefix is not None else None
     if prefix_path is not None:
         prefix_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4755,7 +4823,7 @@ def plot_flight_residual_diagnostics(
         ax.set_ylabel("Residual: Predicted - Actual")
         if is_discrete_target and not jitter_discrete:
             ax.set_xticks(unique_actuals)
-        _despine_and_grid(ax)
+        _apply_clean_residual_axes_style(ax)
 
     for extra_ax in flat_axes1[n_models:]:
         extra_ax.set_visible(False)
@@ -4840,11 +4908,11 @@ def plot_flight_residual_diagnostics(
             ncol=min(2, n_models + 1),
             fontsize=8.8,
         )
-        _despine_and_grid(ax_top)
+        _apply_clean_residual_axes_style(ax_top)
 
         ax_bot.set_xlabel("Validation Era")
         ax_bot.set_ylabel("Predicted - Actual")
-        _despine_and_grid(ax_bot)
+        _apply_clean_residual_axes_style(ax_bot)
 
         fig2.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
         if prefix_path is not None:
