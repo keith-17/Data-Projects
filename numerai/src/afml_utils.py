@@ -1429,6 +1429,84 @@ def cluster_features_onc(
     )
 
 
+def _resolve_mda_feature_columns(
+    X: pd.DataFrame,
+    feature_columns: Optional[Sequence[str]],
+) -> List[str]:
+    """Select validated non-metadata feature column names present in `X` for Clustered MDA."""
+    forbidden = {"era", "date", "data_type", "id", "numerai_ticker", "week_no", "year_horizon", "target"}
+    if feature_columns is not None:
+        return [str(c) for c in feature_columns if str(c) in X.columns]
+    return [str(c) for c in X.columns if str(c) not in forbidden and not str(c).startswith("target")]
+
+
+def _resolve_mda_feature_clusters(
+    X: pd.DataFrame,
+    feat_cols: Sequence[str],
+    clusters: Optional[Mapping[int, Sequence[str]]],
+    *,
+    max_clusters: int,
+    random_state: int,
+) -> Dict[int, List[str]]:
+    """Build or sanitize the `cluster_id -> feature_names` mapping used by Clustered MDA."""
+    if clusters is None:
+        onc_res = cluster_features_onc(
+            X,
+            feat_cols,
+            metric="correlation",
+            max_clusters=min(int(max_clusters), max(2, len(feat_cols) - 1)),
+            random_state=random_state,
+        )
+        return {int(k): list(v) for k, v in onc_res["clusters"].items()}
+    sanitized = {int(k): [str(c) for c in v if str(c) in X.columns] for k, v in clusters.items()}
+    return {k: v for k, v in sanitized.items() if len(v) > 0}
+
+
+def _compute_mean_era_numerai_corr(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    eras: np.ndarray,
+) -> float:
+    """Compute mean per-era official `numerai_corr`, returning `0.0` for degenerate eras."""
+    frame = pd.DataFrame({"era": eras, "target": y_true, "prediction": y_pred})
+    scores: List[float] = []
+    for _, grp in frame.groupby("era", sort=True):
+        if len(grp) < 3 or _is_const_1d(grp["prediction"].to_numpy()) or _is_const_1d(grp["target"].to_numpy()):
+            scores.append(0.0)
+        else:
+            v = float(numerai_corr(grp[["prediction"]], grp["target"])["prediction"])
+            scores.append(v if np.isfinite(v) else 0.0)
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def _summarize_clustered_mda_deltas(
+    deltas_by_cluster: Mapping[int, Sequence[float]],
+    cluster_map: Mapping[int, Sequence[str]],
+) -> pd.DataFrame:
+    """Aggregate per-fold Clustered MDA score drops into mean, std, t-stat, and top-feature summary rows."""
+    rows: List[Dict[str, Any]] = []
+    for cid, d_list in deltas_by_cluster.items():
+        d_arr = np.asarray(d_list, dtype=np.float64)
+        mean_d = float(np.mean(d_arr)) if len(d_arr) else 0.0
+        std_d = float(np.std(d_arr, ddof=1)) if len(d_arr) >= 2 else 0.0
+        se_d = std_d / float(np.sqrt(len(d_arr))) if len(d_arr) >= 2 else 0.0
+        t_stat = (mean_d / se_d) if se_d > 1e-12 else 0.0
+        members = cluster_map[cid]
+        rows.append({
+            "cluster_id": int(cid),
+            "n_features": int(len(members)),
+            "mda_mean": round(mean_d, 6),
+            "mda_std": round(std_d, 6),
+            "mda_tstat": round(t_stat, 3),
+            "top_features": ", ".join(members[:5]) + (" ..." if len(members) > 5 else ""),
+        })
+    return (
+        pd.DataFrame(rows)
+        .sort_values("mda_mean", ascending=False, kind="stable")
+        .reset_index(drop=True)
+    )
+
+
 def compute_clustered_mda(
     estimator: Any,
     X: pd.DataFrame,
@@ -1450,31 +1528,19 @@ def compute_clustered_mda(
     eliminating the substitution effect that breaks single-feature MDI/MDA under multicollinearity.
     Scores impact using official per-era `numerai_corr`.
     """
-    forbidden = {"era", "date", "data_type", "id", "numerai_ticker", "week_no", "year_horizon", "target"}
-    if feature_columns is not None:
-        feat_cols = [str(c) for c in feature_columns if str(c) in X.columns]
-    else:
-        feat_cols = [str(c) for c in X.columns if str(c) not in forbidden and not str(c).startswith("target")]
-
+    feat_cols = _resolve_mda_feature_columns(X, feature_columns)
     if not feat_cols:
         return pd.DataFrame(columns=["cluster_id", "n_features", "mda_mean", "mda_std", "mda_tstat", "top_features"])
 
     era_arr = np.asarray(eras, dtype=np.int64).ravel()
     y_arr = np.asarray(y, dtype=np.float64).ravel()
-
-    if clusters is None:
-        onc_res = cluster_features_onc(
-            X,
-            feat_cols,
-            metric="correlation",
-            max_clusters=min(int(max_clusters), max(2, len(feat_cols) - 1)),
-            random_state=random_state,
-        )
-        cluster_map: Dict[int, List[str]] = {int(k): list(v) for k, v in onc_res["clusters"].items()}
-    else:
-        cluster_map = {int(k): [str(c) for c in v if str(c) in X.columns] for k, v in clusters.items()}
-        cluster_map = {k: v for k, v in cluster_map.items() if len(v) > 0}
-
+    cluster_map = _resolve_mda_feature_clusters(
+        X,
+        feat_cols,
+        clusters,
+        max_clusters=max_clusters,
+        random_state=random_state,
+    )
     splits = (
         list(cv_splits)
         if cv_splits is not None
@@ -1486,37 +1552,23 @@ def compute_clustered_mda(
         )
     )
 
-    def _mean_era_ncorr(y_t: np.ndarray, y_p: np.ndarray, e_t: np.ndarray) -> float:
-        frame = pd.DataFrame({"era": e_t, "target": y_t, "prediction": y_p})
-        scores: List[float] = []
-        for _, grp in frame.groupby("era", sort=True):
-            if len(grp) < 3 or _is_const_1d(grp["prediction"].to_numpy()) or _is_const_1d(grp["target"].to_numpy()):
-                scores.append(0.0)
-            else:
-                v = float(numerai_corr(grp[["prediction"]], grp["target"])["prediction"])
-                scores.append(v if np.isfinite(v) else 0.0)
-        return float(np.mean(scores)) if scores else 0.0
-
     rng = np.random.default_rng(int(random_state))
     deltas_by_cluster: Dict[int, List[float]] = {cid: [] for cid in cluster_map}
     reps = max(1, int(n_repeats))
-
     row_index_vals = X.index.to_numpy()
+
     for tr_idx, te_idx in splits:
-        tr_labels = row_index_vals[tr_idx]
-        te_labels = row_index_vals[te_idx]
-        X_tr = X.loc[tr_labels]
+        X_tr = X.loc[row_index_vals[tr_idx]]
         y_tr = y_arr[tr_idx]
-        X_te = X.loc[te_labels]
+        X_te = X.loc[row_index_vals[te_idx]]
         y_te = y_arr[te_idx]
         e_te = era_arr[te_idx]
 
         model = clone(estimator)
         model.fit(X_tr, y_tr)
         base_preds = np.asarray(model.predict(X_te), dtype=np.float64).ravel()
-        base_score = _mean_era_ncorr(y_te, base_preds, e_te)
+        base_score = _compute_mean_era_numerai_corr(y_te, base_preds, e_te)
 
-        # Permute each cluster within each era (preserving era structure while destroying cross-sectional signal)
         n_te = len(X_te)
         for cid, c_cols in cluster_map.items():
             rep_deltas: List[float] = []
@@ -1526,32 +1578,11 @@ def compute_clustered_mda(
                 orig_block = X_te[c_cols].to_numpy(copy=True)
                 X_perm[c_cols] = orig_block[perm_idx]
                 perm_preds = np.asarray(model.predict(X_perm), dtype=np.float64).ravel()
-                perm_score = _mean_era_ncorr(y_te, perm_preds, e_te)
+                perm_score = _compute_mean_era_numerai_corr(y_te, perm_preds, e_te)
                 rep_deltas.append(base_score - perm_score)
             deltas_by_cluster[cid].append(float(np.mean(rep_deltas)))
 
-    rows: List[Dict[str, Any]] = []
-    for cid, d_list in deltas_by_cluster.items():
-        d_arr = np.asarray(d_list, dtype=np.float64)
-        mean_d = float(np.mean(d_arr)) if len(d_arr) else 0.0
-        std_d = float(np.std(d_arr, ddof=1)) if len(d_arr) >= 2 else 0.0
-        se_d = std_d / float(np.sqrt(len(d_arr))) if len(d_arr) >= 2 else 0.0
-        t_stat = (mean_d / se_d) if se_d > 1e-12 else 0.0
-        members = cluster_map[cid]
-        rows.append({
-            "cluster_id": int(cid),
-            "n_features": int(len(members)),
-            "mda_mean": round(mean_d, 6),
-            "mda_std": round(std_d, 6),
-            "mda_tstat": round(t_stat, 3),
-            "top_features": ", ".join(members[:5]) + (" ..." if len(members) > 5 else ""),
-        })
-
-    return (
-        pd.DataFrame(rows)
-        .sort_values("mda_mean", ascending=False, kind="stable")
-        .reset_index(drop=True)
-    )
+    return _summarize_clustered_mda_deltas(deltas_by_cluster, cluster_map)
 
 
 # ---------------------------------------------------------------------------

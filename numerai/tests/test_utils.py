@@ -704,14 +704,13 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
                     "mean_residual",
                     "mae",
                     "rmse",
-                    "mean_pct_error_nonzero",
                     "under_predict_pct",
                     "over_predict_pct",
                 },
             )
             self.assertTrue((Path(f"{prefix}_residuals_vs_actual.png")).is_file())
             self.assertTrue((Path(f"{prefix}_actual_vs_predicted_by_era.png")).is_file())
-            self.assertTrue((Path(f"{prefix}_pct_error_vs_actual.png")).is_file())
+            self.assertFalse((Path(f"{prefix}_pct_error_vs_actual.png")).exists())
 
         with self.assertRaises(ValueError):
             utils.plot_flight_residual_diagnostics(y_true, {"Bad": preds_a[:-1]}, eras)

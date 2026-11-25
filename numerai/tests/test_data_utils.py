@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -32,28 +33,40 @@ from data_utils import (
 )
 
 
+class _MockResponseStatusError(Exception):
+    """Test error carrying an HTTP `response.status_code` attribute."""
+
+    def __init__(self, code: int):
+        super().__init__(f"boom {code}")
+        self.response = SimpleNamespace(status_code=code)
+
+
+class _MockAttributeStatusError(Exception):
+    """Test error carrying a top-level HTTP `status` attribute."""
+
+    def __init__(self, code: int):
+        super().__init__(f"status {code}")
+        self.status = code
+
+
+def _copy_staged_numerapi_file(staged_dir: Path, _remote_path: str, dest_path: str) -> None:
+    """Mock `NumerAPI.download_dataset` side effect copying a staged synthetic file into `dest_path`."""
+    src_name = Path(dest_path).name
+    Path(dest_path).write_bytes((staged_dir / src_name).read_bytes())
+
+
 class TestHttpAndPathHelpers(unittest.TestCase):
     """Unit tests for HTTP error formatting and local dataset path discovery."""
 
     def test_extract_http_status_code_and_format_error(self) -> None:
-        class _RespErr(Exception):
-            def __init__(self, code: int):
-                super().__init__(f"boom {code}")
-                self.response = SimpleNamespace(status_code=code)
-
-        class _StatusAttrErr(Exception):
-            def __init__(self, code: int):
-                super().__init__(f"status {code}")
-                self.status = code
-
-        self.assertEqual(_extract_http_status_code(_RespErr(401)), 401)
-        self.assertEqual(_extract_http_status_code(_StatusAttrErr(429)), 429)
+        self.assertEqual(_extract_http_status_code(_MockResponseStatusError(401)), 401)
+        self.assertEqual(_extract_http_status_code(_MockAttributeStatusError(429)), 429)
         self.assertIsNone(_extract_http_status_code(RuntimeError("plain")))
 
-        msg_401 = _format_http_error("Kaggle failed", _RespErr(401))
+        msg_401 = _format_http_error("Kaggle failed", _MockResponseStatusError(401))
         self.assertIn("401 Unauthorized", msg_401)
 
-        msg_418 = _format_http_error("Kaggle failed", _RespErr(418))
+        msg_418 = _format_http_error("Kaggle failed", _MockResponseStatusError(418))
         self.assertIn("HTTP 418", msg_418)
 
         msg_plain = _format_http_error("Kaggle failed", RuntimeError("disk full"))
@@ -368,12 +381,7 @@ class TestLoadUnityNumeraiDataAndCache(unittest.TestCase):
             mock_kagglehub.dataset_download.side_effect = OSError("kagglehub offline")
 
             mock_numerapi_instance = MagicMock()
-
-            def _fake_download(_remote_path: str, dest_path: str) -> None:
-                src_name = Path(dest_path).name
-                Path(dest_path).write_bytes((staged_dir / src_name).read_bytes())
-
-            mock_numerapi_instance.download_dataset.side_effect = _fake_download
+            mock_numerapi_instance.download_dataset.side_effect = partial(_copy_staged_numerapi_file, staged_dir)
             mock_numerapi_cls = MagicMock(return_value=mock_numerapi_instance)
 
             with (

@@ -14,7 +14,7 @@ from sklearn.base import clone
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 
-from _fixtures import NOTEBOOKS_DIR, make_synthetic_numerai_panel
+from _fixtures import NOTEBOOKS_DIR, REPO_ROOT, make_synthetic_numerai_panel
 import baseline_utils
 from baseline_utils import (
     BaseNumeraiEstimator,
@@ -49,8 +49,42 @@ UNITY_NOTEBOOKS = (
 )
 
 
+def _find_nested_callables_and_lambdas(py_path: object) -> list[str]:
+    """Inspect a Python module AST for nested `def`/`class` inside functions or anonymous `lambda` expressions."""
+    tree = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
+    violations: list[str] = []
+    stack: list[tuple[ast.AST, bool, str]] = [(tree, False, "")]
+    while stack:
+        node, inside_function, owner_name = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if inside_function:
+                violations.append(f"{py_path.name}:{node.lineno} nested def '{node.name}' inside '{owner_name}'")
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, True, node.name))
+        elif isinstance(node, ast.ClassDef):
+            if inside_function:
+                violations.append(f"{py_path.name}:{node.lineno} nested class '{node.name}' inside '{owner_name}'")
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, inside_function, owner_name))
+        elif isinstance(node, ast.Lambda):
+            violations.append(f"{py_path.name}:{node.lineno} anonymous lambda inside '{owner_name or '<module>'}'")
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, inside_function, owner_name))
+        else:
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, inside_function, owner_name))
+    return violations
+
+
 class TestNotebookStructureAndStandards(unittest.TestCase):
     """Validate structure, syntax, coding standards, and required sections across all Unity notebooks."""
+
+    def test_no_nested_functions_classes_or_lambdas_in_src_or_tests(self) -> None:
+        violations: list[str] = []
+        for folder_name in ("src", "tests"):
+            for py_path in sorted((REPO_ROOT / folder_name).glob("*.py")):
+                violations.extend(_find_nested_callables_and_lambdas(py_path))
+        self.assertEqual(violations, [], f"Nested functions/classes/lambdas found: {violations}")
 
     def test_all_unity_notebooks_exist_and_compile_cleanly(self) -> None:
         for nb_name in UNITY_NOTEBOOKS:

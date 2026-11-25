@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
 from pathlib import Path
+from typing import List
 
 import matplotlib
 matplotlib.use("Agg")
@@ -28,11 +30,43 @@ from utils import (
 )
 
 
+def _collect_nested_callables_and_lambdas(py_file: Path) -> List[str]:
+    """Return AST violation strings for any nested `def`/`class` inside a function or any `lambda` in `py_file`."""
+    tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+    violations: List[str] = []
+    stack: List[tuple[ast.AST, bool, str]] = [(tree, False, "")]
+    while stack:
+        node, inside_function, owner_name = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if inside_function:
+                violations.append(f"{py_file.name}:{node.lineno} nested def '{node.name}' inside '{owner_name}'")
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, True, node.name))
+        elif isinstance(node, ast.ClassDef):
+            if inside_function:
+                violations.append(f"{py_file.name}:{node.lineno} nested class '{node.name}' inside '{owner_name}'")
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, inside_function, owner_name))
+        elif isinstance(node, ast.Lambda):
+            violations.append(f"{py_file.name}:{node.lineno} anonymous lambda inside '{owner_name or '<module>'}'")
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, inside_function, owner_name))
+        else:
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, inside_function, owner_name))
+    return violations
+
+
 def test_coding_standards() -> None:
-    for py_file in (REPO_ROOT / "src").glob("*.py"):
+    for py_file in sorted((REPO_ROOT / "src").glob("*.py")):
         txt = py_file.read_text(encoding="utf-8")
         assert ".iloc" not in txt, f"Forbidden .iloc found in {py_file}"
-    for nb_file in (REPO_ROOT / "notebooks").glob("*.ipynb"):
+        violations = _collect_nested_callables_and_lambdas(py_file)
+        assert not violations, f"Nested functions/classes/lambdas found in {py_file.name}: {violations}"
+    for py_file in sorted((REPO_ROOT / "tests").glob("*.py")):
+        violations = _collect_nested_callables_and_lambdas(py_file)
+        assert not violations, f"Nested functions/classes/lambdas found in {py_file.name}: {violations}"
+    for nb_file in sorted((REPO_ROOT / "notebooks").glob("*.ipynb")):
         nb = json.load(open(nb_file, encoding="utf-8"))
         for idx, cell in enumerate(nb["cells"]):
             if cell["cell_type"] != "code":
@@ -40,6 +74,11 @@ def test_coding_standards() -> None:
             src = "".join(cell.get("source", []))
             assert ".iloc" not in src, f"Forbidden .iloc in {nb_file.name} cell {idx}"
             assert not re.search(r"^\s*(async\s+)?def\s+", src, flags=re.M), f"Forbidden def in {nb_file.name} cell {idx}"
+            cleaned_src = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith(("%", "!")))
+            if cleaned_src.strip():
+                cell_tree = ast.parse(cleaned_src, filename=f"{nb_file.name}:cell_{idx}")
+                lambdas = [n.lineno for n in ast.walk(cell_tree) if isinstance(n, ast.Lambda)]
+                assert not lambdas, f"Forbidden lambda in {nb_file.name} cell {idx} lines {lambdas}"
             if idx > 1:
                 assert not re.search(
                     r"^\s*(import\s+|from\s+\S+\s+import\s+)", src, flags=re.M

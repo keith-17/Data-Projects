@@ -1124,6 +1124,125 @@ LagReversalBaseline = LagReversalEstimator
 PersistenceBaseline = PersistenceEstimator
 
 
+def _build_baseline_result_entry(
+    *,
+    variant_name: str,
+    train_eval: Dict[str, Any],
+    val_eval: Dict[str, Any],
+    val_preds: np.ndarray,
+    val_pnl: Dict[str, Any],
+    val_dsr_info: Dict[str, Any],
+    score_version: str,
+    estimator_params: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Assemble the standardized comparison dictionary for one evaluated baseline variant."""
+    return {
+        "variant": variant_name,
+        "train_corr": train_eval["numerai_corr"],
+        "validation_corr": val_eval["numerai_corr"],
+        "validation_corr_pct": val_eval["numerai_corr_pct"],
+        "positive_era_pct": val_eval["positive_era_pct"],
+        "era_consistency_pct": val_eval["era_consistency_pct"],
+        "directional_accuracy_pct": val_eval["directional_accuracy_pct"],
+        "validation_spearman": val_eval["spearman"],
+        "validation_payout": val_eval["payout"],
+        "validation_sharpe": val_eval["numerai_sharpe"],
+        "validation_lo_sharpe": val_eval["lo_sharpe"],
+        "validation_psr": round(float(val_dsr_info["psr"]), 4),
+        "validation_dsr": round(float(val_dsr_info["dsr"]), 4),
+        "effective_n_trials_onc": round(float(val_dsr_info["effective_n_trials"]), 2),
+        "validation_fnc": val_eval["feature_neutral_corr"],
+        "validation_fnc_sharpe": val_eval["fnc_sharpe"],
+        "tuw_max_eras": val_eval["tuw_max_eras"],
+        "hhi_pos": val_eval["hhi_pos"],
+        "hhi_neg": val_eval["hhi_neg"],
+        "validation_spearman_sharpe": val_eval["spearman_sharpe"],
+        "validation_mae": val_eval["mae"],
+        "forecast_bias": val_eval["forecast_bias"],
+        "directional_hit_rate": val_eval["directional_hit_rate"],
+        "era_corr_lag1_acf": val_eval["era_corr_lag1_acf"],
+        "ljung_box_pvalue": val_eval["ljung_box_pvalue"],
+        "arch_lm_pvalue": val_eval["arch_lm_pvalue"],
+        "adf_pvalue": val_eval["adf_pvalue"],
+        "era_corr_skew": val_eval["era_corr_skew"],
+        "era_corr_kurtosis": val_eval["era_corr_kurtosis"],
+        "jarque_bera_pvalue": val_eval["jarque_bera_pvalue"],
+        "feature_exposure": val_eval["feature_exposure"],
+        "corr_drawdown": val_eval["corr_drawdown"],
+        "start_capital": round(float(val_pnl["start_capital"]), 2),
+        "end_capital": round(float(val_pnl["end_capital"]), 2),
+        "total_profit": round(float(val_pnl["total_profit"]), 2),
+        "total_return_pct": round(float(val_pnl["total_return_pct"]), 2),
+        "money_drawdown_pct": round(float(val_pnl["money_drawdown_pct"]), 2),
+        "max_drawdown_gbp": round(float(val_pnl["max_drawdown_gbp"]), 2),
+        "worst_round_gbp": round(float(val_pnl["worst_round_gbp"]), 2),
+        "score_version": str(score_version),
+        "corr_gap": train_eval["numerai_corr"] - val_eval["numerai_corr"],
+        "sanity_status": val_eval["sanity_status"],
+        "validation_preds": val_preds,
+        "validation_era_corrs": val_eval["numerai_era_corrs"],
+        "params": estimator_params,
+    }
+
+
+def _build_baseline_cv_search(
+    pipeline: Any,
+    param_space: Any,
+    *,
+    search_mode: str,
+    cv_scorer: Any,
+    cv_object: Any,
+    n_iter: int,
+    random_state: int,
+    verbose: int,
+    error_score: Any,
+    n_jobs: int,
+) -> Any:
+    """Instantiate a configured `BayesSearchCV` or deduplicated `GridSearchCV` search object."""
+    from sklearn.model_selection import GridSearchCV
+    from utils import build_conditional_bayesian_spaces, deduplicate_param_grid
+
+    if search_mode == "bayes":
+        try:
+            from skopt import BayesSearchCV
+        except ImportError as exc:
+            raise ImportError("scikit-optimize is required for Bayesian search") from exc
+        search_spaces = (
+            param_space
+            if isinstance(param_space, list)
+            else build_conditional_bayesian_spaces(param_space, total_n_iter=n_iter)
+        )
+        return BayesSearchCV(
+            estimator=pipeline,
+            search_spaces=search_spaces,
+            n_iter=n_iter,
+            optimizer_kwargs={
+                "base_estimator": "ET",
+                "acq_func": "EI",
+                "n_initial_points": min(4, max(1, n_iter // 3)),
+            },
+            scoring=cv_scorer,
+            cv=cv_object,
+            refit=False,
+            random_state=random_state,
+            verbose=verbose,
+            error_score=error_score,
+            n_jobs=n_jobs,
+        )
+
+    deduped_grid = deduplicate_param_grid(param_space, base_params=pipeline.get_params(deep=True))
+    return GridSearchCV(
+        estimator=pipeline,
+        param_grid=deduped_grid,
+        scoring=cv_scorer,
+        cv=cv_object,
+        refit=False,
+        verbose=verbose,
+        error_score=error_score,
+        n_jobs=n_jobs,
+    )
+
+
 def run_baseline(
     baseline_name: str,
     pipeline: Any,
@@ -1157,14 +1276,11 @@ def run_baseline(
     Configures error binning and resets/collects the process-local `_CV_FOLD_METRIC_LOG` inside the worker so
     parallel execution under `joblib` (`loky`) preserves all extended CV metrics without loss.
     """
-    from sklearn.model_selection import GridSearchCV
     from utils import (
-        build_conditional_bayesian_spaces,
         build_quick_results_df,
         compute_deflated_sharpe_ratio,
         compute_pbo_cscv,
         configure_error_binning,
-        deduplicate_param_grid,
         evaluate_numerai_predictions,
         make_candidate_scorer,
         prepare_tuned_pipeline,
@@ -1174,17 +1290,11 @@ def run_baseline(
         walk_forward_predict,
     )
 
-    try:
-        from skopt import BayesSearchCV
-    except ImportError:
-        BayesSearchCV = None
-
     if error_bin_config is not None:
         configure_error_binning(**error_bin_config)
     if extraction_cache_config is not None:
         configure_extraction_cache(**extraction_cache_config)
 
-    # Extract optional validation era -> calendar date mapping so R1393+/R1399+ rules trigger on v6.0 dates
     val_era_dates: Optional[pd.Series] = None
     if isinstance(X_validation, pd.DataFrame) and "date" in X_validation.columns and "era" in X_validation.columns:
         val_era_dates = X_validation.groupby("era", sort=True)["date"].first()
@@ -1206,6 +1316,7 @@ def run_baseline(
 
     results_entries: Dict[str, Dict[str, Any]] = {}
     default_model = clone(pipeline).fit(X_train_static, y_train_static)
+    default_params = default_model.named_steps["estimator"].get_params()
 
     train_preds = default_model.predict(X_train_static)
     val_preds = default_model.predict(X_validation)
@@ -1229,57 +1340,20 @@ def run_baseline(
         verbose=True,
     )
 
-    default_variant_name = f"{baseline_name} [Default]"
     if eval_mode in ("static", "both"):
+        default_variant_name = f"{baseline_name} [Default]"
         val_pnl = simulate_stake_pnl(val_eval["numerai_era_corrs"], era_dates=val_era_dates)
         val_dsr_info = compute_deflated_sharpe_ratio(val_eval["numerai_era_corrs"], [val_eval["numerai_sharpe"]])
-        results_entries[default_variant_name] = {
-            "variant": default_variant_name,
-            "train_corr": train_eval["numerai_corr"],
-            "validation_corr": val_eval["numerai_corr"],
-            "validation_corr_pct": val_eval["numerai_corr_pct"],
-            "positive_era_pct": val_eval["positive_era_pct"],
-            "era_consistency_pct": val_eval["era_consistency_pct"],
-            "directional_accuracy_pct": val_eval["directional_accuracy_pct"],
-            "validation_spearman": val_eval["spearman"],
-            "validation_payout": val_eval["payout"],
-            "validation_sharpe": val_eval["numerai_sharpe"],
-            "validation_lo_sharpe": val_eval["lo_sharpe"],
-            "validation_psr": round(float(val_dsr_info["psr"]), 4),
-            "validation_dsr": round(float(val_dsr_info["dsr"]), 4),
-            "effective_n_trials_onc": round(float(val_dsr_info["effective_n_trials"]), 2),
-            "validation_fnc": val_eval["feature_neutral_corr"],
-            "validation_fnc_sharpe": val_eval["fnc_sharpe"],
-            "tuw_max_eras": val_eval["tuw_max_eras"],
-            "hhi_pos": val_eval["hhi_pos"],
-            "hhi_neg": val_eval["hhi_neg"],
-            "validation_spearman_sharpe": val_eval["spearman_sharpe"],
-            "validation_mae": val_eval["mae"],
-            "forecast_bias": val_eval["forecast_bias"],
-            "directional_hit_rate": val_eval["directional_hit_rate"],
-            "era_corr_lag1_acf": val_eval["era_corr_lag1_acf"],
-            "ljung_box_pvalue": val_eval["ljung_box_pvalue"],
-            "arch_lm_pvalue": val_eval["arch_lm_pvalue"],
-            "adf_pvalue": val_eval["adf_pvalue"],
-            "era_corr_skew": val_eval["era_corr_skew"],
-            "era_corr_kurtosis": val_eval["era_corr_kurtosis"],
-            "jarque_bera_pvalue": val_eval["jarque_bera_pvalue"],
-            "feature_exposure": val_eval["feature_exposure"],
-            "corr_drawdown": val_eval["corr_drawdown"],
-            "start_capital": round(float(val_pnl["start_capital"]), 2),
-            "end_capital": round(float(val_pnl["end_capital"]), 2),
-            "total_profit": round(float(val_pnl["total_profit"]), 2),
-            "total_return_pct": round(float(val_pnl["total_return_pct"]), 2),
-            "money_drawdown_pct": round(float(val_pnl["money_drawdown_pct"]), 2),
-            "max_drawdown_gbp": round(float(val_pnl["max_drawdown_gbp"]), 2),
-            "worst_round_gbp": round(float(val_pnl["worst_round_gbp"]), 2),
-            "score_version": str(score_version),
-            "corr_gap": train_eval["numerai_corr"] - val_eval["numerai_corr"],
-            "sanity_status": val_eval["sanity_status"],
-            "validation_preds": val_preds,
-            "validation_era_corrs": val_eval["numerai_era_corrs"],
-            "params": default_model.named_steps["estimator"].get_params(),
-        }
+        results_entries[default_variant_name] = _build_baseline_result_entry(
+            variant_name=default_variant_name,
+            train_eval=train_eval,
+            val_eval=val_eval,
+            val_preds=val_preds,
+            val_pnl=val_pnl,
+            val_dsr_info=val_dsr_info,
+            score_version=str(score_version),
+            estimator_params=default_params,
+        )
 
     if eval_mode in ("walk_forward", "both"):
         wf_preds = walk_forward_predict(
@@ -1307,92 +1381,30 @@ def run_baseline(
         wf_pnl = simulate_stake_pnl(wf_eval["numerai_era_corrs"], era_dates=val_era_dates)
         wf_dsr_info = compute_deflated_sharpe_ratio(wf_eval["numerai_era_corrs"], [wf_eval["numerai_sharpe"]])
         wf_variant_name = f"{baseline_name} [Walk-Forward]"
-        results_entries[wf_variant_name] = {
-            "variant": wf_variant_name,
-            "train_corr": train_eval["numerai_corr"],
-            "validation_corr": wf_eval["numerai_corr"],
-            "validation_corr_pct": wf_eval["numerai_corr_pct"],
-            "positive_era_pct": wf_eval["positive_era_pct"],
-            "era_consistency_pct": wf_eval["era_consistency_pct"],
-            "directional_accuracy_pct": wf_eval["directional_accuracy_pct"],
-            "validation_spearman": wf_eval["spearman"],
-            "validation_payout": wf_eval["payout"],
-            "validation_sharpe": wf_eval["numerai_sharpe"],
-            "validation_lo_sharpe": wf_eval["lo_sharpe"],
-            "validation_psr": round(float(wf_dsr_info["psr"]), 4),
-            "validation_dsr": round(float(wf_dsr_info["dsr"]), 4),
-            "effective_n_trials_onc": round(float(wf_dsr_info["effective_n_trials"]), 2),
-            "validation_fnc": wf_eval["feature_neutral_corr"],
-            "validation_fnc_sharpe": wf_eval["fnc_sharpe"],
-            "tuw_max_eras": wf_eval["tuw_max_eras"],
-            "hhi_pos": wf_eval["hhi_pos"],
-            "hhi_neg": wf_eval["hhi_neg"],
-            "validation_spearman_sharpe": wf_eval["spearman_sharpe"],
-            "validation_mae": wf_eval["mae"],
-            "forecast_bias": wf_eval["forecast_bias"],
-            "directional_hit_rate": wf_eval["directional_hit_rate"],
-            "era_corr_lag1_acf": wf_eval["era_corr_lag1_acf"],
-            "ljung_box_pvalue": wf_eval["ljung_box_pvalue"],
-            "arch_lm_pvalue": wf_eval["arch_lm_pvalue"],
-            "adf_pvalue": wf_eval["adf_pvalue"],
-            "era_corr_skew": wf_eval["era_corr_skew"],
-            "era_corr_kurtosis": wf_eval["era_corr_kurtosis"],
-            "jarque_bera_pvalue": wf_eval["jarque_bera_pvalue"],
-            "feature_exposure": wf_eval["feature_exposure"],
-            "corr_drawdown": wf_eval["corr_drawdown"],
-            "start_capital": round(float(wf_pnl["start_capital"]), 2),
-            "end_capital": round(float(wf_pnl["end_capital"]), 2),
-            "total_profit": round(float(wf_pnl["total_profit"]), 2),
-            "total_return_pct": round(float(wf_pnl["total_return_pct"]), 2),
-            "money_drawdown_pct": round(float(wf_pnl["money_drawdown_pct"]), 2),
-            "max_drawdown_gbp": round(float(wf_pnl["max_drawdown_gbp"]), 2),
-            "worst_round_gbp": round(float(wf_pnl["worst_round_gbp"]), 2),
-            "score_version": str(score_version),
-            "corr_gap": train_eval["numerai_corr"] - wf_eval["numerai_corr"],
-            "sanity_status": wf_eval["sanity_status"],
-            "validation_preds": wf_preds,
-            "validation_era_corrs": wf_eval["numerai_era_corrs"],
-            "params": default_model.named_steps["estimator"].get_params(),
-        }
+        results_entries[wf_variant_name] = _build_baseline_result_entry(
+            variant_name=wf_variant_name,
+            train_eval=train_eval,
+            val_eval=wf_eval,
+            val_preds=wf_preds,
+            val_pnl=wf_pnl,
+            val_dsr_info=wf_dsr_info,
+            score_version=str(score_version),
+            estimator_params=default_params,
+        )
 
     cv_scorer = make_candidate_scorer(score_version=score_version)
-    if search_mode == "bayes":
-        if BayesSearchCV is None:
-            raise ImportError("scikit-optimize is required for Bayesian search")
-        search_spaces = (
-            param_space
-            if isinstance(param_space, list)
-            else build_conditional_bayesian_spaces(param_space, total_n_iter=n_iter)
-        )
-        search = BayesSearchCV(
-            estimator=pipeline,
-            search_spaces=search_spaces,
-            n_iter=n_iter,
-            optimizer_kwargs={
-                "base_estimator": "ET",
-                "acq_func": "EI",
-                "n_initial_points": min(4, max(1, n_iter // 3)),
-            },
-            scoring=cv_scorer,
-            cv=cv_object,
-            refit=False,
-            random_state=random_state,
-            verbose=verbose,
-            error_score=error_score,
-            n_jobs=n_jobs,
-        )
-    else:
-        deduped_grid = deduplicate_param_grid(param_space, base_params=pipeline.get_params(deep=True))
-        search = GridSearchCV(
-            estimator=pipeline,
-            param_grid=deduped_grid,
-            scoring=cv_scorer,
-            cv=cv_object,
-            refit=False,
-            verbose=verbose,
-            error_score=error_score,
-            n_jobs=n_jobs,
-        )
+    search = _build_baseline_cv_search(
+        pipeline,
+        param_space,
+        search_mode=search_mode,
+        cv_scorer=cv_scorer,
+        cv_object=cv_object,
+        n_iter=n_iter,
+        random_state=random_state,
+        verbose=verbose,
+        error_score=error_score,
+        n_jobs=n_jobs,
+    )
 
     reset_cv_metric_log()
     search.fit(X_train, y_train, groups=train_eras)
@@ -1415,9 +1427,9 @@ def run_baseline(
         "best_params": best_params,
     }
 
-    # Post-search refit of the best CV candidate on horizon-purged X_train -> evaluate on held-out X_validation
     tuned_pipeline = prepare_tuned_pipeline(pipeline, best_params)
     tuned_model = clone(tuned_pipeline).fit(X_train_static, y_train_static)
+    tuned_params = tuned_model.named_steps["estimator"].get_params()
     tuned_train_preds = tuned_model.predict(X_train_static)
     tuned_val_preds = tuned_model.predict(X_validation)
 
@@ -1458,53 +1470,16 @@ def run_baseline(
             random_state=random_state,
         )
         tuned_variant_name = f"{baseline_name} [Tuned]"
-        results_entries[tuned_variant_name] = {
-            "variant": tuned_variant_name,
-            "train_corr": tuned_train_eval["numerai_corr"],
-            "validation_corr": tuned_val_eval["numerai_corr"],
-            "validation_corr_pct": tuned_val_eval["numerai_corr_pct"],
-            "positive_era_pct": tuned_val_eval["positive_era_pct"],
-            "era_consistency_pct": tuned_val_eval["era_consistency_pct"],
-            "directional_accuracy_pct": tuned_val_eval["directional_accuracy_pct"],
-            "validation_spearman": tuned_val_eval["spearman"],
-            "validation_payout": tuned_val_eval["payout"],
-            "validation_sharpe": tuned_val_eval["numerai_sharpe"],
-            "validation_lo_sharpe": tuned_val_eval["lo_sharpe"],
-            "validation_psr": round(float(tuned_dsr_info["psr"]), 4),
-            "validation_dsr": round(float(tuned_dsr_info["dsr"]), 4),
-            "effective_n_trials_onc": round(float(tuned_dsr_info["effective_n_trials"]), 2),
-            "validation_fnc": tuned_val_eval["feature_neutral_corr"],
-            "validation_fnc_sharpe": tuned_val_eval["fnc_sharpe"],
-            "tuw_max_eras": tuned_val_eval["tuw_max_eras"],
-            "hhi_pos": tuned_val_eval["hhi_pos"],
-            "hhi_neg": tuned_val_eval["hhi_neg"],
-            "validation_spearman_sharpe": tuned_val_eval["spearman_sharpe"],
-            "validation_mae": tuned_val_eval["mae"],
-            "forecast_bias": tuned_val_eval["forecast_bias"],
-            "directional_hit_rate": tuned_val_eval["directional_hit_rate"],
-            "era_corr_lag1_acf": tuned_val_eval["era_corr_lag1_acf"],
-            "ljung_box_pvalue": tuned_val_eval["ljung_box_pvalue"],
-            "arch_lm_pvalue": tuned_val_eval["arch_lm_pvalue"],
-            "adf_pvalue": tuned_val_eval["adf_pvalue"],
-            "era_corr_skew": tuned_val_eval["era_corr_skew"],
-            "era_corr_kurtosis": tuned_val_eval["era_corr_kurtosis"],
-            "jarque_bera_pvalue": tuned_val_eval["jarque_bera_pvalue"],
-            "feature_exposure": tuned_val_eval["feature_exposure"],
-            "corr_drawdown": tuned_val_eval["corr_drawdown"],
-            "start_capital": round(float(tuned_val_pnl["start_capital"]), 2),
-            "end_capital": round(float(tuned_val_pnl["end_capital"]), 2),
-            "total_profit": round(float(tuned_val_pnl["total_profit"]), 2),
-            "total_return_pct": round(float(tuned_val_pnl["total_return_pct"]), 2),
-            "money_drawdown_pct": round(float(tuned_val_pnl["money_drawdown_pct"]), 2),
-            "max_drawdown_gbp": round(float(tuned_val_pnl["max_drawdown_gbp"]), 2),
-            "worst_round_gbp": round(float(tuned_val_pnl["worst_round_gbp"]), 2),
-            "score_version": effective_ver,
-            "corr_gap": tuned_train_eval["numerai_corr"] - tuned_val_eval["numerai_corr"],
-            "sanity_status": tuned_val_eval["sanity_status"],
-            "validation_preds": tuned_val_preds,
-            "validation_era_corrs": tuned_val_eval["numerai_era_corrs"],
-            "params": tuned_model.named_steps["estimator"].get_params(),
-        }
+        results_entries[tuned_variant_name] = _build_baseline_result_entry(
+            variant_name=tuned_variant_name,
+            train_eval=tuned_train_eval,
+            val_eval=tuned_val_eval,
+            val_preds=tuned_val_preds,
+            val_pnl=tuned_val_pnl,
+            val_dsr_info=tuned_dsr_info,
+            score_version=effective_ver,
+            estimator_params=tuned_params,
+        )
 
     if eval_mode in ("walk_forward", "both"):
         tuned_wf_preds = walk_forward_predict(
@@ -1537,52 +1512,15 @@ def run_baseline(
             random_state=random_state,
         )
         tuned_wf_variant_name = f"{baseline_name} [Tuned Walk-Forward]"
-        results_entries[tuned_wf_variant_name] = {
-            "variant": tuned_wf_variant_name,
-            "train_corr": tuned_train_eval["numerai_corr"],
-            "validation_corr": tuned_wf_eval["numerai_corr"],
-            "validation_corr_pct": tuned_wf_eval["numerai_corr_pct"],
-            "positive_era_pct": tuned_wf_eval["positive_era_pct"],
-            "era_consistency_pct": tuned_wf_eval["era_consistency_pct"],
-            "directional_accuracy_pct": tuned_wf_eval["directional_accuracy_pct"],
-            "validation_spearman": tuned_wf_eval["spearman"],
-            "validation_payout": tuned_wf_eval["payout"],
-            "validation_sharpe": tuned_wf_eval["numerai_sharpe"],
-            "validation_lo_sharpe": tuned_wf_eval["lo_sharpe"],
-            "validation_psr": round(float(tuned_wf_dsr_info["psr"]), 4),
-            "validation_dsr": round(float(tuned_wf_dsr_info["dsr"]), 4),
-            "effective_n_trials_onc": round(float(tuned_wf_dsr_info["effective_n_trials"]), 2),
-            "validation_fnc": tuned_wf_eval["feature_neutral_corr"],
-            "validation_fnc_sharpe": tuned_wf_eval["fnc_sharpe"],
-            "tuw_max_eras": tuned_wf_eval["tuw_max_eras"],
-            "hhi_pos": tuned_wf_eval["hhi_pos"],
-            "hhi_neg": tuned_wf_eval["hhi_neg"],
-            "validation_spearman_sharpe": tuned_wf_eval["spearman_sharpe"],
-            "validation_mae": tuned_wf_eval["mae"],
-            "forecast_bias": tuned_wf_eval["forecast_bias"],
-            "directional_hit_rate": tuned_wf_eval["directional_hit_rate"],
-            "era_corr_lag1_acf": tuned_wf_eval["era_corr_lag1_acf"],
-            "ljung_box_pvalue": tuned_wf_eval["ljung_box_pvalue"],
-            "arch_lm_pvalue": tuned_wf_eval["arch_lm_pvalue"],
-            "adf_pvalue": tuned_wf_eval["adf_pvalue"],
-            "era_corr_skew": tuned_wf_eval["era_corr_skew"],
-            "era_corr_kurtosis": tuned_wf_eval["era_corr_kurtosis"],
-            "jarque_bera_pvalue": tuned_wf_eval["jarque_bera_pvalue"],
-            "feature_exposure": tuned_wf_eval["feature_exposure"],
-            "corr_drawdown": tuned_wf_eval["corr_drawdown"],
-            "start_capital": round(float(tuned_wf_pnl["start_capital"]), 2),
-            "end_capital": round(float(tuned_wf_pnl["end_capital"]), 2),
-            "total_profit": round(float(tuned_wf_pnl["total_profit"]), 2),
-            "total_return_pct": round(float(tuned_wf_pnl["total_return_pct"]), 2),
-            "money_drawdown_pct": round(float(tuned_wf_pnl["money_drawdown_pct"]), 2),
-            "max_drawdown_gbp": round(float(tuned_wf_pnl["max_drawdown_gbp"]), 2),
-            "worst_round_gbp": round(float(tuned_wf_pnl["worst_round_gbp"]), 2),
-            "score_version": effective_ver,
-            "corr_gap": tuned_train_eval["numerai_corr"] - tuned_wf_eval["numerai_corr"],
-            "sanity_status": tuned_wf_eval["sanity_status"],
-            "validation_preds": tuned_wf_preds,
-            "validation_era_corrs": tuned_wf_eval["numerai_era_corrs"],
-            "params": tuned_model.named_steps["estimator"].get_params(),
-        }
+        results_entries[tuned_wf_variant_name] = _build_baseline_result_entry(
+            variant_name=tuned_wf_variant_name,
+            train_eval=tuned_train_eval,
+            val_eval=tuned_wf_eval,
+            val_preds=tuned_wf_preds,
+            val_pnl=tuned_wf_pnl,
+            val_dsr_info=tuned_wf_dsr_info,
+            score_version=effective_ver,
+            estimator_params=tuned_params,
+        )
 
     return baseline_name, results_entries, cv_results_df, search_summary_row, tuned_model
