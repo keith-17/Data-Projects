@@ -871,6 +871,22 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         sample_weight: Optional[Any] = None,
         eras: Optional[Any] = None,
     ) -> "MiniRocketNumeraiEstimator":
+        return self._fit_with_fail_safe(
+            self._fit_impl,
+            X,
+            y,
+            sample_weight=sample_weight,
+            eras=eras,
+            context="MiniRocketNumeraiEstimator.fit",
+        )
+
+    def _fit_impl(
+        self,
+        X: Any,
+        y: Any,
+        sample_weight: Optional[Any] = None,
+        eras: Optional[Any] = None,
+    ) -> "MiniRocketNumeraiEstimator":
         _, feature_matrix, target_values, _, sample_weights, era_values = self._prepare_fit_inputs(
             X, y, sample_weight=sample_weight, eras=eras, return_matrix=True, matrix_dtype=np.float32
         )
@@ -1034,6 +1050,9 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         return preds
 
     def predict(self, X: Any) -> np.ndarray:
+        aborted = self._aborted_predict(X)
+        if aborted is not None:
+            return aborted
         if not hasattr(self, "rocket_") or not hasattr(self, "coef_"):
             raise ValueError("MiniRocketNumeraiEstimator must be fitted before calling predict.")
         features_df, era_values = self._prepare_predict_df(X)

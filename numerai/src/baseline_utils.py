@@ -24,6 +24,7 @@ from utils import (
     NumeraiExtractions,
     _all_numeric_dtypes,
     _decode_structured,
+    _reclaim_cached_memory,
     _safe_autocorr,
     check_memory_budget,
     compute_feature_target_correlations,
@@ -463,6 +464,65 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
         bias_offset = float(getattr(self, "learned_bias_offset_", 0.0))
         return (transformed + bias_offset) if abs(bias_offset) > 1e-15 else transformed
 
+    def _mark_aborted_fit(
+        self,
+        exc: BaseException,
+        y: Any = None,
+        *,
+        context: str = "",
+    ) -> "BaseNumeraiEstimator":
+        """Record a failed-safe aborted fit so ``predict`` returns a constant array penalized to ``-1.0``."""
+        fallback = 0.5
+        if y is not None:
+            try:
+                y_arr = np.asarray(y, dtype=np.float64).ravel()
+                finite_y = y_arr[np.isfinite(y_arr)]
+                if len(finite_y) > 0:
+                    fallback = float(np.mean(finite_y))
+            except Exception:
+                fallback = 0.5
+        self._aborted_reason_ = str(exc) or type(exc).__name__
+        self._aborted_fallback_value_ = fallback
+        _reclaim_cached_memory()
+        gc.collect()
+        ctx = context or f"{type(self).__name__}.fit"
+        print(
+            f"  [FAIL-SAFE ABORT | {ctx}] Returning constant fallback={fallback:.4f} "
+            f"so CV assigns -1.0 without crashing: {self._aborted_reason_}"
+        )
+        return self
+
+    def _aborted_predict(self, X: Any) -> Optional[np.ndarray]:
+        """Return a constant prediction array if ``fit`` aborted under a time/memory fail-safe."""
+        if getattr(self, "_aborted_reason_", None) is None:
+            return None
+        n_rows = len(X)
+        fallback = float(getattr(self, "_aborted_fallback_value_", 0.5))
+        return np.full(n_rows, fallback, dtype=np.float64)
+
+    def _fit_with_fail_safe(
+        self,
+        fit_impl: Any,
+        X: Any,
+        y: Any,
+        sample_weight: Optional[Any] = None,
+        eras: Optional[Any] = None,
+        *,
+        context: str = "",
+    ) -> "BaseNumeraiEstimator":
+        """Run ``fit_impl``, converting ``TimeoutError``/``MemoryError`` into a constant-prediction aborted fit.
+
+        Inside ``BayesSearchCV`` (``n_points=1``), raising out of ``fit()`` aborts the entire search with
+        ``ValueError: All the 1 fits failed`` even when ``error_score=-1.0``. Returning ``self`` in an
+        aborted state lets ``predict()`` emit a constant array that ``candidate_score`` penalizes to ``-1.0``.
+        """
+        self._aborted_reason_ = None
+        self._aborted_fallback_value_ = 0.5
+        try:
+            return fit_impl(X, y, sample_weight=sample_weight, eras=eras)
+        except (TimeoutError, MemoryError) as exc:
+            return self._mark_aborted_fit(exc, y=y, context=context or f"{type(self).__name__}.fit")
+
 
 class BinSnappingEstimator(BaseNumeraiEstimator):
     """Child Class — Baseline A: Deterministic Bin-Snapping ("Map Matching") lookup-table estimator."""
@@ -604,6 +664,22 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
         sample_weight: Optional[Any] = None,
         eras: Optional[Any] = None,
     ) -> "BinSnappingEstimator":
+        return self._fit_with_fail_safe(
+            self._fit_impl,
+            X,
+            y,
+            sample_weight=sample_weight,
+            eras=eras,
+            context="BinSnappingEstimator.fit",
+        )
+
+    def _fit_impl(
+        self,
+        X: Any,
+        y: Any,
+        sample_weight: Optional[Any] = None,
+        eras: Optional[Any] = None,
+    ) -> "BinSnappingEstimator":
         features_df, _, target_values, _, sample_weights, era_values = self._prepare_fit_inputs(
             X, y, sample_weight=sample_weight, eras=eras, return_matrix=False
         )
@@ -698,6 +774,9 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
         return self
 
     def predict(self, X: Any) -> np.ndarray:
+        aborted = self._aborted_predict(X)
+        if aborted is not None:
+            return aborted
         if not hasattr(self, "bin_table_"):
             raise ValueError("BinSnappingEstimator must be fitted before calling predict.")
         features_df, era_values = self._prepare_predict_df(X)
@@ -778,6 +857,22 @@ class LagReversalEstimator(BaseNumeraiEstimator):
         self.center_features = center_features
 
     def fit(
+        self,
+        X: Any,
+        y: Any,
+        sample_weight: Optional[Any] = None,
+        eras: Optional[Any] = None,
+    ) -> "LagReversalEstimator":
+        return self._fit_with_fail_safe(
+            self._fit_impl,
+            X,
+            y,
+            sample_weight=sample_weight,
+            eras=eras,
+            context="LagReversalEstimator.fit",
+        )
+
+    def _fit_impl(
         self,
         X: Any,
         y: Any,
@@ -971,6 +1066,9 @@ class LagReversalEstimator(BaseNumeraiEstimator):
         return self
 
     def predict(self, X: Any) -> np.ndarray:
+        aborted = self._aborted_predict(X)
+        if aborted is not None:
+            return aborted
         if not hasattr(self, "weights_"):
             raise ValueError("LagReversalEstimator must be fitted before calling predict.")
         features_df, era_values = self._prepare_predict_df(X)
@@ -1141,6 +1239,22 @@ class PersistenceEstimator(BaseNumeraiEstimator):
         sample_weight: Optional[Any] = None,
         eras: Optional[Any] = None,
     ) -> "PersistenceEstimator":
+        return self._fit_with_fail_safe(
+            self._fit_impl,
+            X,
+            y,
+            sample_weight=sample_weight,
+            eras=eras,
+            context="PersistenceEstimator.fit",
+        )
+
+    def _fit_impl(
+        self,
+        X: Any,
+        y: Any,
+        sample_weight: Optional[Any] = None,
+        eras: Optional[Any] = None,
+    ) -> "PersistenceEstimator":
         X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
         if self.target_col and self.target_col in X_df.columns:
             target_values = pd.to_numeric(X_df[self.target_col], errors="coerce").fillna(0.5).to_numpy(dtype=np.float64)
@@ -1275,6 +1389,9 @@ class PersistenceEstimator(BaseNumeraiEstimator):
         return self
 
     def predict(self, X: Any) -> np.ndarray:
+        aborted = self._aborted_predict(X)
+        if aborted is not None:
+            return aborted
         if not hasattr(self, "global_mean_"):
             raise ValueError("PersistenceEstimator must be fitted before calling predict.")
         X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)

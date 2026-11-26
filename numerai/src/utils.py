@@ -2706,22 +2706,26 @@ def candidate_score(
         and wf_train_eras is not None
         and eras is not None
     ):
-        preds = np.asarray(
-            walk_forward_predict(
-                estimator,
-                wf_train_X,
-                pd.Series(wf_train_y),
-                pd.Series(wf_train_eras),
-                X,
-                pd.Series(targets),
-                pd.Series(eras),
-                step_eras=int(wf_step),
-                window_mode=str(getattr(inner_est, "walk_forward_window", "expanding") or "expanding"),
-                target_horizon_eras=int(getattr(inner_est, "target_horizon_eras", 4) or 4),
-                era_stride=int(getattr(inner_est, "era_stride", 1) or 1),
-            ),
-            dtype=np.float64,
-        ).ravel()
+        try:
+            preds = np.asarray(
+                walk_forward_predict(
+                    estimator,
+                    wf_train_X,
+                    pd.Series(wf_train_y),
+                    pd.Series(wf_train_eras),
+                    X,
+                    pd.Series(targets),
+                    pd.Series(eras),
+                    step_eras=int(wf_step),
+                    window_mode=str(getattr(inner_est, "walk_forward_window", "expanding") or "expanding"),
+                    target_horizon_eras=int(getattr(inner_est, "target_horizon_eras", 4) or 4),
+                    era_stride=int(getattr(inner_est, "era_stride", 1) or 1),
+                ),
+                dtype=np.float64,
+            ).ravel()
+        except (TimeoutError, MemoryError) as exc:
+            print(f"  [FAIL-SAFE ABORT | walk_forward_predict] Returning constant fallback so CV assigns -1.0: {exc}")
+            preds = np.full(len(targets), 0.5, dtype=np.float64)
     else:
         preds = np.asarray(estimator.predict(X), dtype=np.float64).ravel()
     era_corrs = compute_per_era_numerai_corr(targets, preds, eras=eras)

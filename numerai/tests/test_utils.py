@@ -1174,6 +1174,69 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
             out_png = tmp_dir / "20261126_unit_lightgbm_regressor_candidate_timing_analysis.png"
             self.assertTrue(out_png.is_file())
 
+    def test_bayes_search_survives_time_and_memory_guard_aborts(self):
+        """BayesSearchCV(n_points=1, cv=1 fold) must score -1.0 and continue instead of raising ValueError."""
+        from skopt import BayesSearchCV
+        from skopt.space import Integer
+        from lgbm_utils import LightGBMNumeraiEstimator
+        from baseline_utils import LagReversalEstimator
+
+        df, feat_cols = make_synthetic_numerai_panel(n_eras=8, n_tickers=10, n_features=6, seed=11)
+        X = df[["era", "numerai_ticker"] + feat_cols].copy()
+        y = df["target"].copy()
+        tr_idx = np.flatnonzero(df["era"].to_numpy() <= 5)
+        va_idx = np.flatnonzero(df["era"].to_numpy() > 5)
+        cv_splits = [(tr_idx, va_idx)]
+        scorer = utils.make_candidate_scorer("v1_skepta")
+
+        try:
+            # 1) Time fail-safe inside BayesSearchCV (n_points=1, 1 fold): must NOT raise ValueError: All the 1 fits failed
+            utils.configure_time_guard(enabled=True, max_candidate_seconds=1e-6)
+            utils.configure_memory_guard(enabled=False, min_free_gb=3.0)
+            lgb_pipe = Pipeline([("estimator", LightGBMNumeraiEstimator(n_estimators=5, verbose=-1, n_jobs=1))])
+            search_time = BayesSearchCV(
+                estimator=lgb_pipe,
+                search_spaces={"estimator__num_leaves": Integer(4, 8)},
+                n_iter=2,
+                optimizer_kwargs={"base_estimator": "ET", "acq_func": "EI", "n_initial_points": 1},
+                scoring=scorer,
+                cv=cv_splits,
+                refit=False,
+                random_state=42,
+                error_score=-1.0,
+                n_jobs=1,
+            )
+            utils.reset_cv_metric_log()
+            search_time.fit(X, y)
+            self.assertEqual(len(search_time.cv_results_["mean_test_score"]), 2)
+            self.assertTrue(np.allclose(search_time.cv_results_["mean_test_score"], -1.0))
+
+            # 2) Memory fail-safe inside BayesSearchCV (n_points=1, 1 fold): must NOT raise ValueError: All the 1 fits failed
+            from unittest.mock import patch
+
+            utils.configure_time_guard(enabled=False, max_candidate_seconds=1800.0)
+            lag_pipe = Pipeline([("estimator", LagReversalEstimator(lag=1, top_k=None))])
+            search_mem = BayesSearchCV(
+                estimator=lag_pipe,
+                search_spaces={"estimator__lag": Integer(1, 2)},
+                n_iter=2,
+                optimizer_kwargs={"base_estimator": "ET", "acq_func": "EI", "n_initial_points": 1},
+                scoring=scorer,
+                cv=cv_splits,
+                refit=False,
+                random_state=42,
+                error_score=-1.0,
+                n_jobs=1,
+            )
+            utils.reset_cv_metric_log()
+            with patch("baseline_utils.check_memory_budget", side_effect=MemoryError("simulated OOM")):
+                search_mem.fit(X, y)
+            self.assertEqual(len(search_mem.cv_results_["mean_test_score"]), 2)
+            self.assertTrue(np.allclose(search_mem.cv_results_["mean_test_score"], -1.0))
+        finally:
+            utils.configure_time_guard(enabled=True, max_candidate_seconds=1800.0)
+            utils.configure_memory_guard(enabled=True, min_free_gb=3.0)
+
 
 if __name__ == "__main__":
     unittest.main()

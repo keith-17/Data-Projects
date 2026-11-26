@@ -349,6 +349,22 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
         sample_weight: Optional[Any] = None,
         eras: Optional[Any] = None,
     ) -> "LightGBMNumeraiEstimator":
+        return self._fit_with_fail_safe(
+            self._fit_impl,
+            X,
+            y,
+            sample_weight=sample_weight,
+            eras=eras,
+            context="LightGBMNumeraiEstimator.fit",
+        )
+
+    def _fit_impl(
+        self,
+        X: Any,
+        y: Any,
+        sample_weight: Optional[Any] = None,
+        eras: Optional[Any] = None,
+    ) -> "LightGBMNumeraiEstimator":
         fit_start_t = time.perf_counter()
         features_df, _, target_values, _, sample_weights, era_values = self._prepare_fit_inputs(
             X, y, sample_weight=sample_weight, eras=eras, return_matrix=False
@@ -437,6 +453,9 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
         return self
 
     def predict(self, X: Any) -> np.ndarray:
+        aborted = self._aborted_predict(X)
+        if aborted is not None:
+            return aborted
         if not hasattr(self, "model_"):
             raise ValueError("LightGBMNumeraiEstimator must be fitted before calling predict.")
         features_df, era_values = self._prepare_predict_df(X)
