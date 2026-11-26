@@ -1,0 +1,1242 @@
+"""Unit tests for general helper functions, NumeraiExtractions, evaluation, and diagnostics in src/utils.py."""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.base import BaseEstimator, RegressorMixin, clone
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+from _fixtures import make_synthetic_numerai_panel
+import utils
+from utils import (
+    CORR_SANITY_HIGH_THRESHOLD,
+    CORR_SANITY_LOW_THRESHOLD,
+    FORBIDDEN_FEATURE_COLS,
+    NumeraiExtractions,
+    _decode_structured,
+    _encode_skopt_item,
+    _fill_missing_features,
+    _infer_non_overlapping_stride,
+    _is_constant_1d,
+    _is_inactive,
+    _parse_era_numbers,
+    _parse_pipe_tokens,
+    _safe_autocorr,
+    build_conditional_bayesian_spaces,
+    build_experiment_setup,
+    build_quick_results_df,
+    candidate_score,
+    classify_error_bins,
+    compute_eda_era_stationarity,
+    compute_era_error_envelope,
+    compute_error_bin_shares,
+    compute_error_bin_waterfall,
+    compute_feature_exposure,
+    compute_feature_target_correlations,
+    compute_model_error_bin_comparison,
+    compute_per_era_mmc,
+    compute_per_era_numerai_corr,
+    compute_per_era_spearman_corr,
+    configure_error_binning,
+    deduplicate_param_grid,
+    drop_constant_dims,
+    evaluate_numerai_predictions,
+    export_diagnostics_predictions,
+    infer_target_horizon_eras,
+    plot_era_error_envelope,
+    plot_error_bin_waterfall,
+    prepare_bayesian_space,
+    prepare_tuned_pipeline,
+    quantize_to_5bins,
+    reset_cv_metric_log,
+    sharpe_ratio,
+    walk_forward_predict,
+)
+
+
+class _DummyMeanEstimator(RegressorMixin, BaseEstimator):
+    """Minimal deterministic sklearn estimator for testing walk_forward_predict & pipelines."""
+
+    def __init__(self, walk_forward_step_eras=None, offset: float = 0.0):
+        self.walk_forward_step_eras = walk_forward_step_eras
+        self.offset = offset
+
+    def fit(self, X, y):
+        self.fit_max_era_ = int(pd.to_numeric(X["era"]).max()) if isinstance(X, pd.DataFrame) and "era" in X.columns else None
+        self.mean_y_ = float(np.mean(y))
+        return self
+
+    def predict(self, X):
+        n = len(X)
+        if isinstance(X, pd.DataFrame) and "feature_alpha_0" in X.columns:
+            return self.mean_y_ + self.offset + 0.05 * (X["feature_alpha_0"].to_numpy(dtype=np.float64) - 2.0)
+        return np.full(n, self.mean_y_ + self.offset, dtype=np.float64)
+
+
+class TestEncodingAndParsingHelpers(unittest.TestCase):
+    """Unit tests for structured encoding, token parsing, and small numeric guards."""
+
+    def test_decode_and_encode_structured_roundtrip(self) -> None:
+        cases = [
+            ("None", None),
+            ("none", None),
+            ("null", None),
+            ("[1, 2, 4]", (1, 2, 4)),
+            ('{"a": 1}', {"a": 1}),
+            ("plain_string", "plain_string"),
+            ("[invalid json", "[invalid json"),
+            (42, 42),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(_decode_structured(raw), expected)
+
+        self.assertEqual(_encode_skopt_item((4, 12)), "[4, 12]")
+        self.assertEqual(_encode_skopt_item({"b": 2, "a": 1}), '{"a": 1, "b": 2}')
+        self.assertEqual(_encode_skopt_item(5), 5)
+
+    def test_parse_pipe_tokens_handles_aliases_and_empty(self) -> None:
+        valid = ("mean", "std", "skew")
+        self.assertEqual(_parse_pipe_tokens(None, valid), set())
+        self.assertEqual(_parse_pipe_tokens(False, valid), set())
+        self.assertEqual(_parse_pipe_tokens("none", valid), set())
+        self.assertEqual(_parse_pipe_tokens(True, valid), set(valid))
+        self.assertEqual(_parse_pipe_tokens("all", valid), set(valid))
+        self.assertEqual(_parse_pipe_tokens("mean|skew|invalid", valid), {"mean", "skew"})
+        self.assertEqual(_parse_pipe_tokens("mean, std", valid), {"mean", "std"})
+
+    def test_is_inactive_and_is_constant_1d(self) -> None:
+        for val in (None, False, 0, "None", "none", "null", ""):
+            self.assertTrue(_is_inactive(val))
+        for val in (True, 1, "lasso", (1, 2)):
+            self.assertFalse(_is_inactive(val))
+
+        self.assertTrue(_is_constant_1d(np.array([])))
+        self.assertTrue(_is_constant_1d(np.array([1.0])))
+        self.assertTrue(_is_constant_1d(np.array([3.0, 3.0, 3.0])))
+        self.assertTrue(_is_constant_1d(np.array([np.nan, np.nan])))
+        self.assertFalse(_is_constant_1d(np.array([1.0, 2.0, 3.0])))
+
+    def test_parse_era_numbers_and_infer_stride(self) -> None:
+        parsed_int = _parse_era_numbers(pd.Index([1, 2, 5]))
+        np.testing.assert_allclose(parsed_int, [1.0, 2.0, 5.0])
+
+        parsed_str = _parse_era_numbers(pd.Index(["era100", "era104", "era108"]))
+        np.testing.assert_allclose(parsed_str, [100.0, 104.0, 108.0])
+
+        self.assertEqual(_infer_non_overlapping_stride(pd.Index([1]), default_stride=4), 1)
+        self.assertEqual(_infer_non_overlapping_stride(pd.Index([1, 2, 3, 4]), default_stride=4), 4)
+        self.assertEqual(_infer_non_overlapping_stride(pd.Index([1, 5, 9, 13]), default_stride=4), 1)
+
+
+class TestQuantizationAndAutocorr(unittest.TestCase):
+    """Unit tests for quantize_to_5bins and _safe_autocorr."""
+
+    def test_quantize_to_5bins_bounds_and_dtype(self) -> None:
+        rng = np.random.default_rng(7)
+        vals = rng.normal(0.0, 1.0, size=100)
+        eras = np.repeat(np.arange(1, 6), 20)
+
+        for scope in ("era", "global"):
+            for strat in ("zscore", "quantile"):
+                with self.subTest(scope=scope, strategy=strat):
+                    out = quantize_to_5bins(vals, strategy=strat, eras=eras, quantize_scope=scope)
+                    self.assertEqual(out.dtype, np.int8)
+                    self.assertEqual(len(out), len(vals))
+                    self.assertTrue(np.all((out >= 0) & (out <= 4)))
+
+    def test_quantize_to_5bins_train_fit_uses_frozen_scaler(self) -> None:
+        train_vals = np.linspace(-2.0, 2.0, 50)
+        scaler = StandardScaler().fit(train_vals.reshape(-1, 1))
+        test_vals = np.array([-10.0, 0.0, 10.0])
+
+        out = quantize_to_5bins(test_vals, quantize_scope="train_fit", fitted_scaler=scaler)
+        np.testing.assert_array_equal(out, np.array([0, 2, 4], dtype=np.int8))
+
+    def test_quantize_to_5bins_edge_cases(self) -> None:
+        self.assertEqual(len(quantize_to_5bins(np.array([]))), 0)
+        np.testing.assert_array_equal(
+            quantize_to_5bins(np.array([np.nan, np.inf, -np.inf])),
+            np.array([2, 2, 2], dtype=np.int8),
+        )
+        np.testing.assert_array_equal(
+            quantize_to_5bins(np.array([5.0, 5.0, 5.0, 5.0])),
+            np.array([2, 2, 2, 2], dtype=np.int8),
+        )
+
+    def test_safe_autocorr_edge_and_signal_cases(self) -> None:
+        self.assertEqual(_safe_autocorr([1.0, 1.0, 1.0, 1.0], lag=1), 0.0)
+        self.assertEqual(_safe_autocorr([1.0, 2.0], lag=1), 0.0)
+        alternating = np.array([1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0])
+        self.assertLess(_safe_autocorr(alternating, lag=1), -0.95)
+        self.assertGreater(_safe_autocorr(alternating, lag=2), 0.95)
+
+
+class TestMissingFeatureImputation(unittest.TestCase):
+    """Unit tests for _fill_missing_features."""
+
+    def test_fast_path_for_clean_int8_dataframe(self) -> None:
+        df = pd.DataFrame({"a": np.array([0, 2, 4], dtype=np.int8), "b": np.array([1, 3, 2], dtype=np.int8)})
+        filled, defaults = _fill_missing_features(df, missing_fill_value=2.0)
+        self.assertIs(filled, df)
+        self.assertEqual(filled["a"].dtype, np.int8)
+        self.assertTrue(np.allclose(defaults.to_numpy(), [2.0, 2.0]))
+
+    def test_constant_mean_median_and_era_imputation(self) -> None:
+        df = pd.DataFrame({
+            "f0": [0.0, np.nan, 4.0, 4.0],
+            "f1": [1.0, 3.0, np.nan, 3.0],
+        })
+        eras = pd.Series([1, 1, 2, 2])
+
+        filled_const, _ = _fill_missing_features(df, missing_fill_value="zero")
+        self.assertEqual(float(filled_const.loc[1, "f0"]), 0.0)
+        self.assertFalse(filled_const.isna().any().any())
+
+        filled_mean, learned = _fill_missing_features(df, missing_fill_value="mean")
+        self.assertAlmostEqual(float(filled_mean.loc[1, "f0"]), (0.0 + 4.0 + 4.0) / 3.0, places=5)
+
+        filled_era, _ = _fill_missing_features(df, missing_fill_value="era_mean", era_series=eras)
+        self.assertAlmostEqual(float(filled_era.loc[1, "f0"]), 0.0, places=5)
+        self.assertAlmostEqual(float(filled_era.loc[2, "f1"]), 3.0, places=5)
+
+        # Applying learned_fill_map on a new DataFrame with NaNs
+        test_df = pd.DataFrame({"f0": [np.nan], "f1": [np.nan]})
+        filled_test, _ = _fill_missing_features(test_df, missing_fill_value="mean", learned_fill_map=learned)
+        self.assertAlmostEqual(float(filled_test.loc[0, "f0"]), float(learned["f0"]), places=5)
+
+    def test_empty_dataframe_returns_empty(self) -> None:
+        empty_df = pd.DataFrame()
+        out, defaults = _fill_missing_features(empty_df)
+        self.assertTrue(out.empty)
+        self.assertTrue(defaults.empty)
+
+
+class TestSearchSpaceHelpers(unittest.TestCase):
+    """Unit tests for grid deduplication and Bayesian search space helpers."""
+
+    def test_deduplicate_param_grid_prunes_inactive_combinations(self) -> None:
+        param_grid = {
+            "estimator__extractor__sparse_selector": [None, "lasso"],
+            "estimator__extractor__sparse_alpha": [0.001, 0.01, 0.1],
+            "estimator__era_weighting": [None, "recency_exp"],
+            "estimator__recency_decay": [0.005, 0.01],
+        }
+        # Raw Cartesian product = 2 * 3 * 2 * 2 = 24
+        # When sparse_selector=None, 3 alphas collapse to 1; when era_weighting=None, 2 decays collapse to 1
+        # Expected unique active combinations = (1 + 3) * (1 + 2) = 12
+        deduped = deduplicate_param_grid(param_grid)
+        self.assertEqual(len(deduped), 12)
+
+    def test_drop_constant_dims_pins_single_values_on_pipeline(self) -> None:
+        pipe = Pipeline([("estimator", _DummyMeanEstimator())])
+        space = {
+            "estimator__offset": [0.25],
+            "estimator__walk_forward_step_eras": [None, 10],
+        }
+        active = drop_constant_dims(space, pipe)
+        self.assertNotIn("estimator__offset", active)
+        self.assertIn("estimator__walk_forward_step_eras", active)
+        self.assertAlmostEqual(pipe.get_params()["estimator__offset"], 0.25)
+
+    def test_prepare_and_build_conditional_bayesian_spaces(self) -> None:
+        space = {
+            "estimator__extractor__sparse_selector": [None, "lasso"],
+            "estimator__extractor__sparse_alpha": [0.001, 0.01],
+            "estimator__extractor__rolling_era_windows": [(4, 12), (4, 8)],
+        }
+        prepared = prepare_bayesian_space(space)
+        self.assertIn("estimator__extractor__rolling_era_windows", prepared)
+
+        subspaces = build_conditional_bayesian_spaces(space, total_n_iter=10)
+        if utils.SKOPT_AVAILABLE:
+            self.assertIsInstance(subspaces, list)
+            self.assertEqual(len(subspaces), 2)
+            self.assertEqual(sum(n for _, n in subspaces), 10)
+
+    def test_prepare_tuned_pipeline_clears_walk_forward_step_eras(self) -> None:
+        pipe = Pipeline([("estimator", _DummyMeanEstimator(walk_forward_step_eras=20, offset=0.0))])
+        tuned = prepare_tuned_pipeline(pipe, {"estimator__offset": 0.5})
+        self.assertAlmostEqual(tuned.get_params()["estimator__offset"], 0.5)
+        self.assertIsNone(tuned.get_params()["estimator__walk_forward_step_eras"])
+        # Original pipeline must not be mutated
+        self.assertEqual(pipe.get_params()["estimator__walk_forward_step_eras"], 20)
+
+
+class TestCorrelationsAndNumeraiExtractions(unittest.TestCase):
+    """Unit tests for compute_feature_target_correlations and NumeraiExtractions."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.df, cls.feature_cols = make_synthetic_numerai_panel(
+            n_eras=10, n_tickers=12, n_features=10, seed=101, signal_strength=0.75
+        )
+
+    def test_compute_feature_target_correlations_all_methods(self) -> None:
+        feats = self.df[self.feature_cols]
+        target = self.df["target"]
+        eras = self.df["era"]
+
+        for method in (None, "pandas_mean", "numerai_mean", "pearson", "spearman"):
+            with self.subTest(method=method):
+                corrs = compute_feature_target_correlations(
+                    feats, target, correlation_method=method, era_series=eras
+                )
+                self.assertEqual(list(corrs.index), self.feature_cols)
+                self.assertTrue(np.all(np.isfinite(corrs.to_numpy())))
+                if method is not None:
+                    # feature_alpha_0 carries the injected signal and should be highest correlated
+                    self.assertGreater(float(corrs["feature_alpha_0"]), 0.25)
+
+    def test_compute_feature_target_correlations_constant_target_and_empty(self) -> None:
+        feats = self.df[self.feature_cols]
+        const_target = pd.Series(np.full(len(feats), 0.5), index=feats.index)
+        corrs = compute_feature_target_correlations(feats, const_target, correlation_method="pearson")
+        np.testing.assert_allclose(corrs.to_numpy(), 0.0)
+
+        empty_corrs = compute_feature_target_correlations(pd.DataFrame(), const_target)
+        self.assertTrue(empty_corrs.empty)
+
+    def test_numerai_extractions_excludes_forbidden_columns_and_selects_top_k(self) -> None:
+        ext = NumeraiExtractions(top_k=4, correlation_method="pandas_mean", abs_corr=True)
+        out = ext.fit_transform(self.df, self.df["target"])
+
+        self.assertEqual(len(ext.selected_feature_names_), 4)
+        self.assertIn("feature_alpha_0", ext.selected_feature_names_)
+        for forbidden in FORBIDDEN_FEATURE_COLS:
+            self.assertNotIn(forbidden, ext.selected_feature_names_)
+        self.assertEqual(len(out), len(self.df))
+        self.assertIn("era", out.columns)
+
+    def test_numerai_extractions_feature_engineering_modes(self) -> None:
+        ext = NumeraiExtractions(
+            top_k=6,
+            basic_group_stats="mean|std|skew",
+            era_dispersion_features="mean|std|extreme_frac",
+            fourier_order=2,
+            include_rolling_era=True,
+            rolling_era_windows=(2, 4),
+            include_lag_diff=True,
+            era_lag_scales=(1, 2),
+            ticker_features="rolling_mean|raw_lags",
+            ticker_windows=(2,),
+            ticker_lag_steps=(1,),
+            quantize_scope="train_fit",
+        )
+        out = ext.fit_transform(self.df, self.df["target"])
+
+        self.assertIn("fourier_sin_k1", out.columns)
+        self.assertIn("fourier_cos_k2", out.columns)
+        self.assertIn("row_feat_mean_bin", out.columns)
+        self.assertIn("row_extreme_frac_bin", out.columns)
+        self.assertTrue(any("_era_roll2" in c for c in out.columns))
+        self.assertTrue(any("_era_diff1" in c for c in out.columns))
+        self.assertTrue(any("_ticker_roll_mean2" in c for c in out.columns))
+        self.assertTrue(len(ext.signal_scalers_) > 0)
+
+        # Transforming a new batch must reuse learned scalers without error
+        out_val = ext.transform(self.df.head(24))
+        self.assertEqual(list(out_val.columns), list(out.columns))
+
+    def test_numerai_extractions_sparse_selector_and_pca(self) -> None:
+        ext = NumeraiExtractions(
+            sparse_selector="lasso",
+            sparse_alpha=0.001,
+            pca_n_components=3,
+        )
+        out = ext.fit_transform(self.df, self.df["target"])
+        self.assertIsNotNone(ext.sparse_selector_)
+        self.assertIsNotNone(ext.pca_)
+        self.assertIn("pca_comp_0", out.columns)
+        self.assertEqual(out["pca_comp_0"].dtype, np.int8)
+
+    def test_numerai_extractions_raises_on_no_features_or_invalid_sparse(self) -> None:
+        meta_only = self.df[["era", "id", "target"]]
+        with self.assertRaises(ValueError):
+            NumeraiExtractions().fit(meta_only, self.df["target"])
+
+        with self.assertRaises(ValueError):
+            NumeraiExtractions(sparse_selector="invalid_sel").fit(self.df, self.df["target"])
+
+    def test_numerai_extractions_set_params_decodes_json_and_alias(self) -> None:
+        ext = NumeraiExtractions()
+        ext.set_params(lag_scales="[1, 3]", rolling_era_windows="[4, 8]")
+        self.assertEqual(ext.era_lag_scales, (1, 3))
+        self.assertEqual(ext.rolling_era_windows, (4, 8))
+        cloned = clone(ext)
+        self.assertEqual(cloned.era_lag_scales, (1, 3))
+
+    def test_numerai_extractions_strictly_causal_no_val_lookahead(self) -> None:
+        # Phase 1 regression: perturbing future validation eras MUST NOT change earlier validation eras
+        # when include_rolling_era=True, include_lag_diff=True (quantize_scope='era') or ticker_features (train_fit)
+        train_df = self.df.loc[self.df["era"] <= 5].copy()
+        val_orig = self.df.loc[self.df["era"] > 5].copy()
+        val_pert = val_orig.copy()
+        # Massively perturb the final validation era (era 10)
+        future_mask = val_pert["era"] == val_pert["era"].max()
+        for col in self.feature_cols:
+            val_pert.loc[future_mask, col] = 4
+
+        for qscope in ("era", "train_fit"):
+            with self.subTest(quantize_scope=qscope):
+                ext = NumeraiExtractions(
+                    top_k=4,
+                    include_rolling_era=True,
+                    rolling_era_windows=(2,),
+                    include_lag_diff=True,
+                    era_lag_scales=(1,),
+                    ticker_features="rolling_mean",
+                    ticker_windows=(2,),
+                    quantize_scope=qscope,
+                ).fit(train_df, train_df["target"])
+                out_orig = ext.transform(val_orig)
+                out_pert = ext.transform(val_pert)
+                early_mask = (val_orig["era"] < val_orig["era"].max()).to_numpy()
+                pd.testing.assert_frame_equal(
+                    out_orig.loc[early_mask].reset_index(drop=True),
+                    out_pert.loc[early_mask].reset_index(drop=True),
+                )
+
+
+class TestEvaluationWalkForwardAndExport(unittest.TestCase):
+    """Unit tests for evaluation metrics, walk-forward prediction, MMC, and Parquet export."""
+
+    def test_sharpe_ratio_and_per_era_correlations(self) -> None:
+        self.assertEqual(sharpe_ratio(pd.Series(dtype=np.float64)), 0.0)
+        self.assertEqual(sharpe_ratio(pd.Series([0.02, 0.02, 0.02])), 0.0)
+        s = pd.Series([0.01, 0.03, 0.02, 0.04])
+        # Official numerai_tools.scoring.sharpe_ratio uses population std (ddof=0)
+        self.assertAlmostEqual(sharpe_ratio(s), float(s.mean() / s.std(ddof=0)), places=10)
+
+        df, _ = make_synthetic_numerai_panel(n_eras=6, n_tickers=20, n_features=4, seed=9)
+        y_true = df["target"].to_numpy()
+        eras = df["era"].to_numpy()
+        sp = compute_per_era_spearman_corr(y_true, y_true, eras=eras)
+        nc = compute_per_era_numerai_corr(y_true, y_true, eras=eras)
+        self.assertEqual(len(sp), 6)
+        self.assertEqual(len(nc), 6)
+        self.assertTrue(np.all(sp.to_numpy() > 0.99))
+        self.assertTrue(np.all(nc.to_numpy() > 0.90))
+
+    def test_evaluate_numerai_predictions_sanity_tripwire(self) -> None:
+        df, feat_cols = make_synthetic_numerai_panel(n_eras=8, n_tickers=30, n_features=6, seed=12)
+        y_true = df["target"].to_numpy(dtype=np.float64)
+        eras = df["era"].to_numpy()
+
+        # Perfect predictions -> LEAKAGE_WARNING (> 0.04)
+        ev_leak = evaluate_numerai_predictions(
+            y_true, y_true, eras=eras, features_df=df, feature_columns=feat_cols, verbose=False
+        )
+        self.assertEqual(ev_leak["sanity_status"], "LEAKAGE_WARNING")
+        self.assertGreater(ev_leak["numerai_corr"], CORR_SANITY_HIGH_THRESHOLD)
+        self.assertTrue(np.isfinite(ev_leak["feature_exposure"]))
+
+        # Constant predictions -> LOW_SIGNAL_WARNING (< 0.005)
+        ev_low = evaluate_numerai_predictions(
+            y_true, np.full_like(y_true, 0.5), eras=eras, verbose=False
+        )
+        self.assertEqual(ev_low["sanity_status"], "LOW_SIGNAL_WARNING")
+        self.assertLess(ev_low["numerai_corr"], CORR_SANITY_LOW_THRESHOLD)
+
+    def test_compute_feature_exposure_edge_cases(self) -> None:
+        df, feat_cols = make_synthetic_numerai_panel(n_eras=2, n_tickers=10, n_features=4, seed=5)
+        self.assertTrue(np.isnan(compute_feature_exposure(df, np.zeros(len(df)), feature_columns=[])))
+        self.assertEqual(compute_feature_exposure(df, np.full(len(df), 0.5), feature_columns=feat_cols), 0.0)
+        fe = compute_feature_exposure(df, df[feat_cols[0]].to_numpy(dtype=np.float64), feature_columns=feat_cols)
+        self.assertGreater(fe, 0.0)
+
+    def test_compute_eda_era_stationarity(self) -> None:
+        df, feat_cols = make_synthetic_numerai_panel(n_eras=12, n_tickers=8, n_features=4, seed=13)
+        res = compute_eda_era_stationarity(df, feat_cols[:2], era_col="era")
+        self.assertEqual(list(res["feature"]), feat_cols[:2])
+        self.assertSetEqual(set(res.columns), {"feature", "adf_stat", "adf_pvalue", "stationary_at_5pct"})
+
+        empty_res = compute_eda_era_stationarity(df, feat_cols, era_col="missing_era")
+        self.assertTrue(empty_res.empty)
+
+    def test_walk_forward_predict_expanding_and_sliding_no_leakage(self) -> None:
+        train_df, _ = make_synthetic_numerai_panel(n_eras=10, n_tickers=6, n_features=4, start_era=1, seed=21)
+        val_df, _ = make_synthetic_numerai_panel(n_eras=10, n_tickers=6, n_features=4, start_era=11, seed=22)
+
+        for mode in ("expanding", "sliding"):
+            with self.subTest(window_mode=mode):
+                preds = walk_forward_predict(
+                    _DummyMeanEstimator(),
+                    train_df,
+                    train_df["target"],
+                    train_df["era"],
+                    val_df,
+                    val_df["target"],
+                    val_df["era"],
+                    step_eras=4,
+                    window_mode=mode,
+                    target_horizon_eras=4,
+                    era_stride=2,
+                )
+                self.assertEqual(len(preds), len(val_df))
+                self.assertTrue(np.all(np.isfinite(preds)))
+
+    def test_export_diagnostics_predictions_and_mmc(self) -> None:
+        val_df, _ = make_synthetic_numerai_panel(n_eras=4, n_tickers=15, n_features=4, start_era=20, seed=31)
+        rng = np.random.default_rng(31)
+        preds = rng.normal(0.5, 0.1, size=len(val_df))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "diag" / "validation_predictions.parquet"
+            written = export_diagnostics_predictions(val_df, preds, out_path, era_col="era")
+            self.assertTrue(written.is_file())
+            loaded = pd.read_parquet(written)
+            self.assertEqual(len(loaded), len(val_df))
+            self.assertIn("id", loaded.columns)
+            self.assertIn("prediction", loaded.columns)
+            self.assertTrue((loaded["prediction"] > 0.0).all() and (loaded["prediction"] <= 1.0).all())
+
+            # Length mismatch raises ValueError
+            with self.assertRaises(ValueError):
+                export_diagnostics_predictions(val_df, preds[:-1], out_path)
+
+            # compute_per_era_mmc: missing file -> None
+            self.assertIsNone(compute_per_era_mmc(val_df, preds, meta_model_path=None))
+            self.assertIsNone(compute_per_era_mmc(val_df, preds, meta_model_path=Path(tmp) / "nope.parquet"))
+
+            # compute_per_era_mmc: valid meta_model.parquet
+            meta_path = Path(tmp) / "meta_model.parquet"
+            pd.DataFrame({
+                "id": val_df["id"],
+                "numerai_meta_model": rng.normal(0.5, 0.1, size=len(val_df)),
+            }).to_parquet(meta_path, index=False)
+            mmc_s = compute_per_era_mmc(val_df, preds, meta_model_path=meta_path)
+            self.assertIsNotNone(mmc_s)
+            self.assertEqual(len(mmc_s), 4)
+            self.assertTrue(np.all(np.isfinite(mmc_s.to_numpy())))
+
+
+class TestSetupErrorBinningAndReporting(unittest.TestCase):
+    """Unit tests for build_experiment_setup, error binning, envelope, waterfall, and CV result tables."""
+
+    def tearDown(self) -> None:
+        configure_error_binning(mode="pct", pct_bins=(5.0, 10.0), zero_tols=(0.01, 0.10), abs_bins=(0.125, 0.375))
+        reset_cv_metric_log()
+        plt.close("all")
+
+    def test_infer_target_horizon_eras(self) -> None:
+        self.assertEqual(infer_target_horizon_eras("target"), 12)
+        self.assertEqual(infer_target_horizon_eras("target_cyrus_v4_60"), 12)
+        self.assertEqual(infer_target_horizon_eras("target_alpha_4"), 1)
+        self.assertEqual(infer_target_horizon_eras("target_victor_20"), 4)
+
+    def test_build_experiment_setup_defaults_and_validation_errors(self) -> None:
+        cfg = build_experiment_setup(
+            target_col="target",
+            era_stride=4,
+            search_mode="bayes",
+            score_version="v1_skepta",
+            downsample_mode="recent",
+            downsample_frac=0.5,
+        )
+        self.assertEqual(cfg["target_horizon_eras"], 12)
+        self.assertEqual(cfg["embargo_eras"], 3)
+        self.assertEqual(cfg["score_version"], "v1_skepta")
+        self.assertEqual(cfg["downsample_mode"], "recent")
+        self.assertIsNone(cfg["val_downsample_mode"])
+        self.assertEqual(cfg["val_downsample_frac"], 1.0)
+
+        cfg_both = build_experiment_setup(
+            target_col="target",
+            era_stride=4,
+            downsample_mode="recent",
+            downsample_frac=0.25,
+            val_downsample_mode="same",
+        )
+        self.assertEqual(cfg_both["val_downsample_mode"], "recent")
+        self.assertEqual(cfg_both["val_downsample_frac"], 0.25)
+
+        # era_stride='auto' / None auto-syncs with target_horizon_eras and suppresses [Overlap Notice]
+        buf_60d = io.StringIO()
+        with contextlib.redirect_stdout(buf_60d):
+            cfg_auto_60 = build_experiment_setup(target_col="target", era_stride="auto")
+        self.assertEqual(cfg_auto_60["era_stride"], 12)
+        self.assertEqual(cfg_auto_60["target_horizon_eras"], 12)
+        self.assertEqual(cfg_auto_60["embargo_eras"], 1)
+        self.assertEqual(cfg_auto_60["era_tag"], "all_eras_stride12")
+        self.assertIn("era_stride=12 (auto-matched to horizon=12)", buf_60d.getvalue())
+        self.assertNotIn("[Overlap Notice]", buf_60d.getvalue())
+
+        buf_20d = io.StringIO()
+        with contextlib.redirect_stdout(buf_20d):
+            cfg_auto_20 = build_experiment_setup(target_col="target_jupiter_20", era_stride="auto")
+        self.assertEqual(cfg_auto_20["era_stride"], 4)
+        self.assertEqual(cfg_auto_20["target_horizon_eras"], 4)
+        self.assertEqual(cfg_auto_20["embargo_eras"], 1)
+        self.assertEqual(cfg_auto_20["era_tag"], "all_eras_stride4")
+        self.assertNotIn("[Overlap Notice]", buf_20d.getvalue())
+
+        cfg_none_stride = build_experiment_setup(target_col="target", era_stride=None)
+        self.assertEqual(cfg_none_stride["era_stride"], 12)
+        self.assertEqual(cfg_none_stride["embargo_eras"], 1)
+
+        buf_overlap = io.StringIO()
+        with contextlib.redirect_stdout(buf_overlap):
+            cfg_explicit_4 = build_experiment_setup(target_col="target", era_stride=4)
+        self.assertEqual(cfg_explicit_4["era_stride"], 4)
+        self.assertEqual(cfg_explicit_4["target_horizon_eras"], 12)
+        self.assertEqual(cfg_explicit_4["embargo_eras"], 3)
+        self.assertIn("[Overlap Notice]", buf_overlap.getvalue())
+
+        invalid_kwargs = [
+            {"baseline_mode": "invalid"},
+            {"search_mode": "random"},
+            {"score_version": "v99"},
+            {"cv_strategy": "kfold"},
+            {"cv_split": 1.0},
+            {"era_stride": 0},
+            {"era_stride": -2},
+            {"era_stride": "bad_stride"},
+            {"era_stride": True},
+            {"downsample_mode": "unknown"},
+            {"downsample_mode": "within_era"},
+            {"downsample_mode": "random_eras"},
+            {"downsample_frac": 0.0},
+            {"val_downsample_mode": "unknown"},
+            {"val_downsample_mode": "within_era"},
+            {"val_downsample_mode": "random_eras"},
+            {"val_downsample_frac": 0.0},
+            {"eval_mode": "invalid"},
+            {"walk_forward_window": "invalid"},
+            {"era_weighting": "invalid"},
+        ]
+        for kwargs in invalid_kwargs:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    build_experiment_setup(**kwargs)
+
+    def test_classify_error_bins_pct_and_abs_modes(self) -> None:
+        y_true = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, np.nan])
+        y_pred = np.array([0.85, 0.92, 1.0, 1.07, 1.15, 0.005, 0.20, 0.5])
+
+        codes, residuals, finite = classify_error_bins(y_true, y_pred, mode="pct", pct_bins=(5.0, 10.0), zero_tols=(0.01, 0.10))
+        np.testing.assert_array_equal(codes, np.array([0, 1, 2, 3, 4, 2, 4, -1], dtype=np.int8))
+        self.assertEqual(int(finite.sum()), 7)
+        self.assertEqual(len(residuals), 8)
+
+        codes_abs, _, _ = classify_error_bins(
+            np.array([0.5, 0.5, 0.5, 0.5, 0.5]),
+            np.array([0.0, 0.3, 0.5, 0.7, 1.0]),
+            mode="abs",
+            abs_bins=(0.125, 0.375),
+        )
+        np.testing.assert_array_equal(codes_abs, np.array([0, 1, 2, 3, 4], dtype=np.int8))
+
+        shares = compute_error_bin_shares(y_true, y_pred, mode="pct")
+        self.assertAlmostEqual(sum(shares.values()), 100.0, places=5)
+
+        with self.assertRaises(ValueError):
+            classify_error_bins([0.5, 0.5], [0.5])
+        with self.assertRaises(ValueError):
+            configure_error_binning(mode="invalid")
+
+    def test_era_error_envelope_waterfall_and_comparison(self) -> None:
+        # Leave a gap at era 2 to test interpolation
+        eras = np.array([1, 1, 1, 1, 3, 3, 3, 3, 4, 4, 4, 4], dtype=np.int32)
+        y_true = np.array([0.5, 0.5, 0.5, 0.5] * 3, dtype=np.float64)
+        y_pred = np.array([0.2, 0.4, 0.6, 0.8] * 3, dtype=np.float64)
+
+        env_df = compute_era_error_envelope(y_true, y_pred, eras)
+        self.assertIn(2, env_df.index)
+        self.assertTrue(bool(env_df.loc[2, "is_interpolated"]))
+        self.assertFalse(bool(env_df.loc[1, "is_interpolated"]))
+        self.assertAlmostEqual(float(env_df.loc[1, "over_share"]), 0.5)
+        self.assertAlmostEqual(float(env_df.loc[1, "under_share"]), 0.5)
+
+        plotted_env = plot_era_error_envelope(y_true, y_pred, eras, title="Test Envelope", is_best=True)
+        self.assertEqual(len(plotted_env), len(env_df))
+
+        wf_df = compute_error_bin_waterfall(y_true, y_pred, eras, mode="abs")
+        self.assertIn("Overall", set(wf_df["section"]))
+        self.assertIn("Financial Quarter", set(wf_df["section"]))
+        plot_error_bin_waterfall(wf_df, title="Test Waterfall")
+
+        comp_df = compute_model_error_bin_comparison(
+            {"ModelA": {"validation_preds": y_pred}, "ModelB": {"validation_preds": y_true}},
+            y_true,
+            best_variant_name="ModelB",
+            mode="abs",
+        )
+        self.assertEqual(len(comp_df), 2)
+        self.assertIn("[BEST] ModelB", list(comp_df["variant"]))
+
+        with self.assertRaises(ValueError):
+            compute_era_error_envelope(y_true, y_pred[:-1], eras)
+
+    def test_plot_residual_diagnostics_summary_and_exports(self) -> None:
+        # Test on 100 data points across discrete Numerai targets (including exact 0.0) and optional era_window
+        eras = np.repeat(np.arange(1, 11, dtype=np.int32), 10)
+        rng = np.random.default_rng(77)
+        y_true = rng.choice([0.0, 0.25, 0.5, 0.75, 1.0], size=100)
+        y_true[0] = 0.0
+        preds_a = np.clip(y_true * 0.2 + 0.4 + rng.normal(0.0, 0.03, size=100), 0.0, 1.0)
+        preds_b = np.clip(y_true * 0.1 + 0.45 + rng.normal(0.0, 0.05, size=100), 0.0, 1.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "residual_diag_discrete"
+            summary_df = utils.plot_residual_diagnostics(
+                y_true,
+                {"Model A [Tuned]": {"validation_preds": preds_a}, "Model B [Tuned]": preds_b},
+                eras,
+                best_variant_name="Model A [Tuned]",
+                max_scatter_points=60,
+                era_window=(2, 5),
+                random_state=77,
+                save_prefix=prefix,
+            )
+            self.assertEqual(len(summary_df), 2)
+            self.assertEqual(summary_df.loc[0, "variant"], "[BEST] Model A [Tuned]")
+            self.assertEqual(int(summary_df.loc[0, "n_valid"]), 100)
+            self.assertSetEqual(
+                set(summary_df.columns),
+                {
+                    "variant",
+                    "n_valid",
+                    "mean_residual",
+                    "mae",
+                    "rmse",
+                    "under_predict_pct",
+                    "over_predict_pct",
+                },
+            )
+            self.assertTrue((Path(f"{prefix}_residuals_by_target_bin.png")).is_file())
+            self.assertTrue((Path(f"{prefix}_calibration_and_era_mae.png")).is_file())
+
+            # Continuous targets with default era_window=None (all validation eras)
+            y_cont = rng.normal(0.5, 0.2, size=100)
+            p_cont_a = y_cont + rng.normal(0.0, 0.05, size=100)
+            p_cont_b = y_cont + rng.normal(-0.02, 0.08, size=100)
+            prefix_cont = Path(tmp) / "residual_diag_continuous"
+            cont_df = utils.plot_residual_diagnostics(
+                y_cont,
+                {"Cont A": p_cont_a, "Cont B": p_cont_b},
+                eras,
+                best_variant_name="Cont A",
+                era_window=None,
+                random_state=77,
+                save_prefix=prefix_cont,
+            )
+            self.assertEqual(len(cont_df), 2)
+            self.assertEqual(int(cont_df.loc[0, "n_valid"]), 100)
+            self.assertTrue((Path(f"{prefix_cont}_residuals_by_target_bin.png")).is_file())
+            self.assertTrue((Path(f"{prefix_cont}_calibration_and_era_mae.png")).is_file())
+
+            # Out-of-range era_zscore predictions must be auto-aligned to [0, 1] without exploding residuals
+            z_preds = rng.normal(0.0, 1.5, size=100)
+            prefix_z = Path(tmp) / "residual_diag_zscore"
+            z_df = utils.plot_residual_diagnostics(
+                y_true,
+                {"ZScoreModel": z_preds},
+                eras,
+                save_prefix=prefix_z,
+            )
+            self.assertEqual(len(z_df), 1)
+            self.assertLess(float(z_df.loc[0, "mae"]), 1.0)
+            self.assertTrue((Path(f"{prefix_z}_residuals_by_target_bin.png")).is_file())
+
+        with self.assertRaises(ValueError):
+            utils.plot_residual_diagnostics(y_true, {"Bad": preds_a[:-1]}, eras)
+
+    def test_memory_cleanup_and_lightweight_afml_and_mc_helpers(self) -> None:
+        rng = np.random.default_rng(19)
+        era_corrs = pd.Series(rng.normal(0.01, 0.02, size=20), index=np.arange(1, 21, dtype=np.int32))
+        results_map = {
+            "Baseline P (Persistence) [Default]": {
+                "validation_preds": np.full(100, 0.5, dtype=np.float64),
+                "validation_era_corrs": era_corrs,
+                "validation_sharpe": float(sharpe_ratio(era_corrs)),
+                "validation_fnc": 0.008,
+                "validation_fnc_sharpe": 0.45,
+            },
+            "Baseline P (Persistence) [Tuned]": {
+                "validation_preds": np.full(100, 0.51, dtype=np.float64),
+                "validation_era_corrs": era_corrs + 0.002,
+                "validation_sharpe": float(sharpe_ratio(era_corrs + 0.002)),
+                "validation_fnc": np.nan,
+                "validation_fnc_sharpe": np.nan,
+            },
+        }
+        removed = utils.strip_validation_predictions(results_map)
+        self.assertEqual(removed, 2)
+        for entry in results_map.values():
+            self.assertNotIn("validation_preds", entry)
+
+        afml_df = utils.build_afml_diagnostics_df(
+            results_map,
+            cv_trial_stats_by_baseline={"Baseline P (Persistence)": {"trial_srs": np.array([0.4, 0.6]), "trials_era_corrs_df": None}},
+            random_state=42,
+        )
+        self.assertEqual(len(afml_df), 2)
+        self.assertAlmostEqual(float(afml_df.loc[0, "fnc_mean"]), 0.008, places=4)
+
+        mc_light = utils.simulate_stake_pnl_monte_carlo(era_corrs, n_sims=30, block_size=4, retain_paths=False)
+        self.assertEqual(mc_light["sim_equity_paths"].shape, (0, 0))
+        self.assertEqual(len(mc_light["final_stakes"]), 30)
+
+        mc_plot_light = utils.plot_stake_pnl_monte_carlo(era_corrs, n_sims=30, block_size=4, retain_paths=False)
+        self.assertEqual(mc_plot_light["sim_equity_paths"].shape, (0, 0))
+        self.assertEqual(len(mc_plot_light["final_stakes"]), 30)
+
+    def test_candidate_score_and_build_quick_results_df(self) -> None:
+        df, _ = make_synthetic_numerai_panel(n_eras=6, n_tickers=15, n_features=4, seed=44)
+        est = _DummyMeanEstimator().fit(df, df["target"])
+
+        reset_cv_metric_log()
+        score = candidate_score(est, df, df["target"], score_version="v1_skepta")
+        self.assertTrue(np.isfinite(score))
+
+        cv_results = {
+            "mean_test_score": [score],
+            "split0_test_score": [score],
+            "rank_test_score": [1],
+            "params": [{"estimator__offset": 0.0}],
+            "param_estimator__offset": [0.0],
+        }
+        quick_df = build_quick_results_df(cv_results)
+        self.assertEqual(len(quick_df), 1)
+        self.assertEqual(quick_df.loc[0, "score_version"], "v1_skepta")
+        self.assertIn("mean_numerai_corr", quick_df.columns)
+        self.assertIn("offset", quick_df.columns)
+
+        # Empty input returns empty DataFrame
+        self.assertTrue(build_quick_results_df({}).empty)
+
+    def test_build_quick_results_df_wide_repr_with_trials_attrs(self) -> None:
+        df, _ = make_synthetic_numerai_panel(n_eras=8, n_tickers=15, n_features=4, seed=45)
+        est = _DummyMeanEstimator().fit(df, df["target"])
+
+        reset_cv_metric_log()
+        score1 = candidate_score(est, df, df["target"], score_version="v1_skepta")
+        score2 = candidate_score(est, df, df["target"], score_version="v1_skepta")
+        wide_params = {f"estimator__p{i}": float(i) for i in range(25)}
+        cv_results = {
+            "mean_test_score": [score1, score2],
+            "split0_test_score": [score1, score2],
+            "rank_test_score": [1, 2],
+            "params": [wide_params, wide_params],
+        }
+        quick_df = build_quick_results_df(cv_results)
+        self.assertGreater(len(quick_df.columns), 20)
+        self.assertIsInstance(quick_df.attrs.get("trials_era_corrs_df"), dict)
+        # Wide DataFrame repr() triggers horizontal truncation + concat(); must not raise ValueError
+        rendered = repr(quick_df)
+        self.assertGreater(len(rendered), 0)
+
+        pbo = utils.compute_pbo_cscv(quick_df.attrs["trials_era_corrs_df"], n_submatrices=4, random_state=42)
+        self.assertIn("pbo", pbo)
+
+    def test_four_layer_analysis_scorecards_json_corr_envelope_and_top2_residuals(self) -> None:
+        comp_df = pd.DataFrame([
+            {
+                "variant": "Model [Default]",
+                "end_capital": 1120.556,
+                "total_return_pct": 12.0556,
+                "money_drawdown_pct": -8.456,
+                "max_drawdown_gbp": -92.123,
+                "worst_round_gbp": -18.765,
+                "tuw_max_eras": 26,
+                "train_corr": 0.0321,
+                "validation_corr": 0.0185,
+                "corr_gap": 0.0136,
+                "validation_sharpe": 0.92,
+                "validation_psr": 0.962,
+                "validation_dsr": 0.910,
+                "sanity_status": "OK",
+                "feature_exposure": 0.145,
+                "validation_fnc": 0.0112,
+                "validation_fnc_sharpe": 0.71,
+                "validation_mae": 0.194,
+                "forecast_bias": -0.002,
+                "directional_hit_rate": 0.518,
+                "adf_pvalue": 0.012,
+                "ljung_box_pvalue": 0.21,
+                "arch_lm_pvalue": 0.34,
+                "hhi_pos": 0.04,
+                "hhi_neg": 0.05,
+            },
+            {
+                "variant": "Model [Tuned]",
+                "end_capital": 1285.40,
+                "total_return_pct": 28.54,
+                "money_drawdown_pct": -6.10,
+                "max_drawdown_gbp": -71.50,
+                "worst_round_gbp": -12.30,
+                "tuw_max_eras": 52,
+                "train_corr": 0.0385,
+                "validation_corr": 0.0231,
+                "corr_gap": 0.0154,
+                "validation_sharpe": 1.18,
+                "validation_psr": 0.991,
+                "validation_dsr": 0.964,
+                "sanity_status": "OK",
+                "feature_exposure": 0.112,
+                "validation_fnc": np.nan,
+                "validation_fnc_sharpe": np.inf,
+                "validation_mae": 0.189,
+                "forecast_bias": 0.001,
+                "directional_hit_rate": 0.529,
+                "adf_pvalue": 0.004,
+                "ljung_box_pvalue": 0.41,
+                "arch_lm_pvalue": 0.52,
+                "hhi_pos": 0.03,
+                "hhi_neg": 0.04,
+            },
+        ])
+
+        money_df, science_df = utils.build_executive_scorecard_tables(
+            comp_df, best_variant_name="Model [Tuned]"
+        )
+        self.assertEqual(
+            list(money_df.columns),
+            [
+                "variant",
+                "end_capital",
+                "total_return_pct",
+                "live_round_return_pct",
+                "live_round_profit_gbp",
+                "money_drawdown_pct",
+                "max_drawdown_gbp",
+                "worst_round_gbp",
+                "tuw_max_eras",
+                "live_rounds_span",
+            ],
+        )
+        self.assertEqual(
+            list(science_df.columns),
+            [
+                "variant",
+                "train_corr",
+                "validation_corr",
+                "corr_gap",
+                "validation_sharpe",
+                "live_round_12e_corr",
+                "live_round_12e_pos_pct",
+                "validation_psr",
+                "validation_dsr",
+                "science_score_pct",
+                "sanity_status",
+            ],
+        )
+        # Winner: CORR=0.0231/0.04=57.75%, Sharpe=1.18/2.5=47.2% -> 52.5%
+        self.assertAlmostEqual(float(science_df.loc[0, "science_score_pct"]), 52.5, places=1)
+        self.assertAlmostEqual(float(science_df.loc[0, "live_round_12e_corr"]), round(0.0231 * 12, 4), places=4)
+        self.assertEqual(utils.compute_science_score_pct(0.040, 2.50), 100.0)
+        self.assertEqual(utils.compute_science_score_pct(0.080, 5.00), 100.0)
+        self.assertEqual(utils.compute_science_score_pct(-0.01, -0.50), 0.0)
+        self.assertEqual(utils.compute_science_score_pct(0.020, 1.25), 50.0)
+
+        # Verify rolling 12-era live round metrics when validation_era_corrs is present
+        comp_with_eras = comp_df.copy()
+        comp_with_eras["validation_era_corrs"] = [
+            pd.Series([0.01] * 24, index=np.arange(1, 25)),
+            pd.Series([0.02] * 24, index=np.arange(1, 25)),
+        ]
+        m_lr, s_lr = utils.build_executive_scorecard_tables(comp_with_eras, best_variant_name="Model [Tuned]")
+        self.assertEqual(m_lr.loc[0, "live_rounds_span"], "2.0 rds (24e)")
+        self.assertAlmostEqual(float(m_lr.loc[0, "live_round_profit_gbp"]), round(285.40 / 2.0, 2), places=2)
+        self.assertAlmostEqual(float(s_lr.loc[0, "live_round_12e_corr"]), 0.24, places=4)
+        self.assertAlmostEqual(float(s_lr.loc[0, "live_round_12e_pos_pct"]), 100.0, places=1)
+        self.assertEqual(money_df.loc[0, "variant"], "[WINNER] Model [Tuned]")
+        self.assertIn("1.00 yr", str(money_df.loc[0, "tuw_max_eras"]))
+        # Original DataFrame must remain unmutated
+        self.assertEqual(comp_df.loc[0, "variant"], "Model [Default]")
+
+        diag_df = utils.build_diagnostics_summary_table(comp_df, best_variant_name="Model [Tuned]")
+        self.assertEqual(
+            list(diag_df.columns),
+            [
+                "variant",
+                "feature_exposure",
+                "validation_fnc",
+                "validation_fnc_sharpe",
+                "validation_mae",
+                "forecast_bias",
+                "directional_hit_rate",
+            ],
+        )
+        self.assertEqual(diag_df.loc[0, "variant"], "[WINNER] Model [Tuned]")
+
+        rng = np.random.default_rng(123)
+        eras_30 = np.repeat(np.arange(1001, 1031, dtype=np.int32), 20)
+        y_true = rng.choice([0.0, 0.25, 0.5, 0.75, 1.0], size=len(eras_30))
+        preds_tuned = np.clip(0.5 + 0.15 * (y_true - 0.5) + rng.normal(0.0, 0.04, size=len(eras_30)), 0.0, 1.0)
+        preds_default = np.clip(0.5 + 0.08 * (y_true - 0.5) + rng.normal(0.0, 0.05, size=len(eras_30)), 0.0, 1.0)
+        corrs_tuned = compute_per_era_numerai_corr(y_true, preds_tuned, eras=eras_30)
+        corrs_default = compute_per_era_numerai_corr(y_true, preds_default, eras=eras_30)
+        results_map = {
+            "Model [Default]": {"validation_preds": preds_default, "validation_era_corrs": corrs_default, "validation_sharpe": 0.92},
+            "Model [Tuned]": {"validation_preds": preds_tuned, "validation_era_corrs": corrs_tuned, "validation_sharpe": 1.18},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            json_path = utils.export_winner_scorecard_json(
+                comp_df,
+                best_variant_name="Model [Tuned]",
+                model_tag="lightgbm",
+                output_dir=tmp_dir,
+                experiment_meta={"target_col": "target"},
+            )
+            self.assertEqual(json_path.name, "summary_lightgbm.json")
+            self.assertTrue(json_path.is_file())
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["model_tag"], "lightgbm")
+            self.assertEqual(payload["variant"], "Model [Tuned]")
+            self.assertIsNone(payload["validation_fnc"])
+            self.assertIsNone(payload["validation_fnc_sharpe"])
+            self.assertEqual(payload["money_table"]["tuw_max_years"], 1.0)
+
+            cum_png = tmp_dir / "cum_corr.png"
+            cum_df = utils.plot_cumulative_validation_corr(
+                results_map, best_variant_name="Model [Tuned]", save_path=cum_png
+            )
+            self.assertTrue(cum_png.is_file())
+            self.assertEqual(len(cum_df), 30)
+
+            roll_png = tmp_dir / "roll_corr.png"
+            roll_s = utils.plot_rolling_validation_corr(
+                corrs_tuned,
+                window=20,
+                comparison_corrs={"Model [Default]": corrs_default},
+                save_path=roll_png,
+            )
+            self.assertTrue(roll_png.is_file())
+            self.assertEqual(len(roll_s), 11)
+
+            # Short series (<20 eras) must also render cleanly
+            short_roll = utils.plot_rolling_validation_corr(corrs_tuned.head(8), window=20)
+            self.assertGreater(len(short_roll), 0)
+
+            env_png = tmp_dir / "envelope.png"
+            env_df = plot_era_error_envelope(
+                y_true, preds_tuned, eras_30, title="Model [Tuned]", is_best=True, save_path=env_png
+            )
+            self.assertTrue(env_png.is_file())
+            self.assertIn("over_count", env_df.columns)
+            self.assertIn("under_count", env_df.columns)
+
+            top2_png = tmp_dir / "top2_residuals.png"
+            top2_df = utils.plot_top2_residuals_vs_actual(
+                y_true,
+                results_map,
+                eras_30,
+                best_variant_name="Model [Tuned]",
+                variant_order=["Model [Tuned]", "Model [Default]"],
+                save_path=top2_png,
+            )
+            self.assertTrue(top2_png.is_file())
+            self.assertEqual(len(top2_df), 2)
+            self.assertEqual(top2_df.loc[0, "variant"], "[WINNER] Model [Tuned]")
+
+            # Graceful single-variant fallback
+            single_df = utils.plot_top2_residuals_vs_actual(
+                y_true,
+                {"Model [Tuned]": preds_tuned},
+                eras_30,
+                best_variant_name="Model [Tuned]",
+            )
+            self.assertEqual(len(single_df), 1)
+
+    def test_feature_importance_share_and_group_summary_and_plot(self):
+        """3D-ii (% features concentration) and 3D-iii (feature group distribution by gain/importance)."""
+        self.assertEqual(utils.infer_feature_group_name("pca_comp_001"), "pca")
+        self.assertEqual(utils.infer_feature_group_name("fourier_sin_1"), "fourier")
+        self.assertEqual(utils.infer_feature_group_name("feature_x_ticker_lag1"), "ticker_ts")
+        self.assertEqual(utils.infer_feature_group_name("feature_x_era_roll5"), "era_ts")
+        self.assertEqual(utils.infer_feature_group_name("row_std"), "era_dispersion")
+        self.assertEqual(utils.infer_feature_group_name("feature_intelligence12"), "intelligence")
+        self.assertEqual(
+            utils.infer_feature_group_name("custom_col", feature_groups={"custom_grp": ["custom_col"]}),
+            "custom_grp",
+        )
+
+        imp_df = pd.DataFrame({
+            "feature": [
+                "feature_intelligence1",
+                "feature_intelligence2",
+                "feature_dexterity1",
+                "feature_dexterity2",
+                "pca_comp_0",
+                "row_mean",
+                "feature_wisdom1",
+                "feature_wisdom2",
+                "feature_wisdom3",
+                "feature_wisdom4",
+            ],
+            "gain_importance": [40.0, 20.0, 15.0, 10.0, 10.0, 5.0, 0.0, 0.0, 0.0, 0.0],
+            "split_importance": [30.0, 20.0, 15.0, 15.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0],
+        })
+        summary = utils.build_feature_importance_share_and_group_summary(
+            imp_df,
+            feature_col="feature",
+            importance_col="gain_importance",
+            split_col="split_importance",
+            top_n=5,
+        )
+        self.assertEqual(summary["n_total_features"], 10)
+        self.assertEqual(summary["n_nonzero_features"], 6)
+        self.assertAlmostEqual(summary["total_importance"], 100.0, places=6)
+        # Top 2 features (20%) hold 60% >= 50%; top 4 features (40%) hold 85% >= 80%
+        self.assertAlmostEqual(summary["pct_features_for_50pct"], 20.0, places=1)
+        self.assertAlmostEqual(summary["pct_features_for_80pct"], 40.0, places=1)
+
+        grp_df = summary["group_summary_df"]
+        self.assertFalse(grp_df.empty)
+        self.assertIn("split_share_pct", grp_df.columns)
+        self.assertAlmostEqual(float(grp_df["importance_share_pct"].sum()), 100.0, places=1)
+        self.assertAlmostEqual(float(grp_df["feature_share_pct"].sum()), 100.0, places=1)
+        self.assertEqual(grp_df.loc[0, "feature_group"], "intelligence")
+        self.assertAlmostEqual(float(grp_df.loc[0, "importance_share_pct"]), 60.0, places=1)
+        self.assertAlmostEqual(float(grp_df.loc[0, "importance_lift"]), 3.0, places=2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            utils.plot_interpretability_share_and_groups(
+                summary,
+                model_label="LightGBM",
+                metric_label="Gain",
+                results_dir=tmp_dir,
+                timestamp="20261126",
+                experiment_name="unit",
+                save_results=True,
+            )
+            out_png = tmp_dir / "20261126_unit_lightgbm_importance_share_and_groups.png"
+            self.assertTrue(out_png.is_file())
+
+    def test_time_guard_and_candidate_timing_analysis(self):
+        """Time fail-safe toggle + 5B candidate scoring/fit timing summary & 3-panel plot."""
+        import time
+
+        # Disabled guard must never raise even with huge elapsed time
+        utils.configure_time_guard(enabled=False, max_candidate_seconds=0.001)
+        self.assertTrue(utils.check_time_budget(time.perf_counter() - 10.0, context="disabled_test"))
+
+        # Enabled guard must raise TimeoutError when elapsed exceeds limit
+        utils.configure_time_guard(enabled=True, max_candidate_seconds=0.05)
+        with self.assertRaises(TimeoutError):
+            utils.check_time_budget(time.perf_counter() - 1.0, context="slow_candidate_test")
+
+        # Restore default 30-minute guard via build_experiment_setup
+        cfg = utils.build_experiment_setup(
+            target_col="target",
+            feature_set="small",
+            model_tag="lgbm",
+            time_guard_enabled=True,
+            max_candidate_seconds=1800.0,
+        )
+        self.assertTrue(cfg["time_guard_enabled"])
+        self.assertEqual(cfg["max_candidate_seconds"], 1800.0)
+
+        timing_df = pd.DataFrame({
+            "candidate_id": [0, 1, 2, 3, 4, 5, 6, 7],
+            "rank_test_score": [1, 2, 3, 4, 5, 6, 7, 8],
+            "mean_fit_time": [10.0, 11.0, 10.5, 12.0, 15.0, 20.0, 45.0, 60.0],
+            "mean_score_time": [2.0, 2.0, 2.5, 3.0, 3.0, 4.0, 5.0, 0.0],
+            "total_time_s": [12.0, 13.0, 13.0, 15.0, 18.0, 24.0, 50.0, 60.0],
+            "mean_test_score": [0.025, 0.021, 0.019, 0.015, 0.012, 0.010, 0.008, -1.0],
+        })
+        artifacts = {"timing_records": {"LightGBM Regressor": timing_df}}
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            summary_df = utils.plot_candidate_timing_analysis(
+                artifacts,
+                max_candidate_seconds=1800.0,
+                results_dir=tmp_dir,
+                timestamp="20261126",
+                experiment_name="unit",
+                save_results=True,
+            )
+            self.assertEqual(len(summary_df), 1)
+            row = summary_df.loc[0]
+            self.assertEqual(int(row["n_candidates"]), 8)
+            self.assertEqual(int(row["n_failed"]), 1)
+            self.assertAlmostEqual(float(row["median_s"]), 16.5, places=1)
+            self.assertGreater(float(row["q75_s"]), float(row["median_s"]))
+            self.assertGreaterEqual(int(row["suggested_timeout_s"]), 60)
+            self.assertEqual(int(row["configured_timeout_s"]), 1800)
+            out_png = tmp_dir / "20261126_unit_lightgbm_regressor_candidate_timing_analysis.png"
+            self.assertTrue(out_png.is_file())
+
+    def test_bayes_search_survives_time_and_memory_guard_aborts(self):
+        """BayesSearchCV(n_points=1, cv=1 fold) must score -1.0 and continue instead of raising ValueError."""
+        from skopt import BayesSearchCV
+        from skopt.space import Integer
+        from lgbm_utils import LightGBMNumeraiEstimator
+        from baseline_utils import LagReversalEstimator
+
+        df, feat_cols = make_synthetic_numerai_panel(n_eras=8, n_tickers=10, n_features=6, seed=11)
+        X = df[["era", "numerai_ticker"] + feat_cols].copy()
+        y = df["target"].copy()
+        tr_idx = np.flatnonzero(df["era"].to_numpy() <= 5)
+        va_idx = np.flatnonzero(df["era"].to_numpy() > 5)
+        cv_splits = [(tr_idx, va_idx)]
+        scorer = utils.make_candidate_scorer("v1_skepta")
+
+        try:
+            # 1) Time fail-safe inside BayesSearchCV (n_points=1, 1 fold): must NOT raise ValueError: All the 1 fits failed
+            utils.configure_time_guard(enabled=True, max_candidate_seconds=1e-6)
+            utils.configure_memory_guard(enabled=False, min_free_gb=3.0)
+            lgb_pipe = Pipeline([("estimator", LightGBMNumeraiEstimator(n_estimators=5, verbose=-1, n_jobs=1))])
+            search_time = BayesSearchCV(
+                estimator=lgb_pipe,
+                search_spaces={"estimator__num_leaves": Integer(4, 8)},
+                n_iter=2,
+                optimizer_kwargs={"base_estimator": "ET", "acq_func": "EI", "n_initial_points": 1},
+                scoring=scorer,
+                cv=cv_splits,
+                refit=False,
+                random_state=42,
+                error_score=-1.0,
+                n_jobs=1,
+            )
+            utils.reset_cv_metric_log()
+            search_time.fit(X, y)
+            self.assertEqual(len(search_time.cv_results_["mean_test_score"]), 2)
+            self.assertTrue(np.allclose(search_time.cv_results_["mean_test_score"], -1.0))
+
+            # 2) Memory fail-safe inside BayesSearchCV (n_points=1, 1 fold): must NOT raise ValueError: All the 1 fits failed
+            from unittest.mock import patch
+
+            utils.configure_time_guard(enabled=False, max_candidate_seconds=1800.0)
+            lag_pipe = Pipeline([("estimator", LagReversalEstimator(lag=1, top_k=None))])
+            search_mem = BayesSearchCV(
+                estimator=lag_pipe,
+                search_spaces={"estimator__lag": Integer(1, 2)},
+                n_iter=2,
+                optimizer_kwargs={"base_estimator": "ET", "acq_func": "EI", "n_initial_points": 1},
+                scoring=scorer,
+                cv=cv_splits,
+                refit=False,
+                random_state=42,
+                error_score=-1.0,
+                n_jobs=1,
+            )
+            utils.reset_cv_metric_log()
+            with patch("baseline_utils.check_memory_budget", side_effect=MemoryError("simulated OOM")):
+                search_mem.fit(X, y)
+            self.assertEqual(len(search_mem.cv_results_["mean_test_score"]), 2)
+            self.assertTrue(np.allclose(search_mem.cv_results_["mean_test_score"], -1.0))
+        finally:
+            utils.configure_time_guard(enabled=True, max_candidate_seconds=1800.0)
+            utils.configure_memory_guard(enabled=True, min_free_gb=3.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
