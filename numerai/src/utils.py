@@ -3950,6 +3950,27 @@ def simulate_stake_pnl_monte_carlo(
     }
 
 
+def _compute_wallet_ylim(
+    y_series_list: Sequence[np.ndarray],
+    start_cap: float,
+) -> Optional[Tuple[float, float]]:
+    """Compute y-axis bounds starting near 0.7 * start_cap (without clipping lows) and extending above start_cap."""
+    chunks = [np.asarray(arr, dtype=np.float64).ravel() for arr in y_series_list if arr is not None]
+    if not chunks:
+        return None
+    combined = np.concatenate(chunks)
+    finite_y = combined[np.isfinite(combined)]
+    if len(finite_y) == 0:
+        return None
+    y_min = float(np.min(finite_y))
+    y_max = float(np.max(finite_y))
+    default_floor = 0.7 * start_cap
+    y_span = max(max(y_max, start_cap) - min(y_min, default_floor), max(start_cap * 0.1, 1.0))
+    y_lo = min(default_floor, max(0.0, y_min - 0.08 * y_span))
+    y_hi = max(y_max, start_cap) + 0.10 * y_span
+    return y_lo, y_hi
+
+
 def plot_stake_pnl_dashboard(
     per_era_corr: pd.Series,
     *,
@@ -4042,7 +4063,14 @@ def plot_stake_pnl_dashboard(
             label="Conservative Floor (CORR only, £)",
         )
     ax.axhline(start_cap, color="#64748b", linestyle="--", linewidth=1.2, alpha=0.85, label=f"Start (£{start_cap:,.0f})")
-    ax.set_ylim(bottom=0.0)
+    y_series_list = [y_vals]
+    if has_cons and conservative_pnl is not None:
+        y_series_list.append(conservative_pnl["equity_curve"].to_numpy(dtype=np.float64))
+    ylim = _compute_wallet_ylim(y_series_list, start_cap)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    else:
+        ax.set_ylim(bottom=0.7 * start_cap)
     ax.set_xlabel("Time (Validation Era / Week)")
     ax.set_ylabel("Wallet Balance (£)")
     ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
@@ -4253,6 +4281,15 @@ def plot_stake_pnl_monte_carlo(
             color="#475569",
             bbox={"boxstyle": "round,pad=0.5", "facecolor": "#f8fafc", "edgecolor": "#cbd5e1"},
         )
+
+    path_arrays = [
+        np.asarray(ex["equity_path"], dtype=np.float64)
+        for ex in (lose_ex, win_ex)
+        if ex is not None and ex.get("equity_path") is not None
+    ]
+    paths_ylim = _compute_wallet_ylim(path_arrays, start_cap)
+    if paths_ylim is not None:
+        ax_paths.set_ylim(*paths_ylim)
 
     ax_paths.set_xlabel("Simulated Week (Era Step)")
     ax_paths.set_ylabel("One-Wallet Balance (£)")
@@ -5498,6 +5535,7 @@ def plot_residual_diagnostics(
     era_window: Optional[Tuple[Any, Any]] = None,
     random_state: int = 42,
     save_prefix: Optional[Any] = None,
+    plot: bool = True,
 ) -> pd.DataFrame:
     """Plot clean Numerai-native residual diagnostics (replacing vertical-stripe raw scatter, flat era-mean, and % error charts).
 
@@ -5568,6 +5606,10 @@ def plot_residual_diagnostics(
             "under_predict_pct": round(float(np.mean(r_v < 0.0) * 100.0), 2),
             "over_predict_pct": round(float(np.mean(r_v > 0.0) * 100.0), 2),
         })
+
+    if not plot:
+        del extracted_preds, valid_masks
+        return pd.DataFrame(summary_rows)
 
     n_models = len(extracted_preds)
     unique_actuals = np.sort(np.unique(actual_all[finite_actual]))
@@ -5722,6 +5764,107 @@ def plot_residual_diagnostics(
 
     del extracted_preds, valid_masks, mae_df
     return pd.DataFrame(summary_rows)
+
+
+def plot_residuals_vs_actual(
+    y_true: Any,
+    predictions_by_model: Mapping[str, Any],
+    eras: Any,
+    *,
+    variant_names: Optional[Sequence[str]] = None,
+    max_scatter_points: int = 5000,
+    random_state: int = 42,
+    save_path: Optional[Any] = None,
+) -> None:
+    """Plot side-by-side Residuals vs Actual scatter panels (default green left, tuned orange right)."""
+    import matplotlib.pyplot as plt
+
+    actual_all = np.asarray(y_true, dtype=np.float64).ravel()
+    era_all, _ = _normalize_eras_for_grouping(eras)
+    if len(actual_all) == 0 or len(actual_all) != len(era_all):
+        raise ValueError(
+            f"y_true ({len(actual_all)}) and eras ({len(era_all)}) must be non-empty and equal length."
+        )
+    if not predictions_by_model:
+        raise ValueError("predictions_by_model must contain at least one model entry.")
+
+    if variant_names is not None:
+        selected = [str(v) for v in variant_names if str(v) in predictions_by_model]
+    else:
+        keys = [str(k) for k in predictions_by_model.keys()]
+        default_k = next((k for k in keys if "[Default]" in k), None)
+        tuned_k = next((k for k in keys if "[Tuned]" in k and "Walk-Forward" not in k), None)
+        selected = [k for k in (default_k, tuned_k) if k is not None]
+        if not selected:
+            selected = keys[:2]
+    if not selected:
+        selected = [str(k) for k in list(predictions_by_model.keys())[:2]]
+
+    finite_actual = np.isfinite(actual_all)
+    unique_actuals = np.sort(np.unique(actual_all[finite_actual]))
+    is_discrete_target = 2 <= len(unique_actuals) <= 10
+
+    n_models = len(selected)
+    palette = ["#2e8b57", "#e07b00", "#2563eb", "#7446A5"]
+    fig, axes = plt.subplots(
+        1,
+        n_models,
+        figsize=(6.8 * n_models, 4.6),
+        sharey=True,
+        sharex=True,
+        squeeze=False,
+        facecolor="white",
+    )
+    rng = np.random.default_rng(int(random_state))
+
+    for idx, name in enumerate(selected):
+        ax = axes[0, idx]
+        pred_arr = _extract_variant_predictions(predictions_by_model[name])
+        if len(pred_arr) != len(actual_all):
+            raise ValueError(
+                f"Prediction length mismatch for {name!r}: expected {len(actual_all)}, got {len(pred_arr)}."
+            )
+        aligned_arr, _ = _align_predictions_to_target_scale(pred_arr, actual_all, eras=era_all)
+        mask = finite_actual & np.isfinite(aligned_arr)
+        a_v = actual_all[mask]
+        r_v = aligned_arr[mask] - a_v
+
+        x_plot, y_plot = _subsample_scatter_pair(
+            a_v,
+            r_v,
+            max_scatter_points=max_scatter_points,
+            rng=rng,
+        )
+        if is_discrete_target and len(x_plot) > 0:
+            x_plot = x_plot + rng.uniform(-0.025, 0.025, size=len(x_plot))
+
+        ax.scatter(
+            x_plot,
+            y_plot,
+            s=22,
+            alpha=0.55,
+            color=palette[idx % len(palette)],
+            edgecolors="none",
+            zorder=2,
+        )
+        ax.axhline(0.0, color="#0f172a", linestyle="--", linewidth=1.2, zorder=3)
+        ax.set_title(f"{name}: Residuals vs Actual", fontsize=10.5, pad=8)
+        ax.set_xlabel("Actual Target")
+        ax.set_ylabel("Residual: Predicted - Actual")
+        if is_discrete_target:
+            ax.set_xticks(unique_actuals)
+        _apply_clean_residual_axes_style(ax)
+
+    fig.suptitle("Residuals vs Actual Target (below 0 = under-predicting)", fontsize=12.5, fontweight="bold", y=0.98)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    if save_path is not None:
+        out_path = Path(save_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, dpi=140)
+    plt.show()
+    plt.close(fig)
+    del fig
+    gc.collect()
 
 
 def run_numereval_diagnostics(
