@@ -13,6 +13,8 @@ Numerai Classic v6.0 ("Unity") panel data, supporting:
 
 from __future__ import annotations
 
+import gc
+import time
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -23,7 +25,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.linear_model import SGDRegressor
 
 from baseline_utils import BaseNumeraiEstimator
-from utils import NumeraiExtractions, _decode_structured, check_memory_budget
+from utils import NumeraiExtractions, _decode_structured, check_memory_budget, check_time_budget
 
 try:
     from sktime.transformations.panel.rocket import MiniRocket as SktimeMiniRocket
@@ -582,7 +584,9 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         Xty: Optional[np.ndarray] = None
         n_feat = 0
 
+        batch_t0 = time.perf_counter()
         for start in range(0, n_rows, bs):
+            check_time_budget(batch_t0, context="MiniRocketNumeraiEstimator._fit_ridge_batched")
             end = min(n_rows, start + bs)
             Z = self._transform_batch(X_tensor[start:end]).astype(np.float64, copy=False)
             if sum_x is None:
@@ -677,7 +681,9 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         # Pass 1: feature mean/std
         sum_x: Optional[np.ndarray] = None
         sum_x2: Optional[np.ndarray] = None
+        batch_t0 = time.perf_counter()
         for start in range(0, n_rows, bs):
+            check_time_budget(batch_t0, context="MiniRocketNumeraiEstimator._fit_ridge_batched")
             end = min(n_rows, start + bs)
             Z = self._transform_batch(X_tensor[start:end]).astype(np.float64, copy=False)
             if sum_x is None:
@@ -886,7 +892,9 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         # Fold standardization into effective weight vector for single BLAS matvec per batch
         eff_coef = self.coef_ / self.feature_scale_
         eff_intercept = self.intercept_ - float(np.dot(self.feature_mean_, eff_coef))
+        batch_t0 = time.perf_counter()
         for start in range(0, n_rows, bs):
+            check_time_budget(batch_t0, context="MiniRocketNumeraiEstimator._fit_ridge_batched")
             end = min(n_rows, start + bs)
             Z = self._transform_batch(X_tensor[start:end]).astype(np.float64, copy=False)
             preds[start:end] = Z @ eff_coef + eff_intercept
@@ -921,12 +929,22 @@ def extract_minirocket_interpretability(
     *,
     model_name: str = "MiniRocket Regressor",
     top_n: int = 20,
+    feature_groups: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Extract compact MiniRocket kernel/channel attribution summaries so heavy fitted models can be freed."""
+    """Extract compact MiniRocket kernel/channel attribution, % share, and group distribution summaries."""
+    from utils import build_feature_importance_share_and_group_summary
+
     if model_name not in fitted_models:
         return {}
     fitted_mr = fitted_models[model_name].named_steps["estimator"]
     cap = max(1, int(top_n))
+    share_summary = build_feature_importance_share_and_group_summary(
+        fitted_mr.channel_importance_df_,
+        feature_col="feature",
+        importance_col="kernel_weight_sum",
+        feature_groups=feature_groups,
+        top_n=cap,
+    )
     return {
         "model_name": str(model_name),
         "active_backend": fitted_mr.active_backend_,
@@ -938,6 +956,7 @@ def extract_minirocket_interpretability(
         "chosen_alpha": float(fitted_mr.chosen_alpha_),
         "top_kernels_df": fitted_mr.kernel_importance_df_.head(cap).copy(),
         "top_channels_df": fitted_mr.channel_importance_df_.head(cap).copy(),
+        "share_summary": share_summary,
     }
 
 
@@ -988,3 +1007,19 @@ def display_minirocket_interpretability(
             fig_imp.savefig(out_dir / f"{timestamp}_{experiment_name}_minirocket_importance.png", dpi=140)
         plt.show()
         plt.close(fig_imp)
+        del fig_imp
+        gc.collect()
+
+    share_summary = interpretability.get("share_summary")
+    if share_summary:
+        from utils import plot_interpretability_share_and_groups
+
+        plot_interpretability_share_and_groups(
+            share_summary,
+            model_label="MiniRocket",
+            metric_label="Kernel Weight",
+            results_dir=results_dir,
+            timestamp=timestamp,
+            experiment_name=experiment_name,
+            save_results=save_results,
+        )

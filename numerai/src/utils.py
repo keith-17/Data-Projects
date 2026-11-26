@@ -9,6 +9,7 @@ import inspect
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from functools import partial
 from operator import itemgetter
@@ -110,11 +111,17 @@ FORBIDDEN_FEATURE_COLS = frozenset({
 
 CORR_SANITY_LOW_THRESHOLD = 0.005
 CORR_SANITY_HIGH_THRESHOLD = 0.040
+SHARPE_OFFICIAL_CEILING = 2.50
 
 _MEMORY_GUARD_CONFIG: Dict[str, Any] = {
     "enabled": True,
     "min_free_gb": 3.0,
     "max_fraction": 0.80,
+}
+
+_TIME_GUARD_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "max_candidate_seconds": 3600.0,
 }
 
 
@@ -128,6 +135,46 @@ def configure_memory_guard(
     _MEMORY_GUARD_CONFIG["min_free_gb"] = max(0.0, float(min_free_gb))
     _MEMORY_GUARD_CONFIG["max_fraction"] = float(np.clip(float(max_fraction), 0.10, 0.99))
     return dict(_MEMORY_GUARD_CONFIG)
+
+
+def configure_time_guard(
+    enabled: bool = True,
+    max_candidate_seconds: float = 3600.0,
+) -> Dict[str, Any]:
+    """Configure the explicit per-candidate wall-clock time fail-safe (`enabled=False` turns it off completely)."""
+    _TIME_GUARD_CONFIG["enabled"] = bool(enabled)
+    _TIME_GUARD_CONFIG["max_candidate_seconds"] = max(0.0, float(max_candidate_seconds))
+    return dict(_TIME_GUARD_CONFIG)
+
+
+def check_time_budget(
+    start_time: Optional[float],
+    *,
+    context: str = "",
+    max_seconds: Optional[float] = None,
+) -> bool:
+    """Fail-safe wall-clock check: raises `TimeoutError` if elapsed time exceeds `max_candidate_seconds`.
+
+    When `_TIME_GUARD_CONFIG['enabled']` is `False` (or `start_time` is None / limit <= 0), returns `True`.
+    Inside `BayesSearchCV` / `GridSearchCV` (`error_score=-1.0`), raising `TimeoutError` aborts only the
+    offending slow candidate cleanly instead of stalling the entire hyperparameter search.
+    """
+    if not bool(_TIME_GUARD_CONFIG.get("enabled", True)) or start_time is None:
+        return True
+    limit_s = float(_TIME_GUARD_CONFIG["max_candidate_seconds"] if max_seconds is None else max_seconds)
+    if limit_s <= 0.0:
+        return True
+    elapsed_s = float(time.perf_counter() - float(start_time))
+    if elapsed_s > limit_s:
+        ctx = f"[{context}] " if context else ""
+        msg = (
+            f"[TIME FAIL-SAFE] {ctx}Aborting candidate: elapsed {elapsed_s:.1f}s "
+            f"exceeds max_candidate_seconds={limit_s:.1f}s."
+        )
+        print(msg)
+        _reclaim_cached_memory()
+        raise TimeoutError(msg)
+    return True
 
 
 def _read_cgroup_available_bytes() -> Optional[int]:
@@ -1820,8 +1867,10 @@ def walk_forward_predict(
         _lgb_mod.set_lgb_dataset_cache_suspended(True)
 
     wf_preds = np.full(len(X_validation), float(np.mean(y_train_s)) if len(y_train_s) else 0.5, dtype=np.float64)
+    wf_start_t = time.perf_counter()
     try:
         for start_idx in range(0, len(unique_val_eras), step):
+            check_time_budget(wf_start_t, context="walk_forward_predict")
             chunk_eras = unique_val_eras[start_idx : start_idx + step]
             forecast_origin_era = int(chunk_eras[0])
             settled_cutoff_era = forecast_origin_era - horizon - buf
@@ -2078,6 +2127,7 @@ def build_experiment_setup(
     n_iter: int = 37,
     n_jobs: int = -1,
     save_results: bool = True,
+    save_plots: bool = False,
     workspace_root: Any = ".",
     data_version: str = "v6.0",
     era_tag: Optional[str] = None,
@@ -2106,6 +2156,8 @@ def build_experiment_setup(
     extraction_cache_max_entries: int = 4,
     memory_guard_enabled: bool = True,
     memory_guard_min_free_gb: float = 3.0,
+    time_guard_enabled: bool = True,
+    max_candidate_seconds: float = 3600.0,
     force_reload_data_cache: bool = False,
     use_wandb: bool = False,
     wandb_project: str = "numerai-baselines",
@@ -2265,6 +2317,10 @@ def build_experiment_setup(
         enabled=bool(memory_guard_enabled),
         min_free_gb=float(memory_guard_min_free_gb),
     )
+    configure_time_guard(
+        enabled=bool(time_guard_enabled),
+        max_candidate_seconds=float(max_candidate_seconds),
+    )
 
     cfg: Dict[str, Any] = {
         "data_version": data_version,
@@ -2303,6 +2359,7 @@ def build_experiment_setup(
         "error_score": float(error_score),
         "n_jobs": int(n_jobs),
         "save_results": bool(save_results),
+        "save_plots": bool(save_plots),
         "export_diagnostics": bool(export_diagnostics),
         "error_bin_mode": str(error_bin_mode).strip().lower(),
         "error_pct_bins": error_pct_bins,
@@ -2312,6 +2369,8 @@ def build_experiment_setup(
         "extraction_cache_max_entries": int(extraction_cache_max_entries),
         "memory_guard_enabled": bool(memory_guard_enabled),
         "memory_guard_min_free_gb": float(memory_guard_min_free_gb),
+        "time_guard_enabled": bool(time_guard_enabled),
+        "max_candidate_seconds": float(max_candidate_seconds),
         "force_reload_data_cache": bool(force_reload_data_cache),
         "use_wandb": bool(use_wandb),
         "wandb_project": wandb_project,
@@ -3946,6 +4005,9 @@ def plot_stake_pnl_dashboard(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(out_path, dpi=140)
     plt.show()
+    plt.close(fig)
+    del fig
+    gc.collect()
     return pnl
 
 
@@ -4215,6 +4277,8 @@ def plot_stake_pnl_monte_carlo(
         plt.savefig(out_path, dpi=140)
     plt.show()
     plt.close(fig)
+    del fig
+    gc.collect()
     if not retain_paths:
         mc["sim_equity_paths"] = np.empty((0, 0), dtype=np.float64)
     del sim_eq_paths
@@ -4792,6 +4856,9 @@ def plot_era_error_envelope(
         target_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(target_path, dpi=140)
     plt.show()
+    plt.close(fig)
+    del fig
+    gc.collect()
     return envelope_df
 
 
@@ -5158,6 +5225,9 @@ def plot_error_bin_waterfall(
         target_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(target_path, dpi=140)
     plt.show()
+    plt.close(fig)
+    del fig
+    gc.collect()
 
 
 def _format_pct_tick(value: float, _tick_pos: Any) -> str:
@@ -5285,6 +5355,37 @@ def _slice_era_window(
     return sliced
 
 
+def _align_predictions_to_target_scale(
+    preds: np.ndarray,
+    actuals: np.ndarray,
+    eras: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, bool]:
+    """Align out-of-range predictions (e.g. `era_zscore` in `[-4, +4]`) onto `[0, 1]` via per-era percentile rank.
+
+    Returns `(aligned_preds, was_rank_aligned)`. Predictions already on the `[0, 1]` target scale are preserved.
+    """
+    p_arr = np.asarray(preds, dtype=np.float64).ravel()
+    a_arr = np.asarray(actuals, dtype=np.float64).ravel()
+    finite_p = np.isfinite(p_arr)
+    finite_a = np.isfinite(a_arr)
+    if not np.any(finite_p) or not np.any(finite_a):
+        return p_arr, False
+
+    a_min, a_max = float(np.min(a_arr[finite_a])), float(np.max(a_arr[finite_a]))
+    p_min, p_max = float(np.min(p_arr[finite_p])), float(np.max(p_arr[finite_p]))
+    target_in_unit = (a_min >= -0.05) and (a_max <= 1.05)
+    pred_out_of_unit = (p_min < -0.10) or (p_max > 1.10)
+    if not (target_in_unit and pred_out_of_unit):
+        return p_arr, False
+
+    p_series = pd.Series(p_arr)
+    if eras is not None and len(eras) == len(p_arr):
+        aligned = p_series.groupby(eras, sort=False).rank(pct=True).to_numpy(dtype=np.float64)
+    else:
+        aligned = p_series.rank(pct=True).to_numpy(dtype=np.float64)
+    return aligned, True
+
+
 def plot_residual_diagnostics(
     y_true: Any,
     predictions_by_model: Mapping[str, Any],
@@ -5299,18 +5400,19 @@ def plot_residual_diagnostics(
     random_state: int = 42,
     save_prefix: Optional[Any] = None,
 ) -> pd.DataFrame:
-    """Plot CAVU flight-deck style residual diagnostics adapted to Numerai targets and eras.
+    """Plot clean Numerai-native residual diagnostics (replacing vertical-stripe raw scatter, flat era-mean, and % error charts).
 
-    Generates three clean diagnostic figures:
-      1. Residuals vs Actual Target (`Predicted - Actual`, below 0 = under-predicting), side-by-side per model.
-      2. Actual vs Predicted Target by Era (era-mean trend across all eras or an optional `era_window`).
-      3. Percentage Error vs Actual Target (`(Predicted - Actual) / Actual * 100%` on non-zero actual targets).
+    Generates two clean, scale-aligned diagnostic figures:
+      1. Residual Distribution by Actual Target Bin (`Aligned Pred - Actual`, boxplot + bin means per target bin).
+      2. Prediction Decile Calibration & Per-Era MAE Trend (monotonic calibration across 10 predicted deciles
+         stacked above per-era mean absolute residual across validation eras).
 
-    Subsamples scatter points deterministically only when row count exceeds `max_scatter_points` so
-    large Numerai validation sets render smoothly, while computing era means and summary metrics on all finite rows.
+    Automatically rank-normalizes out-of-range predictions (e.g. `era_zscore` in `[-4, +4]`) per era to `[0, 1]`
+    so residual scales remain directly comparable across variants.
     """
     import matplotlib.pyplot as plt
-    from matplotlib.ticker import FuncFormatter
+
+    del max_scatter_points, jitter_discrete, random_state  # Retained for call-site compatibility
 
     actual_all = np.asarray(y_true, dtype=np.float64).ravel()
     era_all, era_kind = _normalize_eras_for_grouping(eras)
@@ -5329,16 +5431,18 @@ def plot_residual_diagnostics(
     )
 
     extracted_preds: Dict[str, np.ndarray] = {}
+    rank_aligned_flags: Dict[str, bool] = {}
     for name in ordered_names:
         pred_arr = _extract_variant_predictions(predictions_by_model[name])
         if len(pred_arr) != len(actual_all):
             raise ValueError(
                 f"Prediction length mismatch for {name!r}: expected {len(actual_all)}, got {len(pred_arr)}."
             )
-        extracted_preds[name] = pred_arr
+        aligned_arr, was_aligned = _align_predictions_to_target_scale(pred_arr, actual_all, eras=era_all)
+        extracted_preds[name] = aligned_arr
+        rank_aligned_flags[name] = was_aligned
 
     palette = ["#2e8b57", "#e07b00", "#2563eb", "#7446A5", "#dc2626", "#0d9488"]
-    actual_color = "#1f4e79"
     model_colors = {name: palette[idx % len(palette)] for idx, name in enumerate(extracted_preds)}
     display_labels = {
         name: (f"[BEST] {name}" if best_variant_name is not None and name == best_variant_name else name)
@@ -5367,25 +5471,20 @@ def plot_residual_diagnostics(
         })
 
     n_models = len(extracted_preds)
-    rng = np.random.default_rng(int(random_state))
-    cap_pts = max(1, int(max_scatter_points))
-
     unique_actuals = np.sort(np.unique(actual_all[finite_actual]))
     is_discrete_target = 2 <= len(unique_actuals) <= 10
-    jitter_half = 0.08 * float(np.min(np.diff(unique_actuals))) if is_discrete_target else 0.0
 
     prefix_path = Path(save_prefix) if save_prefix is not None else None
     if prefix_path is not None:
         prefix_path.parent.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # 1. Residuals vs Actual Target (Predicted - Actual; < 0 = under-predicting)
+    # 1. Residual Distribution by Actual Target Bin (Boxplot + Bin Mean)
     # ------------------------------------------------------------------
     fig1, axes1 = plt.subplots(
         1,
         n_models,
-        figsize=(7 * n_models, 5),
-        sharex=True,
+        figsize=(6.8 * n_models, 4.8),
         sharey=True,
         squeeze=False,
     )
@@ -5394,137 +5493,135 @@ def plot_residual_diagnostics(
         ax = flat_axes1[idx]
         mask = valid_masks[name]
         a_v = actual_all[mask]
-        p_v = pred_arr[mask]
-        a_s, p_s = _subsample_scatter_pair(a_v, p_v, max_scatter_points=cap_pts, rng=rng)
-        x_plot = (
-            a_s + rng.uniform(-jitter_half, jitter_half, size=len(a_s))
-            if (jitter_discrete and is_discrete_target and jitter_half > 0.0)
-            else a_s
+        r_v = pred_arr[mask] - a_v
+        color = model_colors[name]
+
+        if is_discrete_target:
+            bin_labels = [f"{u:.2f}" for u in unique_actuals]
+            grouped_res = [r_v[a_v == u] for u in unique_actuals]
+        else:
+            q_edges = np.unique(np.quantile(a_v, np.linspace(0.0, 1.0, 6)))
+            if len(q_edges) >= 3:
+                bin_idx = np.clip(np.searchsorted(q_edges[1:-1], a_v, side="right"), 0, len(q_edges) - 2)
+                bin_labels = [f"[{q_edges[i]:.2f}, {q_edges[i + 1]:.2f}]" for i in range(len(q_edges) - 1)]
+                grouped_res = [r_v[bin_idx == i] for i in range(len(q_edges) - 1)]
+            else:
+                bin_labels = ["All"]
+                grouped_res = [r_v]
+
+        non_empty = [(lbl, arr) for lbl, arr in zip(bin_labels, grouped_res) if len(arr) > 0]
+        positions = np.arange(1, len(non_empty) + 1)
+        bp = ax.boxplot(
+            [arr for _, arr in non_empty],
+            positions=positions,
+            widths=0.48,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "#0f172a", "linewidth": 1.6},
+            whiskerprops={"color": color, "linewidth": 1.2},
+            capprops={"color": color, "linewidth": 1.2},
         )
-        ax.scatter(x_plot, p_s - a_s, alpha=0.55, s=24, color=model_colors[name])
-        ax.axhline(0.0, color="black", linestyle="--")
-        ax.set_title(f"{display_labels[name]}: Residuals vs Actual")
-        ax.set_xlabel("Actual Target")
-        ax.set_ylabel("Residual: Predicted - Actual")
+        for patch in bp["boxes"]:
+            patch.set_facecolor(color)
+            patch.set_alpha(0.32)
+            patch.set_edgecolor(color)
+
+        means = [float(np.mean(arr)) for _, arr in non_empty]
+        ax.plot(positions, means, color=color, marker="D", markersize=5.5, linewidth=1.6, label="Bin mean residual", zorder=4)
+        ax.axhline(0.0, color="#0f172a", linestyle="--", linewidth=1.1, zorder=3)
+        ax.set_xticks(positions)
+        ax.set_xticklabels([lbl for lbl, _ in non_empty], rotation=0 if is_discrete_target else 20)
+        align_note = " (era-rank aligned)" if rank_aligned_flags[name] else ""
+        ax.set_title(f"{display_labels[name]}{align_note}", fontsize=10.5, fontweight="bold")
+        ax.set_xlabel("Actual Target Bin")
+        if idx == 0:
+            ax.set_ylabel("Residual: Predicted - Actual")
+        ax.legend(loc="upper right", frameon=False, fontsize=8.5)
         _apply_clean_residual_axes_style(ax)
 
-    fig1.suptitle("Residuals vs Actual Target (below 0 = under-predicting)", fontsize=13)
+    fig1.suptitle("3C-i. Residual Distribution by Target Bin (below 0 = under-predicting)", fontsize=13, fontweight="bold")
     fig1.tight_layout()
     if prefix_path is not None:
-        fig1.savefig(f"{prefix_path}_residuals_vs_actual.png", dpi=140)
+        fig1.savefig(f"{prefix_path}_residuals_by_target_bin.png", dpi=140)
     plt.show()
     plt.close(fig1)
+    del fig1
+    gc.collect()
 
     # ------------------------------------------------------------------
-    # 2. Actual vs Predicted Target by Era (era-mean trend)
+    # 2. Decile Calibration Curve & Per-Era MAE Trend
     # ------------------------------------------------------------------
-    ts_cols: Dict[str, Any] = {
-        "era": era_all,
-        "Actual": np.where(np.isfinite(actual_all), actual_all, np.nan),
-    }
+    fig2, (ax_cal, ax_mae) = plt.subplots(2, 1, figsize=(13.5, 8.2))
+    overall_actual_mean = float(np.mean(actual_all[finite_actual])) if np.any(finite_actual) else 0.5
+    ax_cal.axhline(overall_actual_mean, color="#64748b", linestyle=":", linewidth=1.2, label=f"Target mean ({overall_actual_mean:.3f})")
+
+    era_mae_cols: Dict[str, Any] = {"era": era_all}
     for name, pred_arr in extracted_preds.items():
-        ts_cols[name] = np.where(np.isfinite(pred_arr), pred_arr, np.nan)
-    ts_df = pd.DataFrame(ts_cols).groupby("era", sort=True).mean()
-    ts_df = ts_df.dropna(subset=["Actual"])
-    ts_df = _slice_era_window(ts_df, era_window, era_kind=era_kind)
+        mask = valid_masks[name]
+        a_v = actual_all[mask]
+        p_v = pred_arr[mask]
+        color = model_colors[name]
 
-    if not ts_df.empty:
-        n_eras_plotted = len(ts_df)
-        marker_step = max(1, n_eras_plotted // 60) if n_eras_plotted > 80 else 1
-        fig2, ax2 = plt.subplots(figsize=(14, 5))
+        # Decile calibration: mean actual target across 10 predicted deciles
+        p_ranks = pd.Series(p_v).rank(method="first", pct=True).to_numpy(dtype=np.float64)
+        deciles = np.clip(np.ceil(p_ranks * 10.0).astype(np.int64), 1, 10)
+        dec_x = []
+        dec_y = []
+        for d in range(1, 11):
+            d_mask = deciles == d
+            if np.any(d_mask):
+                dec_x.append(d)
+                dec_y.append(float(np.mean(a_v[d_mask])))
+        ax_cal.plot(dec_x, dec_y, color=color, marker="o", linewidth=2.0, markersize=5, label=display_labels[name])
+
+        abs_err = np.full(len(actual_all), np.nan, dtype=np.float64)
+        abs_err[mask] = np.abs(p_v - a_v)
+        era_mae_cols[name] = abs_err
+
+    ax_cal.set_xticks(range(1, 11))
+    ax_cal.set_xlabel("Predicted Decile (1 = Lowest Predicted, 10 = Highest Predicted)")
+    ax_cal.set_ylabel("Mean Actual Target")
+    ax_cal.set_title("3C-ii. Prediction Decile Calibration (Upward Slope = Positive Cross-Sectional Signal)", fontsize=11, fontweight="bold")
+    ax_cal.legend(frameon=False, fontsize=9.0)
+    _apply_clean_residual_axes_style(ax_cal)
+
+    mae_df = pd.DataFrame(era_mae_cols).groupby("era", sort=True).mean()
+    mae_df = _slice_era_window(mae_df, era_window, era_kind=era_kind)
+    if not mae_df.empty:
+        n_eras_plotted = len(mae_df)
         if era_kind == "str":
             x_era = np.arange(n_eras_plotted, dtype=np.int64)
-            era_tick_labels = ts_df.index.astype(str).to_numpy()
+            era_tick_labels = mae_df.index.astype(str).to_numpy()
         else:
-            x_era = ts_df.index.to_numpy()
+            x_era = mae_df.index.to_numpy()
             era_tick_labels = None
 
-        ax2.plot(
-            x_era,
-            ts_df["Actual"].to_numpy(dtype=np.float64),
-            color=actual_color,
-            linewidth=2.5,
-            marker="o",
-            markevery=marker_step,
-            label="Actual",
-        )
+        roll_win = min(12, max(1, n_eras_plotted // 4))
         for name in extracted_preds:
-            ax2.plot(
-                x_era,
-                ts_df[name].to_numpy(dtype=np.float64),
-                color=model_colors[name],
-                linestyle="--",
-                marker="o",
-                markersize=4,
-                markevery=marker_step,
-                label=f"{display_labels[name]} predicted",
-            )
+            s_mae = mae_df[name].to_numpy(dtype=np.float64)
+            s_roll = pd.Series(s_mae).rolling(window=roll_win, min_periods=1).mean().to_numpy(dtype=np.float64)
+            ax_mae.plot(x_era, s_mae, color=model_colors[name], alpha=0.28, linewidth=1.0)
+            ax_mae.plot(x_era, s_roll, color=model_colors[name], linewidth=2.1, label=f"{display_labels[name]} ({roll_win}-era MA)")
         if era_tick_labels is not None:
             tick_step = max(1, n_eras_plotted // 12)
-            ax2.set_xticks(x_era[::tick_step])
-            ax2.set_xticklabels(era_tick_labels[::tick_step], rotation=35, ha="right")
-        ax2.set_title("Actual vs Predicted Target by Era")
-        ax2.set_xlabel("Era")
-        ax2.set_ylabel("Average Target")
-        ax2.legend(frameon=False)
-        _apply_clean_residual_axes_style(ax2)
-        fig2.tight_layout()
-        if prefix_path is not None:
-            fig2.savefig(f"{prefix_path}_actual_vs_predicted_by_era.png", dpi=140)
-        plt.show()
-        plt.close(fig2)
+            ax_mae.set_xticks(x_era[::tick_step])
+            ax_mae.set_xticklabels(era_tick_labels[::tick_step], rotation=35, ha="right")
 
-    # ------------------------------------------------------------------
-    # 3. Percentage Error vs Actual Target (on non-zero actual targets)
-    # ------------------------------------------------------------------
-    fig3, axes3 = plt.subplots(
-        1,
-        n_models,
-        figsize=(7 * n_models, 5),
-        sharex=True,
-        sharey=True,
-        squeeze=False,
-    )
-    flat_axes3 = axes3.ravel()
-    for idx, (name, pred_arr) in enumerate(extracted_preds.items()):
-        ax = flat_axes3[idx]
-        nz_mask = valid_masks[name] & (np.abs(actual_all) > 1e-12)
-        if np.any(nz_mask):
-            actual_nz = actual_all[nz_mask]
-            pred_nz = pred_arr[nz_mask]
-            pct_err = (pred_nz - actual_nz) / actual_nz * 100.0
-            a_nz_s, pct_s = _subsample_scatter_pair(actual_nz, pct_err, max_scatter_points=cap_pts, rng=rng)
-            x_nz_plot = (
-                a_nz_s + rng.uniform(-jitter_half, jitter_half, size=len(a_nz_s))
-                if (jitter_discrete and is_discrete_target and jitter_half > 0.0)
-                else a_nz_s
-            )
-            ax.scatter(x_nz_plot, pct_s, alpha=0.55, s=24, color=model_colors[name])
-        else:
-            ax.text(
-                0.5,
-                0.5,
-                "No non-zero actual targets",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color="#64748b",
-            )
-        ax.axhline(0.0, color="black", linestyle="--")
-        ax.yaxis.set_major_formatter(FuncFormatter(_format_pct_tick))
-        ax.set_title(f"{display_labels[name]}: % Error vs Actual")
-        ax.set_xlabel("Actual Target")
-        ax.set_ylabel("Percentage Error (%)")
-        _apply_clean_residual_axes_style(ax)
+    ax_mae.set_xlabel("Era")
+    ax_mae.set_ylabel("Per-Era Mean Absolute Residual (MAE)")
+    ax_mae.set_title("Per-Era Forecast Error (MAE) Across Validation Eras", fontsize=11, fontweight="bold")
+    ax_mae.legend(frameon=False, fontsize=9.0)
+    _apply_clean_residual_axes_style(ax_mae)
 
-    fig3.suptitle("Percentage Error vs Actual Target", fontsize=13)
-    fig3.tight_layout()
+    fig2.tight_layout()
     if prefix_path is not None:
-        fig3.savefig(f"{prefix_path}_pct_error_vs_actual.png", dpi=140)
+        fig2.savefig(f"{prefix_path}_calibration_and_era_mae.png", dpi=140)
     plt.show()
-    plt.close(fig3)
+    plt.close(fig2)
+    del fig2
+    gc.collect()
 
-    del extracted_preds, valid_masks, ts_df
+    del extracted_preds, valid_masks, mae_df
     return pd.DataFrame(summary_rows)
 
 
@@ -5777,37 +5874,147 @@ def _prioritize_and_mark_winner(
     return out
 
 
+def compute_science_score_pct(
+    validation_corr: Any,
+    validation_sharpe: Any,
+    *,
+    corr_ceiling: float = CORR_SANITY_HIGH_THRESHOLD,
+    sharpe_ceiling: float = SHARPE_OFFICIAL_CEILING,
+) -> float:
+    """Compute a 0–100% Science Score normalizing validation CORR and Sharpe against Numerai's official ceilings.
+
+    Uses `corr_ceiling = 0.040` (4.0% CORR) and `sharpe_ceiling = 2.50` (validation Sharpe), clamping each
+    component to `[0%, 100%]` and averaging them equally (50% CORR + 50% Sharpe).
+    """
+    c_ceil = max(1e-9, float(corr_ceiling))
+    s_ceil = max(1e-9, float(sharpe_ceiling))
+    c_val = float(pd.to_numeric(validation_corr, errors="coerce"))
+    s_val = float(pd.to_numeric(validation_sharpe, errors="coerce"))
+    parts: List[float] = []
+    if np.isfinite(c_val):
+        parts.append(float(np.clip(c_val / c_ceil, 0.0, 1.0)) * 100.0)
+    if np.isfinite(s_val):
+        parts.append(float(np.clip(s_val / s_ceil, 0.0, 1.0)) * 100.0)
+    if not parts:
+        return float(np.nan)
+    return round(float(np.mean(parts)), 1)
+
+
+def _compute_live_round_metrics_for_row(
+    row: Mapping[str, Any],
+    *,
+    live_round_eras: int = CLASSIC_SETTLEMENT_ROUNDS,
+) -> Dict[str, Any]:
+    """Compute per-live-Numerai-round (default 12-era / 60-day) Money (1A) and Science (1B) metrics for one variant row."""
+    round_len = max(1, int(live_round_eras))
+    raw_corrs = row.get("validation_era_corrs", None)
+    era_s = pd.Series(dtype=np.float64)
+    if isinstance(raw_corrs, pd.Series):
+        era_s = pd.to_numeric(raw_corrs, errors="coerce").dropna().astype(np.float64)
+    elif isinstance(raw_corrs, Mapping) and raw_corrs:
+        era_s = pd.to_numeric(pd.Series(raw_corrs), errors="coerce").dropna().astype(np.float64)
+    elif isinstance(raw_corrs, (list, tuple, np.ndarray)) and len(raw_corrs) > 0:
+        era_s = pd.to_numeric(pd.Series(raw_corrs), errors="coerce").dropna().astype(np.float64)
+
+    n_eras = len(era_s)
+    if n_eras == 0:
+        for count_key in ("n_validation_eras", "n_eras", "validation_eras_count"):
+            raw_n = row.get(count_key, None)
+            if raw_n is not None:
+                n_num = float(pd.to_numeric(raw_n, errors="coerce"))
+                if np.isfinite(n_num) and n_num > 0:
+                    n_eras = int(round(n_num))
+                    break
+
+    n_live_rounds = (float(n_eras) / float(round_len)) if n_eras > 0 else float(np.nan)
+    live_rounds_span = f"{n_live_rounds:.1f} rds ({n_eras}e)" if n_eras > 0 else "N/A"
+
+    start_cap = float(pd.to_numeric(row.get("start_capital", 1000.0), errors="coerce"))
+    if not np.isfinite(start_cap) or start_cap <= 0.0:
+        start_cap = 1000.0
+    end_cap = float(pd.to_numeric(row.get("end_capital", np.nan), errors="coerce"))
+    tot_profit = float(pd.to_numeric(row.get("total_profit", np.nan), errors="coerce"))
+    if not np.isfinite(tot_profit) and np.isfinite(end_cap):
+        tot_profit = end_cap - start_cap
+
+    live_round_return_pct = float(np.nan)
+    live_round_profit_gbp = float(np.nan)
+    if np.isfinite(n_live_rounds) and n_live_rounds > 0.0:
+        if np.isfinite(end_cap):
+            if end_cap <= 0.0:
+                live_round_return_pct = -100.0
+            else:
+                live_round_return_pct = round(
+                    float(((end_cap / start_cap) ** (1.0 / n_live_rounds) - 1.0) * 100.0), 2
+                )
+        if np.isfinite(tot_profit):
+            live_round_profit_gbp = round(float(tot_profit / n_live_rounds), 2)
+
+    val_corr = float(pd.to_numeric(row.get("validation_corr", np.nan), errors="coerce"))
+    live_round_12e_corr = float(np.nan)
+    live_round_12e_pos_pct = float(np.nan)
+    if len(era_s) >= round_len:
+        rolling_round_sums = era_s.rolling(window=round_len, min_periods=round_len).sum().dropna()
+        if len(rolling_round_sums) > 0:
+            live_round_12e_corr = round(float(rolling_round_sums.mean()), 4)
+            live_round_12e_pos_pct = round(float((rolling_round_sums > 0.0).mean() * 100.0), 1)
+    elif np.isfinite(val_corr):
+        live_round_12e_corr = round(float(val_corr * float(round_len)), 4)
+
+    return {
+        "live_round_return_pct": live_round_return_pct,
+        "live_round_profit_gbp": live_round_profit_gbp,
+        "live_rounds_span": live_rounds_span,
+        "live_round_12e_corr": live_round_12e_corr,
+        "live_round_12e_pos_pct": live_round_12e_pos_pct,
+    }
+
+
 def build_executive_scorecard_tables(
     comparison_df: pd.DataFrame,
     *,
     best_variant_name: Optional[str] = None,
     periods_per_year: float = 52.0,
+    corr_ceiling: float = CORR_SANITY_HIGH_THRESHOLD,
+    sharpe_ceiling: float = SHARPE_OFFICIAL_CEILING,
+    live_round_eras: int = CLASSIC_SETTLEMENT_ROUNDS,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Split the wide comparison DataFrame into two compact, untruncated Executive Scorecard tables.
 
     Returns `(money_df, science_df)`:
-      - `money_df` (7 cols): `variant`, `end_capital`, `total_return_pct`, `money_drawdown_pct`,
-        `max_drawdown_gbp`, `worst_round_gbp`, `tuw_max_eras` (formatted in years).
-      - `science_df` (8 cols): `variant`, `train_corr`, `validation_corr`, `corr_gap`,
-        `validation_sharpe`, `validation_psr`, `validation_dsr`, `sanity_status`.
+      - `money_df` (Table 1A, 10 cols): `variant`, `end_capital`, `total_return_pct`,
+        `live_round_return_pct`, `live_round_profit_gbp`, `money_drawdown_pct`,
+        `max_drawdown_gbp`, `worst_round_gbp`, `tuw_max_eras` (formatted in years), `live_rounds_span`.
+      - `science_df` (Table 1B, 11 cols): `variant`, `train_corr`, `validation_corr`, `corr_gap`,
+        `validation_sharpe`, `live_round_12e_corr`, `live_round_12e_pos_pct`, `validation_psr`,
+        `validation_dsr`, `science_score_pct`, `sanity_status`.
     """
     if comparison_df is None or comparison_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
     base = _prioritize_and_mark_winner(comparison_df, best_variant_name=best_variant_name)
+    live_round_rows = [
+        _compute_live_round_metrics_for_row(base.loc[idx], live_round_eras=live_round_eras)
+        for idx in base.index
+    ]
 
     money_cols = [
         "variant",
         "end_capital",
         "total_return_pct",
+        "live_round_return_pct",
+        "live_round_profit_gbp",
         "money_drawdown_pct",
         "max_drawdown_gbp",
         "worst_round_gbp",
         "tuw_max_eras",
+        "live_rounds_span",
     ]
     money_data: Dict[str, Any] = {}
     for col in money_cols:
-        if col not in base.columns:
+        if col in ("live_round_return_pct", "live_round_profit_gbp", "live_rounds_span"):
+            money_data[col] = [r[col] for r in live_round_rows]
+        elif col not in base.columns:
             money_data[col] = [np.nan] * len(base)
         elif col == "variant":
             money_data[col] = base[col].astype(str).tolist()
@@ -5826,13 +6033,32 @@ def build_executive_scorecard_tables(
         "validation_corr",
         "corr_gap",
         "validation_sharpe",
+        "live_round_12e_corr",
+        "live_round_12e_pos_pct",
         "validation_psr",
         "validation_dsr",
+        "science_score_pct",
         "sanity_status",
     ]
+    val_corr_vals = base["validation_corr"].tolist() if "validation_corr" in base.columns else [np.nan] * len(base)
+    val_sharpe_vals = base["validation_sharpe"].tolist() if "validation_sharpe" in base.columns else [np.nan] * len(base)
+    science_scores = [
+        compute_science_score_pct(
+            c_v,
+            s_v,
+            corr_ceiling=corr_ceiling,
+            sharpe_ceiling=sharpe_ceiling,
+        )
+        for c_v, s_v in zip(val_corr_vals, val_sharpe_vals)
+    ]
+
     science_data: Dict[str, Any] = {}
     for col in science_cols:
-        if col not in base.columns:
+        if col == "science_score_pct":
+            science_data[col] = science_scores
+        elif col in ("live_round_12e_corr", "live_round_12e_pos_pct"):
+            science_data[col] = [r[col] for r in live_round_rows]
+        elif col not in base.columns:
             science_data[col] = [np.nan] * len(base)
         elif col in ("variant", "sanity_status"):
             science_data[col] = base[col].astype(str).tolist()
@@ -5955,10 +6181,22 @@ def export_winner_scorecard_json(
         "hhi_neg",
     )
 
+    live_round_info = _compute_live_round_metrics_for_row(winner_row)
     money_metrics = {k: _json_safe_scalar(winner_row.get(k, None)) for k in money_keys}
     money_metrics["tuw_max_years"] = tuw_years_val
     money_metrics["tuw_formatted"] = format_tuw_years(tuw_eras_raw, periods_per_year=periods_per_year)
+    money_metrics["live_round_return_pct"] = _json_safe_scalar(live_round_info["live_round_return_pct"])
+    money_metrics["live_round_profit_gbp"] = _json_safe_scalar(live_round_info["live_round_profit_gbp"])
+    money_metrics["live_rounds_span"] = live_round_info["live_rounds_span"]
     science_metrics = {k: _json_safe_scalar(winner_row.get(k, None)) for k in science_keys}
+    science_metrics["live_round_12e_corr"] = _json_safe_scalar(live_round_info["live_round_12e_corr"])
+    science_metrics["live_round_12e_pos_pct"] = _json_safe_scalar(live_round_info["live_round_12e_pos_pct"])
+    science_metrics["science_score_pct"] = _json_safe_scalar(
+        compute_science_score_pct(
+            winner_row.get("validation_corr", np.nan),
+            winner_row.get("validation_sharpe", np.nan),
+        )
+    )
     diagnostics_metrics = {k: _json_safe_scalar(winner_row.get(k, None)) for k in diagnostics_keys}
 
     safe_tag = (
@@ -6070,6 +6308,9 @@ def plot_cumulative_validation_corr(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_path, dpi=140)
     plt.show()
+    plt.close(fig)
+    del fig
+    gc.collect()
     return cum_df
 
 
@@ -6199,6 +6440,9 @@ def plot_rolling_validation_corr(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_path, dpi=140)
     plt.show()
+    plt.close(fig)
+    del fig
+    gc.collect()
     return rolling_s
 
 
@@ -6339,7 +6583,235 @@ def plot_top2_residuals_vs_actual(
         fig.savefig(out_path, dpi=140)
     plt.show()
     plt.close(fig)
+    del fig
+    gc.collect()
     return pd.DataFrame(summary_rows)
+
+
+def infer_feature_group_name(
+    feature_name: Any,
+    feature_groups: Optional[Mapping[str, Sequence[str]]] = None,
+) -> str:
+    """Map a feature column name to its Numerai / engineered feature group."""
+    col = str(feature_name).strip()
+    if feature_groups:
+        for grp_name, cols in feature_groups.items():
+            if col in cols:
+                return str(grp_name)
+    low = col.lower()
+    if low.startswith("pca_comp_"):
+        return "pca"
+    if low.startswith("fourier_"):
+        return "fourier"
+    if "_ticker_" in low:
+        return "ticker_ts"
+    if "_era_roll" in low or "_era_diff" in low:
+        return "era_ts"
+    if low.startswith("row_"):
+        return "era_dispersion"
+    if low.endswith("_country_ranknorm"):
+        return "signals_ranknorm"
+    if low.endswith("_factor"):
+        return "signals_factor"
+    parts = [p for p in low.split("_") if p]
+    if len(parts) >= 2 and parts[0] == "feature":
+        token = "".join(ch for ch in parts[1] if not ch.isdigit())
+        return token or parts[1]
+    return parts[0] if parts else "other"
+
+
+def build_feature_importance_share_and_group_summary(
+    importance_df: pd.DataFrame,
+    *,
+    feature_col: str = "feature",
+    importance_col: str = "gain_importance",
+    split_col: Optional[str] = None,
+    feature_groups: Optional[Mapping[str, Sequence[str]]] = None,
+    top_n: int = 20,
+) -> Dict[str, Any]:
+    """Compute % share of total importance per feature, Pareto concentration curve, and group distribution table."""
+    if importance_df is None or importance_df.empty or feature_col not in importance_df.columns or importance_col not in importance_df.columns:
+        return {
+            "n_total_features": 0,
+            "n_nonzero_features": 0,
+            "total_importance": 0.0,
+            "pct_features_for_50pct": float(np.nan),
+            "pct_features_for_80pct": float(np.nan),
+            "lorenz_pct_features": np.empty(0, dtype=np.float64),
+            "lorenz_cum_importance_pct": np.empty(0, dtype=np.float64),
+            "top_share_df": pd.DataFrame(),
+            "group_summary_df": pd.DataFrame(),
+        }
+
+    work = pd.DataFrame({
+        "feature": importance_df[feature_col].astype(str).tolist(),
+        "abs_importance": np.abs(pd.to_numeric(importance_df[importance_col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)),
+    })
+    has_split = bool(split_col and split_col in importance_df.columns)
+    if has_split and split_col is not None:
+        work["split_importance"] = np.abs(
+            pd.to_numeric(importance_df[split_col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+        )
+
+    work = work.sort_values("abs_importance", ascending=False, kind="stable").reset_index(drop=True)
+    n_total = int(len(work))
+    imp_arr = work["abs_importance"].to_numpy(dtype=np.float64)
+    total_imp = float(imp_arr.sum())
+    n_nonzero = int(np.sum(imp_arr > 1e-15))
+
+    if total_imp > 1e-15:
+        share_pct = (imp_arr / total_imp) * 100.0
+    else:
+        share_pct = np.zeros(n_total, dtype=np.float64)
+    cum_pct = np.cumsum(share_pct)
+    feat_pct = (np.arange(1, n_total + 1, dtype=np.float64) / float(max(1, n_total))) * 100.0
+
+    work["importance_share_pct"] = np.round(share_pct, 3)
+    work["cum_importance_pct"] = np.round(cum_pct, 2)
+    work["feature_group"] = [infer_feature_group_name(f, feature_groups=feature_groups) for f in work["feature"]]
+
+    pct_for_50 = float(feat_pct[int(np.searchsorted(cum_pct, 50.0))]) if total_imp > 1e-15 else float(np.nan)
+    pct_for_80 = float(feat_pct[int(np.searchsorted(cum_pct, 80.0))]) if total_imp > 1e-15 else float(np.nan)
+
+    # Downsample concentration curve to at most 101 points (0%..100%) for compact storage
+    curve_x = np.concatenate(([0.0], feat_pct))
+    curve_y = np.concatenate(([0.0], cum_pct))
+    if len(curve_x) > 101:
+        pick_idx = np.unique(np.linspace(0, len(curve_x) - 1, num=101, dtype=np.int64))
+        curve_x = curve_x[pick_idx]
+        curve_y = curve_y[pick_idx]
+
+    total_split = float(work["split_importance"].sum()) if has_split else 0.0
+    grp_rows: List[Dict[str, Any]] = []
+    for grp_name, gdf in work.groupby("feature_group", sort=True):
+        g_cnt = int(len(gdf))
+        g_feat_pct = (float(g_cnt) / float(max(1, n_total))) * 100.0
+        g_imp_sum = float(gdf["abs_importance"].sum())
+        g_imp_pct = (g_imp_sum / total_imp) * 100.0 if total_imp > 1e-15 else 0.0
+        g_lift = (g_imp_pct / g_feat_pct) if g_feat_pct > 1e-12 else 0.0
+        row_entry: Dict[str, Any] = {
+            "feature_group": str(grp_name),
+            "n_features": g_cnt,
+            "feature_share_pct": round(g_feat_pct, 2),
+            "importance_share_pct": round(g_imp_pct, 2),
+            "importance_lift": round(g_lift, 2),
+        }
+        if has_split:
+            g_split_sum = float(gdf["split_importance"].sum())
+            g_split_pct = (g_split_sum / total_split) * 100.0 if total_split > 1e-15 else 0.0
+            row_entry["split_share_pct"] = round(g_split_pct, 2)
+        grp_rows.append(row_entry)
+
+    group_summary_df = (
+        pd.DataFrame(grp_rows)
+        .sort_values(["importance_share_pct", "n_features"], ascending=[False, False], kind="stable")
+        .reset_index(drop=True)
+    )
+    cap = max(1, int(top_n))
+    return {
+        "n_total_features": n_total,
+        "n_nonzero_features": n_nonzero,
+        "total_importance": total_imp,
+        "pct_features_for_50pct": round(pct_for_50, 1) if np.isfinite(pct_for_50) else float(np.nan),
+        "pct_features_for_80pct": round(pct_for_80, 1) if np.isfinite(pct_for_80) else float(np.nan),
+        "lorenz_pct_features": curve_x,
+        "lorenz_cum_importance_pct": curve_y,
+        "top_share_df": work.head(cap).copy(),
+        "group_summary_df": group_summary_df,
+    }
+
+
+def plot_interpretability_share_and_groups(
+    share_summary: Mapping[str, Any],
+    *,
+    model_label: str = "Model",
+    metric_label: str = "Importance",
+    results_dir: Optional[Any] = None,
+    timestamp: str = "",
+    experiment_name: str = "",
+    save_results: bool = False,
+) -> None:
+    """Plot 3D-ii (% of Features Cumulative Importance) and 3D-iii (Feature Group Distribution by Gain/Importance)."""
+    if not share_summary or int(share_summary.get("n_total_features", 0)) == 0:
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        plt = None
+
+    group_df = share_summary.get("group_summary_df")
+    if isinstance(group_df, pd.DataFrame) and not group_df.empty:
+        display_compact_dataframe(
+            group_df.head(15),
+            title=f"3D-iii. {model_label} Feature Group Distribution by {metric_label} (Lift = Importance % / Feature %):",
+        )
+
+    if plt is None:
+        return
+
+    curve_x = np.asarray(share_summary.get("lorenz_pct_features", np.empty(0)), dtype=np.float64)
+    curve_y = np.asarray(share_summary.get("lorenz_cum_importance_pct", np.empty(0)), dtype=np.float64)
+    pct_50 = float(share_summary.get("pct_features_for_50pct", np.nan))
+    pct_80 = float(share_summary.get("pct_features_for_80pct", np.nan))
+    n_tot = int(share_summary.get("n_total_features", 0))
+    n_nz = int(share_summary.get("n_nonzero_features", 0))
+
+    fig, (ax_l, ax_r) = plt.subplots(1, 2, figsize=(16, 5.8))
+
+    # Left: 3D-ii Cumulative % Importance vs % of Features
+    if len(curve_x) >= 2:
+        ax_l.plot(curve_x, curve_y, color="#2563eb", linewidth=2.4, label=f"Cumulative {metric_label} %")
+        ax_l.fill_between(curve_x, 0.0, curve_y, color="#2563eb", alpha=0.12)
+        ax_l.plot([0.0, 100.0], [0.0, 100.0], color="#94a3b8", linestyle="--", linewidth=1.2, label="Uniform (equal share)")
+        if np.isfinite(pct_50):
+            ax_l.axhline(50.0, color="#059669", linestyle=":", linewidth=1.1)
+            ax_l.axvline(pct_50, color="#059669", linestyle=":", linewidth=1.1)
+            ax_l.scatter([pct_50], [50.0], color="#059669", s=45, zorder=5, label=f"50% {metric_label} in top {pct_50:.1f}% features")
+        if np.isfinite(pct_80):
+            ax_l.axhline(80.0, color="#d97706", linestyle=":", linewidth=1.1)
+            ax_l.axvline(pct_80, color="#d97706", linestyle=":", linewidth=1.1)
+            ax_l.scatter([pct_80], [80.0], color="#d97706", s=45, zorder=5, label=f"80% {metric_label} in top {pct_80:.1f}% features")
+    ax_l.set_xlim(0.0, 100.0)
+    ax_l.set_ylim(0.0, 103.0)
+    ax_l.set_xlabel("% of Features (Ranked by Importance)")
+    ax_l.set_ylabel(f"Cumulative % of Total {metric_label}")
+    ax_l.set_title(f"3D-ii. {model_label} Concentration ({n_nz}/{n_tot} Active Features)", fontsize=11, fontweight="bold")
+    ax_l.legend(loc="lower right", frameon=False, fontsize=8.5)
+    _apply_clean_residual_axes_style(ax_l)
+
+    # Right: 3D-iii Feature Group Distribution (% Importance vs % Feature Count)
+    if isinstance(group_df, pd.DataFrame) and not group_df.empty:
+        top_g = group_df.head(12).sort_values("importance_share_pct", ascending=True, kind="stable")
+        y_pos = np.arange(len(top_g), dtype=np.float64)
+        bar_h = 0.36
+        imp_vals = top_g["importance_share_pct"].to_numpy(dtype=np.float64)
+        cnt_vals = top_g["feature_share_pct"].to_numpy(dtype=np.float64)
+        lifts = top_g["importance_lift"].to_numpy(dtype=np.float64)
+        labels = top_g["feature_group"].astype(str).tolist()
+
+        ax_r.barh(y_pos + bar_h / 2.0, imp_vals, height=bar_h, color="#10b981", alpha=0.88, label=f"% of Total {metric_label}")
+        ax_r.barh(y_pos - bar_h / 2.0, cnt_vals, height=bar_h, color="#94a3b8", alpha=0.65, label="% of Features")
+        max_x = max(float(np.max(imp_vals)) if len(imp_vals) else 10.0, float(np.max(cnt_vals)) if len(cnt_vals) else 10.0, 10.0)
+        for yi, iv, lf in zip(y_pos, imp_vals, lifts):
+            ax_r.text(iv + max_x * 0.015, yi + bar_h / 2.0, f"{iv:.1f}% ({lf:.2f}x)", va="center", fontsize=8.2, color="#0f172a")
+        ax_r.set_xlim(0.0, max_x * 1.24)
+        ax_r.set_yticks(y_pos)
+        ax_r.set_yticklabels(labels)
+    ax_r.set_xlabel("Share (%)")
+    ax_r.set_title(f"3D-iii. {model_label} Feature Group Share vs. Feature Count", fontsize=11, fontweight="bold")
+    ax_r.legend(loc="lower right", frameon=False, fontsize=8.5)
+    _apply_clean_residual_axes_style(ax_r)
+
+    fig.tight_layout()
+    if save_results and results_dir is not None:
+        out_dir = Path(results_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        slug = model_label.lower().replace(" ", "_").replace("-", "_")
+        fig.savefig(out_dir / f"{timestamp}_{experiment_name}_{slug}_importance_share_and_groups.png", dpi=140)
+    plt.show()
+    plt.close(fig)
+    del curve_x, curve_y, fig
+    gc.collect()
 
 
 def strip_validation_predictions(results_by_variant: Mapping[str, Dict[str, Any]]) -> int:
@@ -6390,3 +6862,241 @@ def build_afml_diagnostics_df(
             row["fnc_sharpe"] = round(fnc_sr, 4) if np.isfinite(fnc_sr) else float(np.nan)
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def _estimate_continuous_mode(values: np.ndarray) -> float:
+    """Estimate the modal value of a 1D continuous sample via histogram peak bin center."""
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) == 0:
+        return float(np.nan)
+    if len(arr) <= 2 or float(np.max(arr) - np.min(arr)) <= 1e-12:
+        return float(np.median(arr))
+    n_bins = min(20, max(4, int(np.ceil(np.sqrt(len(arr))))))
+    counts, edges = np.histogram(arr, bins=n_bins)
+    peak_idx = int(np.argmax(counts))
+    return float(0.5 * (edges[peak_idx] + edges[peak_idx + 1]))
+
+
+def build_candidate_timing_summary(
+    timing_records_by_model: Mapping[str, pd.DataFrame],
+    *,
+    max_candidate_seconds: Optional[float] = None,
+) -> pd.DataFrame:
+    """Summarize per-candidate CV fit & score timings (mean, median, mode, quartiles, P90/P95, failures, suggested cap)."""
+    rows: List[Dict[str, Any]] = []
+    for model_name, t_df in timing_records_by_model.items():
+        if not isinstance(t_df, pd.DataFrame) or t_df.empty:
+            continue
+        fit_s = (
+            pd.to_numeric(t_df["mean_fit_time"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+            if "mean_fit_time" in t_df.columns
+            else np.zeros(len(t_df), dtype=np.float64)
+        )
+        score_s = (
+            pd.to_numeric(t_df["mean_score_time"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+            if "mean_score_time" in t_df.columns
+            else np.zeros(len(t_df), dtype=np.float64)
+        )
+        if "total_time_s" in t_df.columns:
+            raw_tot = pd.to_numeric(t_df["total_time_s"], errors="coerce").to_numpy(dtype=np.float64)
+            total_s = np.where(np.isfinite(raw_tot), raw_tot, fit_s + score_s)
+        else:
+            total_s = fit_s + score_s
+        valid_tot = total_s[np.isfinite(total_s) & (total_s >= 0.0)]
+        n_cand = int(len(t_df))
+        if "mean_test_score" in t_df.columns:
+            scores = pd.to_numeric(t_df["mean_test_score"], errors="coerce").to_numpy(dtype=np.float64)
+            n_failed = int(np.sum((~np.isfinite(scores)) | (scores <= -0.9999)))
+        else:
+            n_failed = 0
+        fail_pct = (100.0 * float(n_failed) / float(max(1, n_cand)))
+
+        if len(valid_tot) == 0:
+            continue
+        q25 = float(np.percentile(valid_tot, 25))
+        med = float(np.median(valid_tot))
+        q75 = float(np.percentile(valid_tot, 75))
+        p90 = float(np.percentile(valid_tot, 90))
+        p95 = float(np.percentile(valid_tot, 95))
+        iqr = float(q75 - q25)
+        mean_v = float(np.mean(valid_tot))
+        std_v = float(np.std(valid_tot, ddof=1)) if len(valid_tot) >= 2 else 0.0
+        mode_v = _estimate_continuous_mode(valid_tot)
+        suggested_cap = float(max(60.0, np.ceil(max(q75 + 3.0 * iqr, 2.0 * p95))))
+
+        row_dict: Dict[str, Any] = {
+            "model": str(model_name),
+            "n_candidates": n_cand,
+            "n_failed": n_failed,
+            "fail_rate_pct": round(fail_pct, 1),
+            "min_s": round(float(np.min(valid_tot)), 2),
+            "q25_s": round(q25, 2),
+            "median_s": round(med, 2),
+            "mean_s": round(mean_v, 2),
+            "mode_s": round(mode_v, 2),
+            "q75_s": round(q75, 2),
+            "iqr_s": round(iqr, 2),
+            "p90_s": round(p90, 2),
+            "p95_s": round(p95, 2),
+            "max_s": round(float(np.max(valid_tot)), 2),
+            "std_s": round(std_v, 2),
+            "median_fit_s": round(float(np.median(fit_s)), 2),
+            "median_score_s": round(float(np.median(score_s)), 2),
+            "total_search_min": round(float(np.sum(valid_tot)) / 60.0, 2),
+            "suggested_timeout_s": int(suggested_cap),
+        }
+        if max_candidate_seconds is not None and float(max_candidate_seconds) > 0.0:
+            row_dict["configured_timeout_s"] = int(round(float(max_candidate_seconds)))
+        rows.append(row_dict)
+    return pd.DataFrame(rows)
+
+
+def plot_candidate_timing_analysis(
+    cv_analysis_artifacts: Mapping[str, Any],
+    *,
+    max_candidate_seconds: Optional[float] = None,
+    results_dir: Optional[Any] = None,
+    timestamp: str = "",
+    experiment_name: str = "",
+    save_results: bool = False,
+) -> pd.DataFrame:
+    """Display 5B Candidate Scoring & Fit Timing summary table (mean/median/mode/quartiles/P95) and 3-panel compute chart."""
+    timing_records = cv_analysis_artifacts.get("timing_records", {}) if isinstance(cv_analysis_artifacts, Mapping) else {}
+    if not timing_records:
+        # Graceful fallback: build timing records from `top_candidates` if `timing_records` was not populated
+        top_cands = cv_analysis_artifacts.get("top_candidates", {}) if isinstance(cv_analysis_artifacts, Mapping) else {}
+        timing_records = {
+            k: v
+            for k, v in top_cands.items()
+            if isinstance(v, pd.DataFrame) and ("mean_fit_time" in v.columns or "mean_score_time" in v.columns)
+        }
+    summary_df = build_candidate_timing_summary(
+        timing_records,
+        max_candidate_seconds=max_candidate_seconds,
+    )
+    if summary_df.empty:
+        print("5B. Candidate Scoring Timing Analysis: no CV timing columns available.")
+        return summary_df
+
+    display_compact_dataframe(
+        summary_df,
+        title="5B. Candidate Scoring & Fit Timing Summary (seconds; Suggested Timeout = max(60s, Q3 + 3*IQR, 2*P95)):",
+    )
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return summary_df
+
+    for model_name, t_df in timing_records.items():
+        if not isinstance(t_df, pd.DataFrame) or t_df.empty:
+            continue
+        fit_s = (
+            pd.to_numeric(t_df["mean_fit_time"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+            if "mean_fit_time" in t_df.columns
+            else np.zeros(len(t_df), dtype=np.float64)
+        )
+        score_s = (
+            pd.to_numeric(t_df["mean_score_time"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+            if "mean_score_time" in t_df.columns
+            else np.zeros(len(t_df), dtype=np.float64)
+        )
+        if "total_time_s" in t_df.columns:
+            raw_tot = pd.to_numeric(t_df["total_time_s"], errors="coerce").to_numpy(dtype=np.float64)
+            total_s = np.where(np.isfinite(raw_tot), raw_tot, fit_s + score_s)
+        else:
+            total_s = fit_s + score_s
+        if "candidate_id" in t_df.columns:
+            raw_cids = pd.to_numeric(t_df["candidate_id"], errors="coerce").to_numpy(dtype=np.float64)
+            cand_ids = np.where(np.isfinite(raw_cids), raw_cids, np.arange(len(t_df), dtype=np.float64)).astype(np.int64)
+        else:
+            cand_ids = np.arange(len(t_df), dtype=np.int64)
+        order = np.argsort(cand_ids, kind="stable")
+        cand_ids = cand_ids[order]
+        fit_s = fit_s[order]
+        score_s = score_s[order]
+        total_s = total_s[order]
+        scores = (
+            pd.to_numeric(t_df["mean_test_score"], errors="coerce").to_numpy(dtype=np.float64)[order]
+            if "mean_test_score" in t_df.columns
+            else np.full(len(t_df), np.nan, dtype=np.float64)
+        )
+        failed_mask = (~np.isfinite(scores)) | (scores <= -0.9999)
+
+        med_v = float(np.median(total_s))
+        mean_v = float(np.mean(total_s))
+        mode_v = _estimate_continuous_mode(total_s)
+        q75_v = float(np.percentile(total_s, 75))
+        p95_v = float(np.percentile(total_s, 95))
+
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 4.8))
+
+        # 5B-i: Distribution Histogram with Mean, Median, Mode, Q3, P95
+        n_bins = min(20, max(4, int(np.ceil(np.sqrt(len(total_s))))))
+        ax1.hist(total_s, bins=n_bins, color="#3b82f6", alpha=0.68, edgecolor="#ffffff")
+        ax1.axvline(med_v, color="#059669", linestyle="-", linewidth=2.0, label=f"Median: {med_v:.1f}s")
+        ax1.axvline(mean_v, color="#1d4ed8", linestyle="--", linewidth=1.8, label=f"Mean: {mean_v:.1f}s")
+        if np.isfinite(mode_v):
+            ax1.axvline(mode_v, color="#7c3aed", linestyle=":", linewidth=1.8, label=f"Mode: {mode_v:.1f}s")
+        ax1.axvline(q75_v, color="#d97706", linestyle="-.", linewidth=1.8, label=f"Q3 (75%): {q75_v:.1f}s")
+        ax1.axvline(p95_v, color="#dc2626", linestyle="--", linewidth=1.5, label=f"P95: {p95_v:.1f}s")
+        if (
+            max_candidate_seconds is not None
+            and float(max_candidate_seconds) > 0.0
+            and float(max_candidate_seconds) <= max(float(np.max(total_s)) * 1.5, 1.0)
+        ):
+            ax1.axvline(float(max_candidate_seconds), color="#991b1b", linestyle="-", linewidth=2.0, label=f"Cap: {float(max_candidate_seconds):.0f}s")
+        ax1.set_xlabel("Candidate Total Time (Fit + Score, s)")
+        ax1.set_ylabel("Candidates")
+        ax1.set_title(f"5B-i. {model_name} Time Distribution", fontsize=10.5, fontweight="bold")
+        ax1.legend(loc="upper right", frameon=False, fontsize=8.0)
+        _apply_clean_residual_axes_style(ax1)
+
+        # 5B-ii: Per-Candidate Fit vs Score Timeline
+        x_pos = np.arange(len(cand_ids), dtype=np.float64)
+        ax2.bar(x_pos, fit_s, color="#2563eb", alpha=0.82, label="Fit Time (s)")
+        ax2.bar(x_pos, score_s, bottom=fit_s, color="#10b981", alpha=0.82, label="Score Time (s)")
+        if np.any(failed_mask):
+            ax2.scatter(
+                x_pos[failed_mask],
+                total_s[failed_mask],
+                color="#dc2626",
+                marker="x",
+                s=55,
+                zorder=5,
+                label="Failed / Timed-out",
+            )
+        ax2.axhline(q75_v, color="#d97706", linestyle="-.", linewidth=1.3, label=f"Q3 ({q75_v:.1f}s)")
+        ax2.set_xlabel("Candidate Trial Order")
+        ax2.set_ylabel("Elapsed Seconds (s)")
+        ax2.set_title(f"5B-ii. {model_name} Fit vs. Score Timeline", fontsize=10.5, fontweight="bold")
+        ax2.legend(loc="upper right", frameon=False, fontsize=8.0)
+        _apply_clean_residual_axes_style(ax2)
+
+        # 5B-iii: Compute Time vs CV Score
+        ok_mask = (~failed_mask) & np.isfinite(scores)
+        if np.any(ok_mask):
+            ax3.scatter(total_s[ok_mask], scores[ok_mask], color="#059669", alpha=0.8, s=42, label="Valid Candidates")
+        if np.any(failed_mask):
+            fail_y = np.where(np.isfinite(scores[failed_mask]), scores[failed_mask], -1.0)
+            ax3.scatter(total_s[failed_mask], fail_y, color="#dc2626", marker="x", s=55, label="Failed / Penalized")
+        ax3.axvline(q75_v, color="#d97706", linestyle="-.", linewidth=1.3, label=f"Q3 ({q75_v:.1f}s)")
+        ax3.set_xlabel("Candidate Total Time (s)")
+        ax3.set_ylabel("CV Mean Test Score")
+        ax3.set_title(f"5B-iii. {model_name} Compute vs. CV Score", fontsize=10.5, fontweight="bold")
+        ax3.legend(loc="best", frameon=False, fontsize=8.0)
+        _apply_clean_residual_axes_style(ax3)
+
+        fig.tight_layout()
+        if save_results and results_dir is not None:
+            out_dir = Path(results_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            slug = str(model_name).lower().replace(" ", "_").replace("-", "_").replace("(", "").replace(")", "")
+            fig.savefig(out_dir / f"{timestamp}_{experiment_name}_{slug}_candidate_timing_analysis.png", dpi=140)
+        plt.show()
+        plt.close(fig)
+        del fit_s, score_s, total_s, cand_ids, scores, failed_mask, fig
+        gc.collect()
+
+    return summary_df

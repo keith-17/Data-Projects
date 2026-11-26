@@ -716,9 +716,8 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
                     "over_predict_pct",
                 },
             )
-            self.assertTrue((Path(f"{prefix}_residuals_vs_actual.png")).is_file())
-            self.assertTrue((Path(f"{prefix}_actual_vs_predicted_by_era.png")).is_file())
-            self.assertTrue((Path(f"{prefix}_pct_error_vs_actual.png")).is_file())
+            self.assertTrue((Path(f"{prefix}_residuals_by_target_bin.png")).is_file())
+            self.assertTrue((Path(f"{prefix}_calibration_and_era_mae.png")).is_file())
 
             # Continuous targets with default era_window=None (all validation eras)
             y_cont = rng.normal(0.5, 0.2, size=100)
@@ -736,20 +735,21 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
             )
             self.assertEqual(len(cont_df), 2)
             self.assertEqual(int(cont_df.loc[0, "n_valid"]), 100)
-            self.assertTrue((Path(f"{prefix_cont}_residuals_vs_actual.png")).is_file())
-            self.assertTrue((Path(f"{prefix_cont}_actual_vs_predicted_by_era.png")).is_file())
-            self.assertTrue((Path(f"{prefix_cont}_pct_error_vs_actual.png")).is_file())
+            self.assertTrue((Path(f"{prefix_cont}_residuals_by_target_bin.png")).is_file())
+            self.assertTrue((Path(f"{prefix_cont}_calibration_and_era_mae.png")).is_file())
 
-            # All-zero targets edge case must still render all 3 figures without zero-division error
-            prefix_zero = Path(tmp) / "residual_diag_zeros"
-            zero_df = utils.plot_residual_diagnostics(
-                np.zeros(100, dtype=np.float64),
-                {"ZeroModel": preds_a},
+            # Out-of-range era_zscore predictions must be auto-aligned to [0, 1] without exploding residuals
+            z_preds = rng.normal(0.0, 1.5, size=100)
+            prefix_z = Path(tmp) / "residual_diag_zscore"
+            z_df = utils.plot_residual_diagnostics(
+                y_true,
+                {"ZScoreModel": z_preds},
                 eras,
-                save_prefix=prefix_zero,
+                save_prefix=prefix_z,
             )
-            self.assertEqual(len(zero_df), 1)
-            self.assertTrue((Path(f"{prefix_zero}_pct_error_vs_actual.png")).is_file())
+            self.assertEqual(len(z_df), 1)
+            self.assertLess(float(z_df.loc[0, "mae"]), 1.0)
+            self.assertTrue((Path(f"{prefix_z}_residuals_by_target_bin.png")).is_file())
 
         with self.assertRaises(ValueError):
             utils.plot_residual_diagnostics(y_true, {"Bad": preds_a[:-1]}, eras)
@@ -909,10 +909,13 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
                 "variant",
                 "end_capital",
                 "total_return_pct",
+                "live_round_return_pct",
+                "live_round_profit_gbp",
                 "money_drawdown_pct",
                 "max_drawdown_gbp",
                 "worst_round_gbp",
                 "tuw_max_eras",
+                "live_rounds_span",
             ],
         )
         self.assertEqual(
@@ -923,11 +926,33 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
                 "validation_corr",
                 "corr_gap",
                 "validation_sharpe",
+                "live_round_12e_corr",
+                "live_round_12e_pos_pct",
                 "validation_psr",
                 "validation_dsr",
+                "science_score_pct",
                 "sanity_status",
             ],
         )
+        # Winner: CORR=0.0231/0.04=57.75%, Sharpe=1.18/2.5=47.2% -> 52.5%
+        self.assertAlmostEqual(float(science_df.loc[0, "science_score_pct"]), 52.5, places=1)
+        self.assertAlmostEqual(float(science_df.loc[0, "live_round_12e_corr"]), round(0.0231 * 12, 4), places=4)
+        self.assertEqual(utils.compute_science_score_pct(0.040, 2.50), 100.0)
+        self.assertEqual(utils.compute_science_score_pct(0.080, 5.00), 100.0)
+        self.assertEqual(utils.compute_science_score_pct(-0.01, -0.50), 0.0)
+        self.assertEqual(utils.compute_science_score_pct(0.020, 1.25), 50.0)
+
+        # Verify rolling 12-era live round metrics when validation_era_corrs is present
+        comp_with_eras = comp_df.copy()
+        comp_with_eras["validation_era_corrs"] = [
+            pd.Series([0.01] * 24, index=np.arange(1, 25)),
+            pd.Series([0.02] * 24, index=np.arange(1, 25)),
+        ]
+        m_lr, s_lr = utils.build_executive_scorecard_tables(comp_with_eras, best_variant_name="Model [Tuned]")
+        self.assertEqual(m_lr.loc[0, "live_rounds_span"], "2.0 rds (24e)")
+        self.assertAlmostEqual(float(m_lr.loc[0, "live_round_profit_gbp"]), round(285.40 / 2.0, 2), places=2)
+        self.assertAlmostEqual(float(s_lr.loc[0, "live_round_12e_corr"]), 0.24, places=4)
+        self.assertAlmostEqual(float(s_lr.loc[0, "live_round_12e_pos_pct"]), 100.0, places=1)
         self.assertEqual(money_df.loc[0, "variant"], "[WINNER] Model [Tuned]")
         self.assertIn("1.00 yr", str(money_df.loc[0, "tuw_max_eras"]))
         # Original DataFrame must remain unmutated
@@ -1028,6 +1053,126 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
                 best_variant_name="Model [Tuned]",
             )
             self.assertEqual(len(single_df), 1)
+
+    def test_feature_importance_share_and_group_summary_and_plot(self):
+        """3D-ii (% features concentration) and 3D-iii (feature group distribution by gain/importance)."""
+        self.assertEqual(utils.infer_feature_group_name("pca_comp_001"), "pca")
+        self.assertEqual(utils.infer_feature_group_name("fourier_sin_1"), "fourier")
+        self.assertEqual(utils.infer_feature_group_name("feature_x_ticker_lag1"), "ticker_ts")
+        self.assertEqual(utils.infer_feature_group_name("feature_x_era_roll5"), "era_ts")
+        self.assertEqual(utils.infer_feature_group_name("row_std"), "era_dispersion")
+        self.assertEqual(utils.infer_feature_group_name("feature_intelligence12"), "intelligence")
+        self.assertEqual(
+            utils.infer_feature_group_name("custom_col", feature_groups={"custom_grp": ["custom_col"]}),
+            "custom_grp",
+        )
+
+        imp_df = pd.DataFrame({
+            "feature": [
+                "feature_intelligence1",
+                "feature_intelligence2",
+                "feature_dexterity1",
+                "feature_dexterity2",
+                "pca_comp_0",
+                "row_mean",
+                "feature_wisdom1",
+                "feature_wisdom2",
+                "feature_wisdom3",
+                "feature_wisdom4",
+            ],
+            "gain_importance": [40.0, 20.0, 15.0, 10.0, 10.0, 5.0, 0.0, 0.0, 0.0, 0.0],
+            "split_importance": [30.0, 20.0, 15.0, 15.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0],
+        })
+        summary = utils.build_feature_importance_share_and_group_summary(
+            imp_df,
+            feature_col="feature",
+            importance_col="gain_importance",
+            split_col="split_importance",
+            top_n=5,
+        )
+        self.assertEqual(summary["n_total_features"], 10)
+        self.assertEqual(summary["n_nonzero_features"], 6)
+        self.assertAlmostEqual(summary["total_importance"], 100.0, places=6)
+        # Top 2 features (20%) hold 60% >= 50%; top 4 features (40%) hold 85% >= 80%
+        self.assertAlmostEqual(summary["pct_features_for_50pct"], 20.0, places=1)
+        self.assertAlmostEqual(summary["pct_features_for_80pct"], 40.0, places=1)
+
+        grp_df = summary["group_summary_df"]
+        self.assertFalse(grp_df.empty)
+        self.assertIn("split_share_pct", grp_df.columns)
+        self.assertAlmostEqual(float(grp_df["importance_share_pct"].sum()), 100.0, places=1)
+        self.assertAlmostEqual(float(grp_df["feature_share_pct"].sum()), 100.0, places=1)
+        self.assertEqual(grp_df.loc[0, "feature_group"], "intelligence")
+        self.assertAlmostEqual(float(grp_df.loc[0, "importance_share_pct"]), 60.0, places=1)
+        self.assertAlmostEqual(float(grp_df.loc[0, "importance_lift"]), 3.0, places=2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            utils.plot_interpretability_share_and_groups(
+                summary,
+                model_label="LightGBM",
+                metric_label="Gain",
+                results_dir=tmp_dir,
+                timestamp="20261126",
+                experiment_name="unit",
+                save_results=True,
+            )
+            out_png = tmp_dir / "20261126_unit_lightgbm_importance_share_and_groups.png"
+            self.assertTrue(out_png.is_file())
+
+    def test_time_guard_and_candidate_timing_analysis(self):
+        """Time fail-safe toggle + 5B candidate scoring/fit timing summary & 3-panel plot."""
+        import time
+
+        # Disabled guard must never raise even with huge elapsed time
+        utils.configure_time_guard(enabled=False, max_candidate_seconds=0.001)
+        self.assertTrue(utils.check_time_budget(time.perf_counter() - 10.0, context="disabled_test"))
+
+        # Enabled guard must raise TimeoutError when elapsed exceeds limit
+        utils.configure_time_guard(enabled=True, max_candidate_seconds=0.05)
+        with self.assertRaises(TimeoutError):
+            utils.check_time_budget(time.perf_counter() - 1.0, context="slow_candidate_test")
+
+        # Restore default 1-hour guard via build_experiment_setup
+        cfg = utils.build_experiment_setup(
+            target_col="target",
+            feature_set="small",
+            model_tag="lgbm",
+            time_guard_enabled=True,
+            max_candidate_seconds=3600.0,
+        )
+        self.assertTrue(cfg["time_guard_enabled"])
+        self.assertEqual(cfg["max_candidate_seconds"], 3600.0)
+
+        timing_df = pd.DataFrame({
+            "candidate_id": [0, 1, 2, 3, 4, 5, 6, 7],
+            "rank_test_score": [1, 2, 3, 4, 5, 6, 7, 8],
+            "mean_fit_time": [10.0, 11.0, 10.5, 12.0, 15.0, 20.0, 45.0, 60.0],
+            "mean_score_time": [2.0, 2.0, 2.5, 3.0, 3.0, 4.0, 5.0, 0.0],
+            "total_time_s": [12.0, 13.0, 13.0, 15.0, 18.0, 24.0, 50.0, 60.0],
+            "mean_test_score": [0.025, 0.021, 0.019, 0.015, 0.012, 0.010, 0.008, -1.0],
+        })
+        artifacts = {"timing_records": {"LightGBM Regressor": timing_df}}
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            summary_df = utils.plot_candidate_timing_analysis(
+                artifacts,
+                max_candidate_seconds=3600.0,
+                results_dir=tmp_dir,
+                timestamp="20261126",
+                experiment_name="unit",
+                save_results=True,
+            )
+            self.assertEqual(len(summary_df), 1)
+            row = summary_df.loc[0]
+            self.assertEqual(int(row["n_candidates"]), 8)
+            self.assertEqual(int(row["n_failed"]), 1)
+            self.assertAlmostEqual(float(row["median_s"]), 16.5, places=1)
+            self.assertGreater(float(row["q75_s"]), float(row["median_s"]))
+            self.assertGreaterEqual(int(row["suggested_timeout_s"]), 60)
+            self.assertEqual(int(row["configured_timeout_s"]), 3600)
+            out_png = tmp_dir / "20261126_unit_lightgbm_regressor_candidate_timing_analysis.png"
+            self.assertTrue(out_png.is_file())
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -20,7 +21,7 @@ import pandas as pd
 from lightgbm import LGBMRegressor
 
 from baseline_utils import BaseNumeraiEstimator
-from utils import NumeraiExtractions, _decode_structured, check_memory_budget
+from utils import NumeraiExtractions, _decode_structured, check_memory_budget, check_time_budget
 
 _LGB_DATASET_CACHE: "OrderedDict[str, lgb.Dataset]" = OrderedDict()
 _LGB_DATASET_CACHE_MAX = 2
@@ -89,6 +90,23 @@ class _BoosterModelAdapter:
 
     def predict(self, X: Any) -> np.ndarray:
         return np.asarray(self.booster_.predict(X), dtype=np.float64)
+
+
+class _LightGBMTimeGuardCallback:
+    """Top-level LightGBM per-iteration callback that enforces `check_time_budget` mid-boosting."""
+
+    order = 99
+    before_iteration = False
+
+    def __init__(self, start_time: float, context: str = "LightGBMNumeraiEstimator.fit", check_every: int = 10):
+        self.start_time = float(start_time)
+        self.context = str(context)
+        self.check_every = max(1, int(check_every))
+
+    def __call__(self, env: Any) -> None:
+        iteration = int(getattr(env, "iteration", 0))
+        if (iteration + 1) % self.check_every == 0:
+            check_time_budget(self.start_time, context=self.context)
 
 
 def _lgb_dataset_fingerprint(
@@ -331,9 +349,11 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
         sample_weight: Optional[Any] = None,
         eras: Optional[Any] = None,
     ) -> "LightGBMNumeraiEstimator":
+        fit_start_t = time.perf_counter()
         features_df, _, target_values, _, sample_weights, era_values = self._prepare_fit_inputs(
             X, y, sample_weight=sample_weight, eras=eras, return_matrix=False
         )
+        check_time_budget(fit_start_t, context="LightGBMNumeraiEstimator.fit")
         selected_cols = list(self.selected_feature_names_)
         selected_df = features_df if len(selected_cols) == len(features_df.columns) and list(features_df.columns) == selected_cols else features_df[selected_cols]
         check_memory_budget(
@@ -342,6 +362,7 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
         )
 
         model = self._build_lgbm_model()
+        time_cb = _LightGBMTimeGuardCallback(fit_start_t, context="LightGBMNumeraiEstimator.fit", check_every=10)
         if bool(self.reuse_binned_dataset) and not _LGB_DATASET_CACHE_SUSPENDED:
             raw_params = model.get_params()
             num_boost_round = int(raw_params.pop("n_estimators", 200))
@@ -358,6 +379,7 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
                 "min_data_in_bin": int(raw_params.get("min_data_in_bin", 3)),
                 "subsample_for_bin": int(raw_params.get("subsample_for_bin", 200000)),
                 "feature_pre_filter": bool(raw_params.get("feature_pre_filter", True)),
+                "linear_tree": bool(raw_params.get("linear_tree", False)),
             }
             ds_key = _lgb_dataset_fingerprint(selected_df, target_values, sample_weights, bin_params)
             if ds_key in _LGB_DATASET_CACHE:
@@ -378,10 +400,11 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
                 params=raw_params,
                 train_set=train_ds,
                 num_boost_round=num_boost_round,
+                callbacks=[time_cb],
             )
             self.model_ = _BoosterModelAdapter(booster, importance_type=importance_type)
         else:
-            fit_kwargs: Dict[str, Any] = {}
+            fit_kwargs: Dict[str, Any] = {"callbacks": [time_cb]}
             if sample_weights is not None:
                 fit_kwargs["sample_weight"] = sample_weights
 
@@ -432,19 +455,32 @@ def extract_lgbm_interpretability(
     *,
     model_name: str = "LightGBM Regressor",
     top_n: int = 20,
+    feature_groups: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Extract compact LightGBM importance summary so heavy fitted boosters can be deleted immediately."""
+    """Extract compact LightGBM importance, feature-percentage share, and group distribution summaries."""
+    from utils import build_feature_importance_share_and_group_summary
+
     if model_name not in fitted_models:
         return {}
     fitted_lgbm = fitted_models[model_name].named_steps["estimator"]
     cap = max(1, int(top_n))
+    full_imp_df = fitted_lgbm.feature_importance_df_
+    share_summary = build_feature_importance_share_and_group_summary(
+        full_imp_df,
+        feature_col="feature",
+        importance_col="gain_importance",
+        split_col="split_importance",
+        feature_groups=feature_groups,
+        top_n=cap,
+    )
     return {
         "model_name": str(model_name),
         "num_trees": int(fitted_lgbm.model_.booster_.num_trees()),
         "selected_features": int(len(fitted_lgbm.selected_feature_names_)),
         "boosting_type": fitted_lgbm.boosting_type,
         "objective": fitted_lgbm.objective,
-        "top_importance_df": fitted_lgbm.feature_importance_df_.head(cap).copy(),
+        "top_importance_df": full_imp_df.head(cap).copy(),
+        "share_summary": share_summary,
     }
 
 
@@ -456,8 +492,8 @@ def display_lgbm_interpretability(
     experiment_name: str = "",
     save_results: bool = False,
 ) -> None:
-    """Display and plot compact LightGBM feature-importance artifacts extracted prior to model cleanup."""
-    from utils import display_compact_dataframe
+    """Display and plot compact LightGBM feature-importance, % share, and group distribution artifacts."""
+    from utils import display_compact_dataframe, plot_interpretability_share_and_groups
 
     if not interpretability:
         return
@@ -468,18 +504,18 @@ def display_lgbm_interpretability(
 
     top_imp_df = interpretability["top_importance_df"]
     print(
-        f"LightGBM Fitted Summary | trees={interpretability['num_trees']} | "
+        f"3D. LightGBM Fitted Summary | trees={interpretability['num_trees']} | "
         f"selected_features={interpretability['selected_features']} | "
         f"boosting_type={interpretability['boosting_type']} | objective={interpretability['objective']}"
     )
-    display_compact_dataframe(top_imp_df)
+    display_compact_dataframe(top_imp_df, title="3D-i. Top 20 LightGBM Features by Gain Importance:")
 
     if plt is not None and len(top_imp_df):
         plot_imp_df = top_imp_df.sort_values("gain_importance", ascending=True)
         fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
         ax_imp.barh(plot_imp_df["feature"], plot_imp_df["gain_importance"], color="#2563eb", alpha=0.85)
         ax_imp.set_xlabel("Gain Importance")
-        ax_imp.set_title("Top 20 LightGBM Features by Gain Importance")
+        ax_imp.set_title("3D-i. Top 20 LightGBM Features by Gain Importance")
         fig_imp.tight_layout()
         if save_results and results_dir is not None:
             out_dir = Path(results_dir)
@@ -487,3 +523,17 @@ def display_lgbm_interpretability(
             fig_imp.savefig(out_dir / f"{timestamp}_{experiment_name}_feature_importance.png", dpi=140)
         plt.show()
         plt.close(fig_imp)
+        del fig_imp
+        gc.collect()
+
+    share_summary = interpretability.get("share_summary")
+    if share_summary:
+        plot_interpretability_share_and_groups(
+            share_summary,
+            model_label="LightGBM",
+            metric_label="Gain Importance",
+            results_dir=results_dir,
+            timestamp=timestamp,
+            experiment_name=experiment_name,
+            save_results=save_results,
+        )

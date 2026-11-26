@@ -27,6 +27,8 @@ Implements:
 
 from __future__ import annotations
 
+import gc
+
 from itertools import combinations
 from math import comb
 from pathlib import Path
@@ -2310,6 +2312,9 @@ def plot_afml_backtest_story(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_path, dpi=140)
     plt.show()
+    plt.close(fig)
+    del fig
+    gc.collect()
 
     return {
         "title": str(title),

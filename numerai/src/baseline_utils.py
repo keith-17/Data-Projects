@@ -512,6 +512,10 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
         self.agg_mode = agg_mode
 
     def _compute_raw_snapped_pred(self, selected_bins: np.ndarray) -> np.ndarray:
+        if hasattr(self, "weighted_bin_table_"):
+            w_tbl = self.weighted_bin_table_
+            col_idx = np.arange(w_tbl.shape[0], dtype=np.intp)
+            return np.asarray(w_tbl[col_idx, selected_bins].sum(axis=1), dtype=np.float64)
         snapped_targets = self.bin_table_[np.arange(len(self.selected_indices_)), selected_bins]
         if self.agg_mode == "corr_weighted":
             abs_corrs = np.abs(self.selected_corrs_)
@@ -527,10 +531,71 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
     def _snap_features_to_bins(arr: np.ndarray, n_bins: int, rescale_from_5: bool = False) -> np.ndarray:
         """Snap Numerai features into integer bins `0..(n_bins - 1)`, symmetrically rescaling `[0, 4]` when `n_bins != 5`."""
         middle_bin = float(n_bins // 2)
-        clean = np.nan_to_num(arr.astype(np.float64, copy=False), nan=2.0 if rescale_from_5 else middle_bin, posinf=4.0 if rescale_from_5 else float(n_bins - 1), neginf=0.0)
+        clean = np.nan_to_num(
+            arr.astype(np.float32, copy=False),
+            nan=2.0 if rescale_from_5 else middle_bin,
+            posinf=4.0 if rescale_from_5 else float(n_bins - 1),
+            neginf=0.0,
+        )
         if rescale_from_5 and n_bins != 5:
-            clean = clean * ((float(n_bins) - 1.0) / 4.0)
-        return np.clip(np.rint(clean), 0, n_bins - 1).astype(np.int64)
+            clean = clean * np.float32((float(n_bins) - 1.0) / 4.0)
+        return np.clip(np.rint(clean), 0.0, float(n_bins - 1)).astype(np.uint8)
+
+    @staticmethod
+    def _accumulate_bins_chunk_numpy(
+        chunk_bins: np.ndarray,
+        w_chunk: np.ndarray,
+        wy_chunk: np.ndarray,
+        n_bins: int,
+        w_sum: np.ndarray,
+        wy_sum: np.ndarray,
+    ) -> None:
+        """Accumulate weighted bin counts & target sums via 5-GEMM multi-threaded BLAS (`mask_b.T @ [w, w*y]`)."""
+        wy_2 = np.column_stack((w_chunk, wy_chunk)).astype(np.float32, copy=False)
+        for bin_idx in range(n_bins):
+            mask_b = (chunk_bins == bin_idx).astype(np.float32)
+            acc = mask_b.T @ wy_2
+            w_sum[:, bin_idx] += acc[:, 0]
+            wy_sum[:, bin_idx] += acc[:, 1]
+            del mask_b, acc
+        del wy_2
+
+    @staticmethod
+    def _accumulate_bins_chunk_tf(
+        tf_mod: Any,
+        chunk_bins: np.ndarray,
+        w_chunk: np.ndarray,
+        wy_chunk: np.ndarray,
+        n_bins: int,
+        w_sum: np.ndarray,
+        wy_sum: np.ndarray,
+    ) -> None:
+        """Accumulate weighted bin counts & target sums via TensorFlow 5-GEMM oneDNN/cuBLAS kernels."""
+        bins_t = tf_mod.constant(chunk_bins, dtype=tf_mod.int32)
+        wy_t = tf_mod.constant(np.column_stack((w_chunk, wy_chunk)), dtype=tf_mod.float32)
+        for bin_idx in range(n_bins):
+            mask_b = tf_mod.cast(tf_mod.equal(bins_t, bin_idx), tf_mod.float32)
+            acc = tf_mod.linalg.matmul(mask_b, wy_t, transpose_a=True).numpy()
+            w_sum[:, bin_idx] += acc[:, 0]
+            wy_sum[:, bin_idx] += acc[:, 1]
+            del mask_b, acc
+        del bins_t, wy_t
+
+    def _build_weighted_bin_table(self) -> np.ndarray:
+        """Pre-scale `bin_table_` by feature aggregation weights once in `fit()` for fast `predict()`."""
+        n_selected = self.bin_table_.shape[0]
+        if self.agg_mode == "corr_weighted":
+            abs_corrs = np.abs(self.selected_corrs_)
+            corr_weight_sum = float(abs_corrs.sum())
+            if corr_weight_sum > 1e-12:
+                feat_w = (abs_corrs / corr_weight_sum).astype(np.float64)
+            else:
+                feat_w = np.full(n_selected, 1.0 / float(max(1, n_selected)), dtype=np.float64)
+        elif self.agg_mode in (None, "none", "None", "mean"):
+            feat_w = np.full(n_selected, 1.0 / float(max(1, n_selected)), dtype=np.float64)
+        else:
+            raise ValueError(f"Unsupported agg_mode '{self.agg_mode}'; use 'mean' or 'corr_weighted'.")
+        return (self.bin_table_ * feat_w[:, None]).astype(np.float64, copy=False)
 
     def fit(
         self,
@@ -539,57 +604,97 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
         sample_weight: Optional[Any] = None,
         eras: Optional[Any] = None,
     ) -> "BinSnappingEstimator":
-        _, feature_matrix, target_values, _, sample_weights, era_values = self._prepare_fit_inputs(
-            X, y, sample_weight=sample_weight, eras=eras
+        features_df, _, target_values, _, sample_weights, era_values = self._prepare_fit_inputs(
+            X, y, sample_weight=sample_weight, eras=eras, return_matrix=False
         )
         n_bins = max(2, int(self.n_bins if self.n_bins is not None else 5))
-        selected_raw = feature_matrix[:, self.selected_indices_]
-        finite_sel = selected_raw[np.isfinite(selected_raw)]
-        # Detect standard Numerai [0, 4] quantized input so n_bins != 5 rescales symmetrically instead of clipping bins 2,3,4
-        self.rescale_from_5_ = bool(
-            n_bins != 5
-            and len(finite_sel) > 0
-            and float(np.min(finite_sel)) >= -0.01
-            and float(np.max(finite_sel)) <= 4.01
-        )
+        selected_cols = list(self.selected_feature_names_)
+        sub_df = features_df[selected_cols]
+        n_rows = len(sub_df)
+        n_selected = len(selected_cols)
+
+        # Detect standard Numerai [0, 4] quantized input from a fast head/stride sample without full-matrix copy
+        self.rescale_from_5_ = False
+        if n_bins != 5 and n_rows > 0 and n_selected > 0:
+            probe_df = sub_df[: min(n_rows, 4096)]
+            probe_arr = probe_df.to_numpy(dtype=np.float32, copy=False)
+            finite_probe = probe_arr[np.isfinite(probe_arr)]
+            self.rescale_from_5_ = bool(
+                len(finite_probe) > 0
+                and float(np.min(finite_probe)) >= -0.01
+                and float(np.max(finite_probe)) <= 4.01
+            )
+            del probe_arr, finite_probe
 
         if sample_weights is not None and float(sample_weights.sum()) > 0.0:
-            self.global_mean_ = float(np.average(target_values, weights=sample_weights))
+            w_arr = np.asarray(sample_weights, dtype=np.float64).ravel()
+            self.global_mean_ = float(np.average(target_values, weights=w_arr))
         else:
-            self.global_mean_ = float(np.mean(target_values))
+            w_arr = np.ones(n_rows, dtype=np.float64)
+            self.global_mean_ = float(np.mean(target_values)) if n_rows > 0 else 0.5
+        wy_arr = w_arr * np.asarray(target_values, dtype=np.float64).ravel()
 
-        n_selected = len(self.selected_indices_)
-        bin_table = np.full((n_selected, n_bins), self.global_mean_, dtype=np.float64)
-        selected_bins = self._snap_features_to_bins(selected_raw, n_bins=n_bins, rescale_from_5=self.rescale_from_5_)
+        # Use TensorFlow oneDNN/cuBLAS 5-GEMM when problem size justifies TF dispatch (>=500k elements); else NumPy BLAS 5-GEMM
+        tf_mod = None
+        if n_rows * n_selected >= 500_000:
+            try:
+                import tensorflow as tf_mod  # type: ignore[no-redef]
+            except ImportError:
+                tf_mod = None
+
+        w_sum = np.zeros((n_selected, n_bins), dtype=np.float64)
+        wy_sum = np.zeros((n_selected, n_bins), dtype=np.float64)
+        batch_rows = 32_768
+        for start_r in range(0, n_rows, batch_rows):
+            end_r = min(n_rows, start_r + batch_rows)
+            chunk_vals = sub_df[start_r:end_r].to_numpy(dtype=np.float32, copy=False)
+            chunk_bins = self._snap_features_to_bins(
+                chunk_vals,
+                n_bins=n_bins,
+                rescale_from_5=self.rescale_from_5_,
+            )
+            if tf_mod is not None:
+                self._accumulate_bins_chunk_tf(
+                    tf_mod, chunk_bins, w_arr[start_r:end_r], wy_arr[start_r:end_r], n_bins, w_sum, wy_sum
+                )
+            else:
+                self._accumulate_bins_chunk_numpy(
+                    chunk_bins, w_arr[start_r:end_r], wy_arr[start_r:end_r], n_bins, w_sum, wy_sum
+                )
+            del chunk_vals, chunk_bins
+
         smoothing_weight = max(0.0, float(self.smoothing or 0.0))
-
-        for feature_pos in range(n_selected):
-            column_bins = selected_bins[:, feature_pos]
-            for bin_index in range(n_bins):
-                in_bin_mask = column_bins == bin_index
-                if not np.any(in_bin_mask):
-                    continue
-                if sample_weights is not None:
-                    weight_sum = float(sample_weights[in_bin_mask].sum())
-                    target_sum = float(np.dot(sample_weights[in_bin_mask], target_values[in_bin_mask]))
-                else:
-                    weight_sum = float(np.sum(in_bin_mask))
-                    target_sum = float(target_values[in_bin_mask].sum())
-                if weight_sum > 0.0:
-                    bin_table[feature_pos, bin_index] = (
-                        target_sum + smoothing_weight * self.global_mean_
-                    ) / (weight_sum + smoothing_weight)
+        bin_table = np.where(
+            w_sum > 0.0,
+            (wy_sum + smoothing_weight * self.global_mean_) / np.where(w_sum > 0.0, w_sum + smoothing_weight, 1.0),
+            self.global_mean_,
+        )
 
         self.bin_table_ = bin_table
+        self.weighted_bin_table_ = self._build_weighted_bin_table()
         self.lookup_table_: Dict[str, Dict[int, float]] = {
             self.selected_feature_names_[feature_pos]: {
                 bin_index: float(bin_table[feature_pos, bin_index]) for bin_index in range(n_bins)
             }
             for feature_pos in range(n_selected)
         }
-        raw_train_pred = self._compute_raw_snapped_pred(selected_bins)
-        self._fit_bias_correction(target_values, raw_train_pred, era_values)
-        del selected_bins, feature_matrix
+        if self.bias_correction not in (None, False, "None", "none", ""):
+            raw_train_pred = np.empty(n_rows, dtype=np.float64)
+            for start_r in range(0, n_rows, batch_rows):
+                end_r = min(n_rows, start_r + batch_rows)
+                chunk_vals = sub_df[start_r:end_r].to_numpy(dtype=np.float32, copy=False)
+                chunk_bins = self._snap_features_to_bins(
+                    chunk_vals, n_bins=n_bins, rescale_from_5=self.rescale_from_5_
+                )
+                raw_train_pred[start_r:end_r] = self._compute_raw_snapped_pred(chunk_bins)
+                del chunk_vals, chunk_bins
+            self._fit_bias_correction(target_values, raw_train_pred, era_values)
+            del raw_train_pred
+        else:
+            self.learned_bias_offset_ = 0.0
+
+        del w_arr, wy_arr, w_sum, wy_sum, sub_df, features_df
+        gc.collect()
         return self
 
     def predict(self, X: Any) -> np.ndarray:
@@ -1624,8 +1729,11 @@ def extract_baseline_interpretability(
     fitted_models: Mapping[str, Any],
     *,
     top_n: int = 20,
+    feature_groups: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Extract compact interpretability tables and scalars so heavy fitted baseline models can be deleted."""
+    """Extract compact interpretability tables, % share concentration, and group distribution summaries."""
+    from utils import build_feature_importance_share_and_group_summary
+
     artifacts: Dict[str, Any] = {}
     cap = max(1, int(top_n))
 
@@ -1635,9 +1743,20 @@ def extract_baseline_interpretability(
         lookup_df = pd.DataFrame(est_a.lookup_table_).T
         lookup_df.columns = [f"bin_{bin_index}" for bin_index in lookup_df.columns]
         lookup_df["train_corr"] = est_a.selected_corrs_
+        corr_share_in = pd.DataFrame({
+            "feature": lookup_df.index.astype(str).tolist(),
+            "train_corr": lookup_df["train_corr"].to_numpy(dtype=np.float64),
+        })
         artifacts[key_bin] = {
             "total_features": int(len(lookup_df)),
             "lookup_table_df": lookup_df.head(cap).copy(),
+            "share_summary": build_feature_importance_share_and_group_summary(
+                corr_share_in,
+                feature_col="feature",
+                importance_col="train_corr",
+                feature_groups=feature_groups,
+                top_n=cap,
+            ),
         }
 
     key_lag = _resolve_baseline_artifact_key(fitted_models, ("Lag-Reversal", "Baseline E (Lag-Reversal)"))
@@ -1647,6 +1766,13 @@ def extract_baseline_interpretability(
             "n_kept_signals": int((est_e.inversion_signs_ > 0).sum()),
             "n_inverted_signals": int((est_e.inversion_signs_ < 0).sum()),
             "rule_summary_df": est_e.rule_summary_.head(cap).copy(),
+            "share_summary": build_feature_importance_share_and_group_summary(
+                est_e.rule_summary_,
+                feature_col="feature",
+                importance_col="effective_weight",
+                feature_groups=feature_groups,
+                top_n=cap,
+            ),
         }
 
     key_pers = _resolve_baseline_artifact_key(fitted_models, ("Persistence", "Baseline P (Persistence)"))
@@ -1725,6 +1851,8 @@ def display_baseline_interpretability(
                 fig_imp.savefig(out_dir / f"{timestamp}_{experiment_name}_lag_reversal_weights.png", dpi=140)
             plt.show()
             plt.close(fig_imp)
+            del fig_imp
+            gc.collect()
         elif key_bin is not None:
             top_bin_df = interpretability[key_bin]["lookup_table_df"].head(20).copy()
             top_bin_df["abs_corr"] = top_bin_df["train_corr"].abs()
@@ -1741,6 +1869,31 @@ def display_baseline_interpretability(
                 fig_imp.savefig(out_dir / f"{timestamp}_{experiment_name}_bin_snapping_corrs.png", dpi=140)
             plt.show()
             plt.close(fig_imp)
+            del fig_imp
+            gc.collect()
+
+    from utils import plot_interpretability_share_and_groups
+
+    if key_lag is not None and interpretability[key_lag].get("share_summary"):
+        plot_interpretability_share_and_groups(
+            interpretability[key_lag]["share_summary"],
+            model_label="Lag-Reversal",
+            metric_label="Abs Effective Weight",
+            results_dir=results_dir,
+            timestamp=timestamp,
+            experiment_name=experiment_name,
+            save_results=save_results,
+        )
+    elif key_bin is not None and interpretability[key_bin].get("share_summary"):
+        plot_interpretability_share_and_groups(
+            interpretability[key_bin]["share_summary"],
+            model_label="Bin-Snapping",
+            metric_label="Abs Train CORR",
+            results_dir=results_dir,
+            timestamp=timestamp,
+            experiment_name=experiment_name,
+            save_results=save_results,
+        )
 
 
 def _baseline_name_to_slug(baseline_name: Any) -> str:
@@ -1767,6 +1920,7 @@ def extract_cv_analysis_artifacts(
     """Export full CV CSVs (if requested) and retain only lightweight top-N tables + trial stats for AFML."""
     top_candidates: Dict[str, pd.DataFrame] = {}
     trial_stats: Dict[str, Dict[str, Any]] = {}
+    timing_records: Dict[str, pd.DataFrame] = {}
     saved_csv_paths: Dict[str, Path] = {}
     out_dir = Path(results_dir) if results_dir is not None else None
     cap = max(1, int(top_n))
@@ -1775,6 +1929,26 @@ def extract_cv_analysis_artifacts(
         top_df = cv_df.head(cap).copy()
         top_df.attrs = {}
         top_candidates[str(baseline_name)] = top_df
+        timing_cols = [
+            c
+            for c in ("candidate_id", "rank_test_score", "mean_fit_time", "mean_score_time", "mean_test_score")
+            if c in cv_df.columns
+        ]
+        if timing_cols:
+            t_df = cv_df[timing_cols].copy()
+            t_df.attrs = {}
+            fit_arr = (
+                pd.to_numeric(t_df["mean_fit_time"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+                if "mean_fit_time" in t_df.columns
+                else np.zeros(len(t_df), dtype=np.float64)
+            )
+            score_arr = (
+                pd.to_numeric(t_df["mean_score_time"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+                if "mean_score_time" in t_df.columns
+                else np.zeros(len(t_df), dtype=np.float64)
+            )
+            t_df["total_time_s"] = fit_arr + score_arr
+            timing_records[str(baseline_name)] = t_df.reset_index(drop=True)
         trial_srs = (
             cv_df["mean_sharpe"].dropna().to_numpy(dtype=np.float64)
             if ("mean_sharpe" in cv_df.columns and len(cv_df) > 0)
@@ -1798,6 +1972,7 @@ def extract_cv_analysis_artifacts(
     return {
         "top_candidates": top_candidates,
         "trial_stats": trial_stats,
+        "timing_records": timing_records,
         "saved_csv_paths": saved_csv_paths,
     }
 
