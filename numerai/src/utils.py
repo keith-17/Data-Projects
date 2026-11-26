@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time
+import warnings
 from datetime import datetime
 from functools import partial
 from operator import itemgetter
@@ -2235,7 +2236,7 @@ def build_experiment_setup(
     recency_decay: float = 0.005,
     random_state: int = 42,
     verbose: int = 3,
-    error_score: float = -1.0,
+    error_score: float = 0.0,
     export_diagnostics: bool = False,
     error_bin_mode: str = "pct",
     error_pct_bins: Tuple[float, float] = (5.0, 10.0),
@@ -2724,6 +2725,11 @@ def candidate_score(
                 dtype=np.float64,
             ).ravel()
         except (TimeoutError, MemoryError) as exc:
+            warnings.warn(
+                f"[FAIL-SAFE ABORT | walk_forward_predict] {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             print(f"  [FAIL-SAFE ABORT | walk_forward_predict] Returning constant fallback so CV assigns -1.0: {exc}")
             preds = np.full(len(targets), 0.5, dtype=np.float64)
     else:

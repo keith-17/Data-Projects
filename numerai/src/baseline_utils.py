@@ -9,6 +9,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import warnings
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -486,6 +487,11 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
         _reclaim_cached_memory()
         gc.collect()
         ctx = context or f"{type(self).__name__}.fit"
+        warnings.warn(
+            f"[FAIL-SAFE ABORT | {ctx}] {self._aborted_reason_}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         print(
             f"  [FAIL-SAFE ABORT | {ctx}] Returning constant fallback={fallback:.4f} "
             f"so CV assigns -1.0 without crashing: {self._aborted_reason_}"
