@@ -538,6 +538,16 @@ def neutralize_predictions(
     era_arr = np.ones(n_rows, dtype=np.int64) if eras is None else np.asarray(eras).ravel()
     out = preds.copy()
 
+    # Optional TensorFlow hardware-accelerated OLS solver (graceful fallback to NumPy)
+    tf_mod = None
+    if n_rows * len(cols) >= 25_000:
+        try:
+            from utils import get_tf_backend
+
+            tf_mod = get_tf_backend()
+        except ImportError:
+            tf_mod = None
+
     # Group row indices by era using stable argsort
     order = np.argsort(era_arr, kind="stable")
     sorted_eras = era_arr[order]
@@ -560,12 +570,28 @@ def neutralize_predictions(
         X_e = X_e - np.mean(X_e, axis=0, keepdims=True)
         ones = np.ones((len(idx), 1), dtype=np.float64)
         design = np.hstack([X_e, ones])
-        try:
-            beta, _, _, _ = np.linalg.lstsq(design, scores, rcond=None)
-            exposure = design @ beta
-            neutral = scores - prop * exposure
-        except np.linalg.LinAlgError:
-            neutral = scores
+        if tf_mod is not None and len(idx) * design.shape[1] >= 10_000:
+            try:
+                design_t = tf_mod.constant(design, dtype=tf_mod.float64)
+                scores_t = tf_mod.constant(scores[:, None], dtype=tf_mod.float64)
+                beta_t = tf_mod.linalg.lstsq(design_t, scores_t, fast=False)
+                exposure = tf_mod.reshape(tf_mod.linalg.matmul(design_t, beta_t), [-1]).numpy()
+                neutral = scores - prop * exposure
+                del design_t, scores_t, beta_t
+            except Exception:
+                try:
+                    beta, _, _, _ = np.linalg.lstsq(design, scores, rcond=None)
+                    exposure = design @ beta
+                    neutral = scores - prop * exposure
+                except np.linalg.LinAlgError:
+                    neutral = scores
+        else:
+            try:
+                beta, _, _, _ = np.linalg.lstsq(design, scores, rcond=None)
+                exposure = design @ beta
+                neutral = scores - prop * exposure
+            except np.linalg.LinAlgError:
+                neutral = scores
         std_n = float(np.std(neutral))
         if std_n > 1e-12:
             neutral = (neutral - float(np.mean(neutral))) / std_n

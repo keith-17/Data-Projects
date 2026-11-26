@@ -25,7 +25,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.linear_model import SGDRegressor
 
 from baseline_utils import BaseNumeraiEstimator
-from utils import NumeraiExtractions, _decode_structured, check_memory_budget, check_time_budget
+from utils import NumeraiExtractions, _decode_structured, check_memory_budget, check_time_budget, get_tf_backend
 
 try:
     from sktime.transformations.panel.rocket import MiniRocket as SktimeMiniRocket
@@ -213,20 +213,116 @@ class _NumpyMiniRocketTransformer:
                     })
                     total_features += 1
 
+            # Precompute fused (9, C, K_grp) Conv1D filter tensors for padded & unpadded kernel groups
+            pad_idx = np.flatnonzero(padding_flags).astype(np.int64)
+            unpad_idx = np.flatnonzero(~padding_flags).astype(np.int64)
+            w_pad = self._build_conv1d_weight_tensor(n_channels, kernel_ids, channel_combos, pad_idx)
+            w_unpad = self._build_conv1d_weight_tensor(n_channels, kernel_ids, channel_combos, unpad_idx)
+
             self.dilation_specs_.append({
                 "dilation": int(dilation),
                 "channel_combos": channel_combos,
                 "kernel_indices": kernel_ids,
                 "padding_flags": padding_flags,
                 "biases": biases,
+                "pad_idx": pad_idx,
+                "unpad_idx": unpad_idx,
+                "w_pad": w_pad,
+                "w_unpad": w_unpad,
             })
 
         self.n_output_features_ = int(total_features)
         return self
 
+    @staticmethod
+    def _build_conv1d_weight_tensor(
+        n_channels: int,
+        kernel_indices: np.ndarray,
+        channel_combos: Sequence[np.ndarray],
+        group_indices: np.ndarray,
+    ) -> np.ndarray:
+        """Build fused `(9, C, K_grp)` Conv1D kernel tensor encoding {-1, +2} taps and per-kernel channel subsets."""
+        n_grp = len(group_indices)
+        weights = np.zeros((9, int(n_channels), n_grp), dtype=np.float32)
+        for out_pos, idx in enumerate(group_indices):
+            k_id = int(kernel_indices[int(idx)])
+            ch = channel_combos[int(idx)]
+            i0, i1, i2 = _MINIROCKET_KERNEL_TRIPLETS[k_id]
+            weights[:, ch, out_pos] = -1.0
+            weights[i0, ch, out_pos] = 2.0
+            weights[i1, ch, out_pos] = 2.0
+            weights[i2, ch, out_pos] = 2.0
+        return weights
+
+    def _transform_tf(self, X_arr: np.ndarray, tf_mod: Any) -> np.ndarray:
+        """Hardware-accelerated MiniRocket transform using batched `tf.nn.conv1d` with dilation + vectorized PPV mean."""
+        b_size, _, seq_len = X_arr.shape
+        out = np.empty((b_size, self.n_output_features_), dtype=np.float32)
+        # Convert (B, C, L) -> (B, L, C) once for tf.nn.conv1d (NWC layout)
+        X_nwc = tf_mod.constant(np.transpose(X_arr, (0, 2, 1)), dtype=tf_mod.float32)
+        col_offset = 0
+        for spec in self.dilation_specs_:
+            dilation = int(spec["dilation"])
+            biases = spec["biases"]
+            n_feat_d = biases.shape[1]
+            span = 8 * dilation + 1
+            pad = 4 * dilation
+            pad_needed = max(pad, (span - seq_len + 1) // 2) if span > seq_len else pad
+            out_len = seq_len if pad_needed == pad else ((seq_len + 2 * pad_needed) - span + 1)
+
+            ppv_all = np.empty((b_size, _NUM_BASE_KERNELS, n_feat_d), dtype=np.float32)
+
+            # Group 1: Padded kernels (single fused dilated conv1d)
+            pad_idx = spec["pad_idx"]
+            if len(pad_idx) > 0:
+                x_pad_t = tf_mod.pad(X_nwc, [[0, 0], [pad_needed, pad_needed], [0, 0]])
+                w_pad_t = tf_mod.constant(spec["w_pad"], dtype=tf_mod.float32)
+                conv_p = tf_mod.nn.conv1d(x_pad_t, w_pad_t, stride=1, padding="VALID", dilations=dilation)
+                conv_p = conv_p[:, :out_len, :]
+                b_pad_t = tf_mod.constant(biases[pad_idx, :], dtype=tf_mod.float32)
+                ppv_p = tf_mod.reduce_mean(
+                    tf_mod.cast(tf_mod.greater(conv_p[:, :, :, None], b_pad_t[None, None, :, :]), tf_mod.float32),
+                    axis=1,
+                ).numpy()
+                ppv_all[:, pad_idx, :] = ppv_p
+                del x_pad_t, w_pad_t, conv_p, b_pad_t, ppv_p
+
+            # Group 2: Unpadded kernels (single fused dilated conv1d, zero-padded only if seq_len < span)
+            unpad_idx = spec["unpad_idx"]
+            if len(unpad_idx) > 0:
+                if seq_len < span:
+                    extra = span - seq_len
+                    left = extra // 2
+                    x_unpad_t = tf_mod.pad(X_nwc, [[0, 0], [left, extra - left], [0, 0]])
+                else:
+                    x_unpad_t = X_nwc
+                w_unpad_t = tf_mod.constant(spec["w_unpad"], dtype=tf_mod.float32)
+                conv_u = tf_mod.nn.conv1d(x_unpad_t, w_unpad_t, stride=1, padding="VALID", dilations=dilation)
+                v_len_u = min(int(conv_u.shape[1]), out_len)
+                conv_u = conv_u[:, :v_len_u, :]
+                b_unpad_t = tf_mod.constant(biases[unpad_idx, :], dtype=tf_mod.float32)
+                ppv_u = tf_mod.reduce_mean(
+                    tf_mod.cast(tf_mod.greater(conv_u[:, :, :, None], b_unpad_t[None, None, :, :]), tf_mod.float32),
+                    axis=1,
+                ).numpy()
+                ppv_all[:, unpad_idx, :] = ppv_u
+                del w_unpad_t, conv_u, b_unpad_t, ppv_u
+
+            width = _NUM_BASE_KERNELS * n_feat_d
+            out[:, col_offset : col_offset + width] = ppv_all.reshape(b_size, width)
+            col_offset += width
+            del ppv_all
+        del X_nwc
+        return out
+
     def transform(self, X_batch: np.ndarray) -> np.ndarray:
         X_arr = np.asarray(X_batch, dtype=np.float32)
         b_size = X_arr.shape[0]
+        if b_size > 0 and b_size * self.n_output_features_ >= 100_000:
+            tf_mod = get_tf_backend()
+            if tf_mod is not None and self.dilation_specs_ and "w_pad" in self.dilation_specs_[0]:
+                return self._transform_tf(X_arr, tf_mod)
+
         out = np.empty((b_size, self.n_output_features_), dtype=np.float32)
         col_offset = 0
         for spec in self.dilation_specs_:
@@ -578,6 +674,7 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         y_mean = float(np.dot(w_f64, y_f64) / w_sum)
         y_centered = y_f64 - y_mean
 
+        tf_mod = get_tf_backend() if (n_rows >= 512) else None
         sum_x: Optional[np.ndarray] = None
         sum_x2: Optional[np.ndarray] = None
         XtX: Optional[np.ndarray] = None
@@ -597,12 +694,24 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
                 Xty = np.zeros(n_feat, dtype=np.float64)
             wb = w_f64[start:end]
             yb = y_centered[start:end]
-            Zw = Z * wb[:, None]
-            sum_x += Zw.sum(axis=0)
-            sum_x2 += (Zw * Z).sum(axis=0)
-            XtX += Zw.T @ Z
-            Xty += Z.T @ (wb * yb)
-            del Z, Zw
+            if tf_mod is not None:
+                z_t = tf_mod.constant(Z, dtype=tf_mod.float64)
+                w_t = tf_mod.constant(wb, dtype=tf_mod.float64)
+                wy_t = tf_mod.constant(wb * yb, dtype=tf_mod.float64)
+                zw_t = z_t * w_t[:, None]
+                sum_x += tf_mod.reduce_sum(zw_t, axis=0).numpy()
+                sum_x2 += tf_mod.reduce_sum(zw_t * z_t, axis=0).numpy()
+                XtX += tf_mod.linalg.matmul(zw_t, z_t, transpose_a=True).numpy()
+                Xty += tf_mod.linalg.matvec(z_t, wy_t, transpose_a=True).numpy()
+                del z_t, w_t, wy_t, zw_t
+            else:
+                Zw = Z * wb[:, None]
+                sum_x += Zw.sum(axis=0)
+                sum_x2 += (Zw * Z).sum(axis=0)
+                XtX += Zw.T @ Z
+                Xty += Z.T @ (wb * yb)
+                del Zw
+            del Z
 
         assert sum_x is not None and sum_x2 is not None and XtX is not None and Xty is not None
         mean_x = sum_x / w_sum
@@ -621,7 +730,16 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         Xty_std = Xty * inv_scale
 
         if use_gcv:
-            eigvals, eigvecs = np.linalg.eigh(XtX_std)
+            if tf_mod is not None:
+                try:
+                    eigvals_t, eigvecs_t = tf_mod.linalg.eigh(tf_mod.constant(XtX_std, dtype=tf_mod.float64))
+                    eigvals = eigvals_t.numpy()
+                    eigvecs = eigvecs_t.numpy()
+                    del eigvals_t, eigvecs_t
+                except Exception:
+                    eigvals, eigvecs = np.linalg.eigh(XtX_std)
+            else:
+                eigvals, eigvecs = np.linalg.eigh(XtX_std)
             eigvals = np.maximum(eigvals, 0.0)
             ut_xty = eigvecs.T @ Xty_std
             y_norm_sq = float(np.dot(w_f64, y_centered * y_centered))
@@ -652,12 +770,26 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
             chosen_alpha = max(1e-8, float(self.alpha))
             eff_alpha = chosen_alpha * (w_sum / max(float(n_rows), 1.0))
             reg_mat = XtX_std + np.eye(n_feat, dtype=np.float64) * eff_alpha
-            try:
-                coef_std = np.linalg.solve(reg_mat, Xty_std)
-            except np.linalg.LinAlgError:
-                coef_std = np.linalg.lstsq(reg_mat, Xty_std, rcond=None)[0]
+            if tf_mod is not None:
+                try:
+                    coef_std = tf_mod.reshape(
+                        tf_mod.linalg.solve(
+                            tf_mod.constant(reg_mat, dtype=tf_mod.float64),
+                            tf_mod.constant(Xty_std[:, None], dtype=tf_mod.float64),
+                        ),
+                        [-1],
+                    ).numpy()
+                except Exception:
+                    coef_std = np.linalg.lstsq(reg_mat, Xty_std, rcond=None)[0]
+            else:
+                try:
+                    coef_std = np.linalg.solve(reg_mat, Xty_std)
+                except np.linalg.LinAlgError:
+                    coef_std = np.linalg.lstsq(reg_mat, Xty_std, rcond=None)[0]
 
         coef_std = np.where(np.isfinite(coef_std), coef_std, 0.0)
+        del XtX, XtX_c, XtX_std
+        gc.collect()
         return coef_std, y_mean, mean_x, scale_x, chosen_alpha
 
     def _fit_batched_sgd(

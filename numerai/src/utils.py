@@ -124,6 +124,35 @@ _TIME_GUARD_CONFIG: Dict[str, Any] = {
     "max_candidate_seconds": 3600.0,
 }
 
+_TF_BACKEND_CACHE: Dict[str, Any] = {
+    "checked": False,
+    "module": None,
+}
+
+
+def get_tf_backend() -> Optional[Any]:
+    """Lazily import TensorFlow once per process for accelerated linear algebra / tensor ops.
+
+    Enables GPU memory growth when GPUs are present so TensorFlow does not pre-allocate all VRAM.
+    Returns `None` cleanly if TensorFlow is not installed.
+    """
+    if _TF_BACKEND_CACHE["checked"]:
+        return _TF_BACKEND_CACHE["module"]
+    _TF_BACKEND_CACHE["checked"] = True
+    try:
+        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+        import tensorflow as tf_mod
+
+        try:
+            for gpu in tf_mod.config.list_physical_devices("GPU"):
+                tf_mod.config.experimental.set_memory_growth(gpu, True)
+        except Exception:
+            pass
+        _TF_BACKEND_CACHE["module"] = tf_mod
+    except ImportError:
+        _TF_BACKEND_CACHE["module"] = None
+    return _TF_BACKEND_CACHE["module"]
+
 
 def configure_memory_guard(
     enabled: bool = True,
@@ -761,6 +790,40 @@ def _pandas_mean_corr_vectorized(
 
     result = np.zeros(n_cols, dtype=np.float64)
     col_names = list(X.columns) if is_df else None
+    tf_mod = get_tf_backend() if (n_rows * n_cols >= 100_000) else None
+
+    if tf_mod is not None:
+        n_eras = len(starts)
+        seg_ids = np.repeat(np.arange(n_eras, dtype=np.int32), counts)
+        seg_ids_t = tf_mod.constant(seg_ids, dtype=tf_mod.int32)
+        counts_t = tf_mod.constant(counts.astype(np.float64), dtype=tf_mod.float64)[:, None]
+        y_c_t = tf_mod.constant(y_centered, dtype=tf_mod.float64)[:, None]
+        y_ss_t = tf_mod.constant(y_ss, dtype=tf_mod.float64)[:, None]
+        chunk_size = 512
+        for c0 in range(0, n_cols, chunk_size):
+            c1 = min(n_cols, c0 + chunk_size)
+            if is_df and col_names is not None:
+                x_chunk = X[col_names[c0:c1]].to_numpy(dtype=np.float64, copy=False)
+            else:
+                x_chunk = np.asarray(X[:, c0:c1], dtype=np.float64)
+            x_sorted_t = tf_mod.constant(x_chunk[order], dtype=tf_mod.float64)
+            x_sum_t = tf_mod.math.unsorted_segment_sum(x_sorted_t, seg_ids_t, n_eras)
+            x_mean_t = x_sum_t / counts_t
+            x_centered_t = x_sorted_t - tf_mod.gather(x_mean_t, seg_ids_t)
+            x_ss_t = tf_mod.math.unsorted_segment_sum(x_centered_t * x_centered_t, seg_ids_t, n_eras)
+            xy_cov_t = tf_mod.math.unsorted_segment_sum(x_centered_t * y_c_t, seg_ids_t, n_eras)
+            denom_t = tf_mod.sqrt(tf_mod.maximum(x_ss_t * y_ss_t, 0.0))
+            era_corrs = tf_mod.where(
+                denom_t > 1e-12,
+                tf_mod.math.divide_no_nan(xy_cov_t, denom_t),
+                tf_mod.zeros_like(xy_cov_t),
+            ).numpy()
+            era_corrs = np.nan_to_num(era_corrs, nan=0.0, posinf=0.0, neginf=0.0)
+            result[c0:c1] = era_corrs[valid_era_mask].mean(axis=0)
+            del x_sorted_t, x_sum_t, x_mean_t, x_centered_t, x_ss_t, xy_cov_t, denom_t, era_corrs
+        del seg_ids_t, counts_t, y_c_t, y_ss_t
+        return result
+
     chunk_size = 256
     for c0 in range(0, n_cols, chunk_size):
         c1 = min(n_cols, c0 + chunk_size)
@@ -803,6 +866,32 @@ def _pooled_pearson_corr(
         return np.zeros(n_features, dtype=np.float64)
 
     corrs = np.zeros(n_features, dtype=np.float64)
+    n_rows = len(y_f64)
+    tf_mod = get_tf_backend() if (n_rows * n_features >= 100_000) else None
+    if tf_mod is not None:
+        y_c_t = tf_mod.constant(y_centered, dtype=tf_mod.float64)
+        y_ss_t = tf_mod.constant(y_ss, dtype=tf_mod.float64)
+        tf_chunk = max(int(chunk_size), 256)
+        for start in range(0, n_features, tf_chunk):
+            chunk_cols = cols[start : start + tf_chunk]
+            x_chunk = df[chunk_cols].to_numpy(dtype=np.float64, copy=False)
+            if rank_columns:
+                x_chunk = np.apply_along_axis(stats.rankdata, 0, x_chunk).astype(np.float64, copy=False)
+            x_t = tf_mod.constant(x_chunk, dtype=tf_mod.float64)
+            x_c_t = x_t - tf_mod.reduce_mean(x_t, axis=0, keepdims=True)
+            x_ss_t = tf_mod.reduce_sum(x_c_t * x_c_t, axis=0)
+            denom_t = tf_mod.sqrt(tf_mod.maximum(x_ss_t * y_ss_t, 0.0))
+            xy_cov_t = tf_mod.linalg.matvec(x_c_t, y_c_t, transpose_a=True)
+            chunk_corrs = tf_mod.where(
+                denom_t > 1e-12,
+                tf_mod.math.divide_no_nan(xy_cov_t, denom_t),
+                tf_mod.zeros_like(xy_cov_t),
+            ).numpy()
+            corrs[start : start + len(chunk_cols)] = np.nan_to_num(chunk_corrs, nan=0.0, posinf=0.0, neginf=0.0)
+            del x_t, x_c_t, x_ss_t, denom_t, xy_cov_t, chunk_corrs
+        del y_c_t, y_ss_t
+        return corrs
+
     for start in range(0, n_features, chunk_size):
         chunk_cols = cols[start : start + chunk_size]
         x_chunk = df[chunk_cols].to_numpy(dtype=np.float64, copy=False)
