@@ -20,10 +20,18 @@ import pandas as pd
 from lightgbm import LGBMRegressor
 
 from baseline_utils import BaseNumeraiEstimator
-from utils import NumeraiExtractions, _decode_structured
+from utils import NumeraiExtractions, _decode_structured, check_memory_budget
 
 _LGB_DATASET_CACHE: "OrderedDict[str, lgb.Dataset]" = OrderedDict()
-_LGB_DATASET_CACHE_MAX = 8
+_LGB_DATASET_CACHE_MAX = 2
+_LGB_DATASET_CACHE_SUSPENDED: bool = False
+
+
+def set_lgb_dataset_cache_suspended(suspended: bool) -> bool:
+    """Temporarily suspend reading/writing `_LGB_DATASET_CACHE` (e.g. inside `walk_forward_predict`)."""
+    global _LGB_DATASET_CACHE_SUSPENDED
+    _LGB_DATASET_CACHE_SUSPENDED = bool(suspended)
+    return _LGB_DATASET_CACHE_SUSPENDED
 
 
 def clear_lgb_dataset_cache() -> int:
@@ -328,9 +336,13 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
         )
         selected_cols = list(self.selected_feature_names_)
         selected_df = features_df if len(selected_cols) == len(features_df.columns) and list(features_df.columns) == selected_cols else features_df[selected_cols]
+        check_memory_budget(
+            len(selected_df) * len(selected_cols) * 4,
+            context="LightGBMNumeraiEstimator.fit",
+        )
 
         model = self._build_lgbm_model()
-        if bool(self.reuse_binned_dataset):
+        if bool(self.reuse_binned_dataset) and not _LGB_DATASET_CACHE_SUSPENDED:
             raw_params = model.get_params()
             num_boost_round = int(raw_params.pop("n_estimators", 200))
             importance_type = str(raw_params.pop("importance_type", "gain") or "gain").strip().lower()

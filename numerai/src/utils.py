@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ctypes
 import gc
 import hashlib
 import inspect
 import json
+import os
+import sys
 from datetime import datetime
 from functools import partial
 from operator import itemgetter
@@ -107,6 +110,167 @@ FORBIDDEN_FEATURE_COLS = frozenset({
 
 CORR_SANITY_LOW_THRESHOLD = 0.005
 CORR_SANITY_HIGH_THRESHOLD = 0.040
+
+_MEMORY_GUARD_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "min_free_gb": 3.0,
+    "max_fraction": 0.80,
+}
+
+
+def configure_memory_guard(
+    enabled: bool = True,
+    min_free_gb: float = 3.0,
+    max_fraction: float = 0.80,
+) -> Dict[str, Any]:
+    """Configure the explicit RAM fail-safe guard (`enabled=False` turns it off completely)."""
+    _MEMORY_GUARD_CONFIG["enabled"] = bool(enabled)
+    _MEMORY_GUARD_CONFIG["min_free_gb"] = max(0.0, float(min_free_gb))
+    _MEMORY_GUARD_CONFIG["max_fraction"] = float(np.clip(float(max_fraction), 0.10, 0.99))
+    return dict(_MEMORY_GUARD_CONFIG)
+
+
+def _read_cgroup_available_bytes() -> Optional[int]:
+    """Read remaining container RAM from Linux cgroup v2 or v1 (used on Kaggle CPU/GPU VMs)."""
+    try:
+        max_path = Path("/sys/fs/cgroup/memory.max")
+        cur_path = Path("/sys/fs/cgroup/memory.current")
+        if max_path.is_file() and cur_path.is_file():
+            raw_max = max_path.read_text(encoding="utf-8").strip()
+            if raw_max.isdigit():
+                limit_b = int(raw_max)
+                used_b = int(cur_path.read_text(encoding="utf-8").strip())
+                if limit_b > 0 and limit_b < (1 << 60):
+                    return max(0, limit_b - used_b)
+    except OSError:
+        pass
+    try:
+        lim_path = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        use_path = Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        if lim_path.is_file() and use_path.is_file():
+            limit_b = int(lim_path.read_text(encoding="utf-8").strip())
+            used_b = int(use_path.read_text(encoding="utf-8").strip())
+            if limit_b > 0 and limit_b < (1 << 60):
+                return max(0, limit_b - used_b)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+class _WinMemoryStatusEx(ctypes.Structure):
+    """Top-level Win32 `MEMORYSTATUSEX` struct for querying available physical RAM without psutil."""
+
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def _read_host_available_bytes() -> Optional[int]:
+    """Read host available RAM cross-platform via `psutil`, `/proc/meminfo`, or Windows `GlobalMemoryStatusEx`."""
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    try:
+        meminfo = Path("/proc/meminfo")
+        if meminfo.is_file():
+            for line in meminfo.read_text(encoding="utf-8").splitlines():
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    if os.name == "nt":
+        try:
+            stat = _WinMemoryStatusEx()
+            stat.dwLength = ctypes.sizeof(_WinMemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullAvailPhys)
+        except Exception:
+            pass
+    return None
+
+
+def get_available_memory_bytes() -> Optional[int]:
+    """Return conservative available RAM in bytes (minimum of container cgroup headroom and host available RAM)."""
+    candidates = [v for v in (_read_cgroup_available_bytes(), _read_host_available_bytes()) if v is not None]
+    return min(candidates) if candidates else None
+
+
+def _reclaim_cached_memory() -> None:
+    """Clear per-process extraction/LightGBM caches (if loaded) and run garbage collection."""
+    bu_mod = sys.modules.get("baseline_utils")
+    if bu_mod is not None and hasattr(bu_mod, "clear_extraction_cache"):
+        bu_mod.clear_extraction_cache()
+    lgb_mod = sys.modules.get("lgbm_utils")
+    if lgb_mod is not None and hasattr(lgb_mod, "clear_lgb_dataset_cache"):
+        lgb_mod.clear_lgb_dataset_cache()
+    gc.collect()
+
+
+def check_memory_budget(
+    estimated_bytes: int,
+    *,
+    context: str = "",
+    min_free_gb: Optional[float] = None,
+    max_fraction: Optional[float] = None,
+    min_check_mb: float = 64.0,
+) -> bool:
+    """Fail-safe RAM preflight check: raises `MemoryError` if a candidate allocation would breach the safety floor.
+
+    When `_MEMORY_GUARD_CONFIG['enabled']` is `False`, this is a zero-overhead no-op returning `True`.
+    Small allocations below `min_check_mb` (default 64 MB) are skipped so tiny slices/unit tests never false-trigger
+    on machines with low ambient free RAM. Inside `BayesSearchCV` / `GridSearchCV` (`error_score=-1.0`),
+    raising `MemoryError` fails only the offending candidate instead of triggering an OS OOM kill (`DeadKernelError`).
+    """
+    if not bool(_MEMORY_GUARD_CONFIG.get("enabled", True)):
+        return True
+    est_b = max(0, int(estimated_bytes))
+    min_check_b = int(max(0.0, float(min_check_mb)) * (1024 ** 2))
+    if est_b == 0 or est_b < min_check_b:
+        return True
+
+    floor_gb = float(_MEMORY_GUARD_CONFIG["min_free_gb"] if min_free_gb is None else min_free_gb)
+    frac_lim = float(_MEMORY_GUARD_CONFIG["max_fraction"] if max_fraction is None else max_fraction)
+    floor_b = int(max(0.0, floor_gb) * (1024 ** 3))
+
+    avail_b = get_available_memory_bytes()
+    if avail_b is None:
+        return True
+
+    over_floor = (avail_b - est_b) < floor_b
+    over_frac = est_b > int(avail_b * frac_lim)
+    if over_floor or over_frac:
+        # Try reclaiming caches + GC once before failing the candidate
+        _reclaim_cached_memory()
+        avail_b = get_available_memory_bytes()
+        if avail_b is None:
+            return True
+        over_floor = (avail_b - est_b) < floor_b
+        over_frac = est_b > int(avail_b * frac_lim)
+        if over_floor or over_frac:
+            est_gb = est_b / (1024 ** 3)
+            avail_gb = avail_b / (1024 ** 3)
+            ctx_label = f" [{context}]" if context else ""
+            msg = (
+                f"[MEMORY FAIL-SAFE]{ctx_label} Aborting candidate: estimated allocation "
+                f"{est_gb:.2f} GB exceeds safe budget (available={avail_gb:.2f} GB, "
+                f"min_free_gb={floor_gb:.2f} GB, max_fraction={frac_lim:.0%})."
+            )
+            print(msg)
+            raise MemoryError(msg)
+    return True
 
 
 def _decode_structured(value: Any) -> Any:
@@ -898,6 +1062,10 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
             else:
                 raise ValueError(f"Unsupported sparse_selector '{self.sparse_selector}'; use None, 'lasso', or 'elasticnet'.")
             sfm = SelectFromModel(base_sparse)
+            check_memory_budget(
+                len(fit_clean_df) * len(selected_cols) * 4 * 2,
+                context=f"NumeraiExtractions.sparse_selector({sel_mode})",
+            )
             fit_target_arr = (target_vec.loc[fit_mask] if use_filter else target_vec).to_numpy(dtype=np.float32, copy=False)
             sparse_raw = fit_clean_df[selected_cols].to_numpy(dtype=np.float32, copy=False)
             self.sparse_scaler_ = StandardScaler().fit(sparse_raw)
@@ -923,6 +1091,10 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
                 n_comp: Any = float(raw_pca)
             else:
                 n_comp = min(max(1, int(raw_pca)), len(selected_cols), len(fit_clean_df))
+            check_memory_budget(
+                len(fit_clean_df) * len(selected_cols) * 4 * 2,
+                context=f"NumeraiExtractions.pca(n_components={n_comp})",
+            )
             pca_raw = fit_clean_df[selected_cols].to_numpy(dtype=np.float32, copy=False)
             self.pca_scaler_ = StandardScaler().fit(pca_raw)
             self.pca_ = PCA(n_components=n_comp, random_state=42)
@@ -1010,18 +1182,32 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
 
         dispersion_tokens = _parse_pipe_tokens(self.era_dispersion_features, ("mean", "std", "extreme_frac"))
         if dispersion_tokens:
-            mat = base_features.to_numpy(dtype=np.float32, copy=False)
-            if "mean" in dispersion_tokens:
-                extra_cols["row_feat_mean_bin"] = np.clip(np.rint(mat.mean(axis=1)), 0, 4).astype(np.int8)
-            if "std" in dispersion_tokens:
+            n_rows_disp = len(base_features)
+            disp_batch = 65_536
+            row_mean_out = np.empty(n_rows_disp, dtype=np.float32) if "mean" in dispersion_tokens else None
+            row_std_out = np.empty(n_rows_disp, dtype=np.float32) if "std" in dispersion_tokens else None
+            row_ext_out = np.empty(n_rows_disp, dtype=np.float32) if "extreme_frac" in dispersion_tokens else None
+            for start_r in range(0, n_rows_disp, disp_batch):
+                end_r = min(n_rows_disp, start_r + disp_batch)
+                chunk_mat = base_features[start_r:end_r].to_numpy(dtype=np.float32, copy=False)
+                if row_mean_out is not None:
+                    row_mean_out[start_r:end_r] = chunk_mat.mean(axis=1)
+                if row_std_out is not None:
+                    row_std_out[start_r:end_r] = chunk_mat.std(axis=1)
+                if row_ext_out is not None:
+                    row_ext_out[start_r:end_r] = ((chunk_mat == 0) | (chunk_mat == 4)).mean(axis=1)
+                del chunk_mat
+            if row_mean_out is not None:
+                extra_cols["row_feat_mean_bin"] = np.clip(np.rint(row_mean_out), 0, 4).astype(np.int8)
+            if row_std_out is not None:
                 extra_cols["row_feat_std_bin"] = self._quantize_signal(
-                    mat.std(axis=1), era_vals, "row_feat_std_bin"
+                    row_std_out, era_vals, "row_feat_std_bin"
                 )
-            if "extreme_frac" in dispersion_tokens:
+            if row_ext_out is not None:
                 extra_cols["row_extreme_frac_bin"] = np.clip(
-                    np.rint(((mat == 0) | (mat == 4)).mean(axis=1) * 4.0), 0, 4
+                    np.rint(row_ext_out * 4.0), 0, 4
                 ).astype(np.int8)
-            del mat
+            del row_mean_out, row_std_out, row_ext_out
 
         seq_top_n = max(1, int(self.sequence_top_n or 4))
 
@@ -1162,10 +1348,18 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
                             )
 
         if getattr(self, "pca_", None) is not None:
-            pca_in = base_features.to_numpy(dtype=np.float32, copy=False)
-            if getattr(self, "pca_scaler_", None) is not None:
-                pca_in = self.pca_scaler_.transform(pca_in)
-            pca_scores = self.pca_.transform(pca_in)
+            n_rows_pca = len(base_features)
+            n_comp_out = int(getattr(self.pca_, "n_components_", self.pca_.components_.shape[0]))
+            pca_scores = np.empty((n_rows_pca, n_comp_out), dtype=np.float32)
+            pca_batch = 65_536
+            pca_scaler = getattr(self, "pca_scaler_", None)
+            for start_r in range(0, n_rows_pca, pca_batch):
+                end_r = min(n_rows_pca, start_r + pca_batch)
+                pca_chunk = base_features[start_r:end_r].to_numpy(dtype=np.float32, copy=False)
+                if pca_scaler is not None:
+                    pca_chunk = pca_scaler.transform(pca_chunk)
+                pca_scores[start_r:end_r] = self.pca_.transform(pca_chunk)
+                del pca_chunk
             pca_cols = {
                 f"pca_comp_{comp_idx}": self._quantize_signal(
                     pca_scores[:, comp_idx], era_vals, f"pca_comp_{comp_idx}"
@@ -1613,105 +1807,125 @@ def walk_forward_predict(
     y_train_s = pd.Series(np.asarray(y_train, dtype=np.float32).ravel(), index=X_train.index)
     y_val_s = pd.Series(np.asarray(y_validation, dtype=np.float32).ravel(), index=X_validation.index)
 
+    # Suspend per-process extraction/LGB caches during walk-forward steps (each step has a unique cutoff -> 0% cache hit rate)
+    import sys
+
+    _bu_mod = sys.modules.get("baseline_utils")
+    _lgb_mod = sys.modules.get("lgbm_utils")
+    _prev_ext_suspended = bool(getattr(_bu_mod, "_EXTRACTION_CACHE_SUSPENDED", False)) if _bu_mod is not None else False
+    _prev_lgb_suspended = bool(getattr(_lgb_mod, "_LGB_DATASET_CACHE_SUSPENDED", False)) if _lgb_mod is not None else False
+    if _bu_mod is not None and hasattr(_bu_mod, "set_extraction_cache_suspended"):
+        _bu_mod.set_extraction_cache_suspended(True)
+    if _lgb_mod is not None and hasattr(_lgb_mod, "set_lgb_dataset_cache_suspended"):
+        _lgb_mod.set_lgb_dataset_cache_suspended(True)
+
     wf_preds = np.full(len(X_validation), float(np.mean(y_train_s)) if len(y_train_s) else 0.5, dtype=np.float64)
-    for start_idx in range(0, len(unique_val_eras), step):
-        chunk_eras = unique_val_eras[start_idx : start_idx + step]
-        forecast_origin_era = int(chunk_eras[0])
-        settled_cutoff_era = forecast_origin_era - horizon - buf
-        min_sliding_era = (settled_cutoff_era - max(1, train_era_span)) if mode == "sliding" else None
+    try:
+        for start_idx in range(0, len(unique_val_eras), step):
+            chunk_eras = unique_val_eras[start_idx : start_idx + step]
+            forecast_origin_era = int(chunk_eras[0])
+            settled_cutoff_era = forecast_origin_era - horizon - buf
+            min_sliding_era = (settled_cutoff_era - max(1, train_era_span)) if mode == "sliding" else None
 
-        train_mask = train_era_arr <= settled_cutoff_era
-        if min_sliding_era is not None:
-            train_mask = train_mask & (train_era_arr >= min_sliding_era)
+            train_mask = train_era_arr <= settled_cutoff_era
+            if min_sliding_era is not None:
+                train_mask = train_mask & (train_era_arr >= min_sliding_era)
 
-        settled_val_eras = unique_val_eras[unique_val_eras <= settled_cutoff_era]
-        if min_sliding_era is not None:
-            settled_val_eras = settled_val_eras[settled_val_eras >= min_sliding_era]
-        if stride > 1 and len(settled_val_eras) > 0:
-            settled_val_eras = settled_val_eras[::stride]
+            settled_val_eras = unique_val_eras[unique_val_eras <= settled_cutoff_era]
+            if min_sliding_era is not None:
+                settled_val_eras = settled_val_eras[settled_val_eras >= min_sliding_era]
+            if stride > 1 and len(settled_val_eras) > 0:
+                settled_val_eras = settled_val_eras[::stride]
 
-        has_train = bool(np.any(train_mask))
-        has_val_settled = len(settled_val_eras) > 0
+            has_train = bool(np.any(train_mask))
+            has_val_settled = len(settled_val_eras) > 0
 
-        if not has_train and not has_val_settled:
-            # No settled historical eras exist prior to `settled_cutoff_era` — never leak unsettled `X_train`
-            continue
+            if not has_train and not has_val_settled:
+                # No settled historical eras exist prior to `settled_cutoff_era` — never leak unsettled `X_train`
+                continue
 
-        val_fit_mask = np.isin(val_era_arr, settled_val_eras) if has_val_settled else np.zeros(len(val_era_arr), dtype=bool)
-        # Prevent 4x-100x era-density imbalance when X_train was downsampled while X_validation is 100% density
-        if balance_era_density and has_train and has_val_settled and median_train_era_rows > 0:
-            val_fit_indices = np.flatnonzero(val_fit_mask)
-            val_fit_eras_sub = val_era_arr[val_fit_indices]
-            _, vf_counts = np.unique(val_fit_eras_sub, return_counts=True)
-            if len(vf_counts) > 0 and float(np.median(vf_counts)) > 1.5 * float(median_train_era_rows):
-                balanced_mask = np.zeros(len(val_era_arr), dtype=bool)
-                for e_id in settled_val_eras:
-                    e_pos = np.flatnonzero(val_era_arr == e_id)
-                    if len(e_pos) > median_train_era_rows:
-                        pick = rng.choice(e_pos, size=median_train_era_rows, replace=False)
-                        balanced_mask[pick] = True
-                    else:
-                        balanced_mask[e_pos] = True
-                val_fit_mask = balanced_mask
+            val_fit_mask = np.isin(val_era_arr, settled_val_eras) if has_val_settled else np.zeros(len(val_era_arr), dtype=bool)
+            # Prevent 4x-100x era-density imbalance when X_train was downsampled while X_validation is 100% density
+            if balance_era_density and has_train and has_val_settled and median_train_era_rows > 0:
+                val_fit_indices = np.flatnonzero(val_fit_mask)
+                val_fit_eras_sub = val_era_arr[val_fit_indices]
+                _, vf_counts = np.unique(val_fit_eras_sub, return_counts=True)
+                if len(vf_counts) > 0 and float(np.median(vf_counts)) > 1.5 * float(median_train_era_rows):
+                    balanced_mask = np.zeros(len(val_era_arr), dtype=bool)
+                    for e_id in settled_val_eras:
+                        e_pos = np.flatnonzero(val_era_arr == e_id)
+                        if len(e_pos) > median_train_era_rows:
+                            pick = rng.choice(e_pos, size=median_train_era_rows, replace=False)
+                            balanced_mask[pick] = True
+                        else:
+                            balanced_mask[e_pos] = True
+                    val_fit_mask = balanced_mask
 
-        if has_train and not has_val_settled:
-            if bool(np.all(train_mask)):
-                X_fit = X_train
-                y_fit = y_train_s
+            if has_train and not has_val_settled:
+                if bool(np.all(train_mask)):
+                    X_fit = X_train
+                    y_fit = y_train_s
+                else:
+                    X_fit = X_train.loc[train_mask]
+                    y_fit = y_train_s.loc[train_mask]
+            elif not has_train and has_val_settled:
+                X_fit = X_validation.loc[val_fit_mask]
+                y_fit = y_val_s.loc[val_fit_mask]
             else:
-                X_fit = X_train.loc[train_mask]
-                y_fit = y_train_s.loc[train_mask]
-        elif not has_train and has_val_settled:
-            X_fit = X_validation.loc[val_fit_mask]
-            y_fit = y_val_s.loc[val_fit_mask]
-        else:
-            X_tr_part = X_train if bool(np.all(train_mask)) else X_train.loc[train_mask]
-            y_tr_part = y_train_s if bool(np.all(train_mask)) else y_train_s.loc[train_mask]
-            X_fit = pd.concat([X_tr_part, X_validation.loc[val_fit_mask]], axis=0, ignore_index=True)
-            y_fit = pd.concat([y_tr_part.reset_index(drop=True), y_val_s.loc[val_fit_mask].reset_index(drop=True)], axis=0, ignore_index=True)
-            del X_tr_part, y_tr_part
+                X_tr_part = X_train if bool(np.all(train_mask)) else X_train.loc[train_mask]
+                y_tr_part = y_train_s if bool(np.all(train_mask)) else y_train_s.loc[train_mask]
+                X_fit = pd.concat([X_tr_part, X_validation.loc[val_fit_mask]], axis=0, ignore_index=True)
+                y_fit = pd.concat([y_tr_part.reset_index(drop=True), y_val_s.loc[val_fit_mask].reset_index(drop=True)], axis=0, ignore_index=True)
+                del X_tr_part, y_tr_part
 
-        if isinstance(X_fit, pd.DataFrame) and "era" in X_fit.columns and len(X_fit) > 0:
-            max_fit_era = int(pd.to_numeric(X_fit["era"], errors="coerce").max())
-            if max_fit_era > settled_cutoff_era:
-                raise ValueError(
-                    f"Walk-forward leakage detected: max fit era ({max_fit_era}) > settled_cutoff_era ({settled_cutoff_era})."
-                )
+            if isinstance(X_fit, pd.DataFrame) and "era" in X_fit.columns and len(X_fit) > 0:
+                max_fit_era = int(pd.to_numeric(X_fit["era"], errors="coerce").max())
+                if max_fit_era > settled_cutoff_era:
+                    raise ValueError(
+                        f"Walk-forward leakage detected: max fit era ({max_fit_era}) > settled_cutoff_era ({settled_cutoff_era})."
+                    )
 
-        step_model = clone(estimator)
-        chunk_params = step_model.get_params(deep=True)
-        set_overrides: Dict[str, Any] = {}
-        if "estimator__walk_forward_step_eras" in chunk_params:
-            set_overrides["estimator__walk_forward_step_eras"] = None
-        elif "walk_forward_step_eras" in chunk_params:
-            set_overrides["walk_forward_step_eras"] = None
-        # Prevent double-striding inside step_model when walk_forward_predict already strided settled eras
-        if stride > 1:
-            if "estimator__era_stride" in chunk_params:
-                set_overrides["estimator__era_stride"] = 1
-            elif "era_stride" in chunk_params:
-                set_overrides["era_stride"] = 1
-        if set_overrides:
-            step_model.set_params(**set_overrides)
-        step_model.fit(X_fit, y_fit)
+            step_model = clone(estimator)
+            chunk_params = step_model.get_params(deep=True)
+            set_overrides: Dict[str, Any] = {}
+            if "estimator__walk_forward_step_eras" in chunk_params:
+                set_overrides["estimator__walk_forward_step_eras"] = None
+            elif "walk_forward_step_eras" in chunk_params:
+                set_overrides["walk_forward_step_eras"] = None
+            # Prevent double-striding inside step_model when walk_forward_predict already strided settled eras
+            if stride > 1:
+                if "estimator__era_stride" in chunk_params:
+                    set_overrides["estimator__era_stride"] = 1
+                elif "era_stride" in chunk_params:
+                    set_overrides["era_stride"] = 1
+            if set_overrides:
+                step_model.set_params(**set_overrides)
+            step_model.fit(X_fit, y_fit)
 
-        val_chunk_mask = np.isin(val_era_arr, chunk_eras)
-        # Provide strictly causal feature-only warm-up context for eras in (settled_cutoff_era, forecast_origin_era)
-        # so rolling / MiniRocket sequence models don't suffer a cold-start across the settlement gap
-        gap_mask = (val_era_arr > settled_cutoff_era) & (val_era_arr < forecast_origin_era)
-        if bool(np.any(gap_mask)) and isinstance(X_validation, pd.DataFrame):
-            # Strip any target column from gap+chunk to guarantee zero target access during predict()
-            non_target_cols = [c for c in X_validation.columns if not str(c).startswith("target")]
-            X_gap = X_validation.loc[gap_mask, non_target_cols]
-            X_chunk = X_validation.loc[val_chunk_mask, non_target_cols]
-            X_pred_in = pd.concat([X_gap, X_chunk], axis=0, ignore_index=True)
-            chunk_preds_full = np.asarray(step_model.predict(X_pred_in), dtype=np.float64).ravel()
-            wf_preds[val_chunk_mask] = chunk_preds_full[len(X_gap) :]
-            del X_gap, X_chunk, X_pred_in
-        else:
-            wf_preds[val_chunk_mask] = step_model.predict(X_validation.loc[val_chunk_mask])
+            val_chunk_mask = np.isin(val_era_arr, chunk_eras)
+            # Provide strictly causal feature-only warm-up context for eras in (settled_cutoff_era, forecast_origin_era)
+            # so rolling / MiniRocket sequence models don't suffer a cold-start across the settlement gap
+            gap_mask = (val_era_arr > settled_cutoff_era) & (val_era_arr < forecast_origin_era)
+            if bool(np.any(gap_mask)) and isinstance(X_validation, pd.DataFrame):
+                # Strip any target column from gap+chunk to guarantee zero target access during predict()
+                non_target_cols = [c for c in X_validation.columns if not str(c).startswith("target")]
+                X_gap = X_validation.loc[gap_mask, non_target_cols]
+                X_chunk = X_validation.loc[val_chunk_mask, non_target_cols]
+                X_pred_in = pd.concat([X_gap, X_chunk], axis=0, ignore_index=True)
+                chunk_preds_full = np.asarray(step_model.predict(X_pred_in), dtype=np.float64).ravel()
+                wf_preds[val_chunk_mask] = chunk_preds_full[len(X_gap) :]
+                del X_gap, X_chunk, X_pred_in, chunk_preds_full
+            else:
+                wf_preds[val_chunk_mask] = step_model.predict(X_validation.loc[val_chunk_mask])
 
-        del X_fit, y_fit, step_model
+            del X_fit, y_fit, step_model
+            gc.collect()
+    finally:
+        if _bu_mod is not None and hasattr(_bu_mod, "set_extraction_cache_suspended"):
+            _bu_mod.set_extraction_cache_suspended(_prev_ext_suspended)
+        if _lgb_mod is not None and hasattr(_lgb_mod, "set_lgb_dataset_cache_suspended"):
+            _lgb_mod.set_lgb_dataset_cache_suspended(_prev_lgb_suspended)
+        gc.collect()
     return wf_preds
 
 
@@ -1785,6 +1999,64 @@ def infer_target_horizon_eras(target_col: str) -> int:
 VALID_DOWNSAMPLE_MODES = (None, "recent", "earliest", "uniform")
 VALID_VAL_DOWNSAMPLE_MODES = VALID_DOWNSAMPLE_MODES + ("same",)
 VALID_SCORE_VERSIONS = ("v0_default", "v1_skepta", "v2_skepta_mmc")
+CANONICAL_BASELINES: Tuple[str, ...] = ("bin_snapping", "lag_reversal", "persistence")
+BASELINE_DISPLAY_NAMES: Dict[str, str] = {
+    "bin_snapping": "Bin-Snapping",
+    "lag_reversal": "Lag-Reversal",
+    "persistence": "Persistence",
+}
+_BASELINE_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "bin_snapping": ("bin_snapping",),
+    "bin-snapping": ("bin_snapping",),
+    "binsnapping": ("bin_snapping",),
+    "baseline_a": ("bin_snapping",),
+    "lag_reversal": ("lag_reversal",),
+    "lag-reversal": ("lag_reversal",),
+    "lagreversal": ("lag_reversal",),
+    "baseline_e": ("lag_reversal",),
+    "persistence": ("persistence",),
+    "baseline_p": ("persistence",),
+    "all": CANONICAL_BASELINES,
+}
+
+
+def normalize_baseline_mode(baseline_mode: Any) -> Optional[Tuple[str, ...]]:
+    """Normalize `baseline_mode` into a deduplicated tuple of canonical names (`'bin_snapping'`, `'lag_reversal'`, `'persistence'`).
+
+    Accepts a single name (`'bin_snapping'`, `'lag_reversal'`, `'persistence'`, `'all'`), a comma/pipe-separated
+    string (`'bin_snapping, lag_reversal'`), a list/tuple/set of names (`['bin_snapping', 'persistence']`), or
+    legacy aliases (`'baseline_a'`, `'baseline_e'`, `'baseline_p'`, `'both'`).
+    """
+    if baseline_mode is None:
+        return None
+    if isinstance(baseline_mode, str):
+        raw_tokens = [tok.strip().lower() for tok in baseline_mode.replace("|", ",").split(",") if tok.strip()]
+    elif isinstance(baseline_mode, (list, tuple, set)):
+        raw_tokens = []
+        for item in baseline_mode:
+            for tok in str(item).replace("|", ",").split(","):
+                if tok.strip():
+                    raw_tokens.append(tok.strip().lower())
+    else:
+        raise ValueError(
+            "baseline_mode must be a baseline name, comma-separated string, or list/tuple of "
+            "['bin_snapping', 'lag_reversal', 'persistence'] (or 'all')."
+        )
+    if not raw_tokens:
+        raise ValueError(
+            "baseline_mode cannot be empty; choose from ['bin_snapping', 'lag_reversal', 'persistence'] or 'all'."
+        )
+    resolved: List[str] = []
+    for tok in raw_tokens:
+        if tok not in _BASELINE_ALIASES:
+            raise ValueError(
+                f"Unknown baseline {tok!r}; choose from 'bin_snapping', 'lag_reversal', 'persistence', 'all' "
+                "(as a string, comma-separated string, or list)."
+            )
+        for canon in _BASELINE_ALIASES[tok]:
+            if canon not in resolved:
+                resolved.append(canon)
+    return tuple(resolved)
 
 
 def build_experiment_setup(
@@ -1792,8 +2064,8 @@ def build_experiment_setup(
     target_col: str = "target",
     feature_set: str = "small",
     era_stride: Union[str, int, None] = "auto",
-    model_tag: str = "baselines_ae",
-    baseline_mode: Optional[str] = None,
+    model_tag: str = "baselines",
+    baseline_mode: Optional[Any] = None,
     search_mode: str = "bayes",
     score_version: str = "v0_default",
     eval_mode: str = "both",
@@ -1832,6 +2104,8 @@ def build_experiment_setup(
     error_abs_bins: Tuple[float, float] = (0.125, 0.375),
     extraction_cache_enabled: bool = True,
     extraction_cache_max_entries: int = 4,
+    memory_guard_enabled: bool = True,
+    memory_guard_min_free_gb: float = 3.0,
     force_reload_data_cache: bool = False,
     use_wandb: bool = False,
     wandb_project: str = "numerai-baselines",
@@ -1845,7 +2119,15 @@ def build_experiment_setup(
     clean_eval = str(eval_mode).strip().lower()
     clean_wf_win = str(walk_forward_window).strip().lower()
     clean_weight = str(era_weighting).strip().lower() if era_weighting is not None else None
-    clean_baseline = str(baseline_mode).strip().lower() if baseline_mode is not None else None
+    resolved_baselines = normalize_baseline_mode(baseline_mode)
+    if resolved_baselines is None:
+        clean_baseline: Any = None
+    elif resolved_baselines == CANONICAL_BASELINES and isinstance(baseline_mode, str) and baseline_mode.strip().lower() == "all":
+        clean_baseline = "all"
+    elif len(resolved_baselines) == 1 and isinstance(baseline_mode, str):
+        clean_baseline = resolved_baselines[0]
+    else:
+        clean_baseline = list(resolved_baselines)
     clean_downsample_mode = (
         None
         if downsample_mode in (None, False, "None", "none", "null", "")
@@ -1860,8 +2142,6 @@ def build_experiment_setup(
     downsample_frac_val = float(downsample_frac)
     val_downsample_frac_raw = None if val_downsample_frac is None else float(val_downsample_frac)
 
-    if clean_baseline is not None and clean_baseline not in ("baseline_a", "baseline_e", "persistence", "both", "all"):
-        raise ValueError("baseline_mode must be 'baseline_a', 'baseline_e', 'persistence', 'both', or 'all'")
     if clean_search not in ("grid", "bayes"):
         raise ValueError("search_mode must be 'grid' or 'bayes'")
     if clean_score_version not in VALID_SCORE_VERSIONS:
@@ -1981,6 +2261,11 @@ def build_experiment_setup(
             f"Consider era_stride={horizon} or era_weighting='uniqueness'."
         )
 
+    configure_memory_guard(
+        enabled=bool(memory_guard_enabled),
+        min_free_gb=float(memory_guard_min_free_gb),
+    )
+
     cfg: Dict[str, Any] = {
         "data_version": data_version,
         "era_tag": resolved_era_tag,
@@ -2025,6 +2310,8 @@ def build_experiment_setup(
         "error_abs_bins": error_abs_bins,
         "extraction_cache_enabled": bool(extraction_cache_enabled),
         "extraction_cache_max_entries": int(extraction_cache_max_entries),
+        "memory_guard_enabled": bool(memory_guard_enabled),
+        "memory_guard_min_free_gb": float(memory_guard_min_free_gb),
         "force_reload_data_cache": bool(force_reload_data_cache),
         "use_wandb": bool(use_wandb),
         "wandb_project": wandb_project,
@@ -2036,6 +2323,7 @@ def build_experiment_setup(
     }
     if clean_baseline is not None:
         cfg["baseline_mode"] = clean_baseline
+        cfg["selected_baselines"] = list(resolved_baselines) if resolved_baselines is not None else []
     return cfg
 
 
@@ -2393,6 +2681,12 @@ def candidate_score(
         f"Dip {fold_pnl['money_drawdown_pct']:.2f}%), Pos Eras {pos_era_pct:.1f}%, "
         f"Dir Acc {dir_acc_pct:.1f}%{acc_tag}"
     )
+    # Per-iteration / per-fold teardown: release heavy CV fold state on the scored trial clone and run GC
+    for _attr in ("_wf_train_X_", "_wf_train_y_", "_wf_train_eras_"):
+        if hasattr(inner_est, _attr):
+            setattr(inner_est, _attr, None)
+    del preds, targets
+    gc.collect()
     return float(score_val)
 
 

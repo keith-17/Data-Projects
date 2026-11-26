@@ -796,6 +796,95 @@ class TestPhase1ModelAndNotebookRegressions(unittest.TestCase):
                     f"Undefined names detected in {nb_name}: {undefined_refs}",
                 )
 
+    def test_baseline_mode_canonical_names_and_list_or_csv_selection(self) -> None:
+        from utils import normalize_baseline_mode
+
+        self.assertEqual(normalize_baseline_mode("bin_snapping"), ("bin_snapping",))
+        self.assertEqual(normalize_baseline_mode("lag_reversal"), ("lag_reversal",))
+        self.assertEqual(normalize_baseline_mode("persistence"), ("persistence",))
+        self.assertEqual(
+            normalize_baseline_mode("bin_snapping, lag_reversal"),
+            ("bin_snapping", "lag_reversal"),
+        )
+        self.assertEqual(
+            normalize_baseline_mode(["persistence", "bin_snapping", "persistence"]),
+            ("persistence", "bin_snapping"),
+        )
+        self.assertEqual(
+            normalize_baseline_mode("all"),
+            ("bin_snapping", "lag_reversal", "persistence"),
+        )
+        # Backward-compatible aliases (without 'both')
+        self.assertEqual(normalize_baseline_mode("baseline_a"), ("bin_snapping",))
+        self.assertEqual(normalize_baseline_mode("baseline_e"), ("lag_reversal",))
+        with self.assertRaises(ValueError):
+            normalize_baseline_mode("both")
+
+        cfg_list = build_experiment_setup(baseline_mode=["lag_reversal", "persistence"])
+        self.assertEqual(cfg_list["selected_baselines"], ["lag_reversal", "persistence"])
+        cfg_csv = build_experiment_setup(baseline_mode="bin_snapping, persistence")
+        self.assertEqual(cfg_csv["selected_baselines"], ["bin_snapping", "persistence"])
+        with self.assertRaises(ValueError):
+            normalize_baseline_mode([])
+        with self.assertRaises(ValueError):
+            normalize_baseline_mode("bin_snapping, unknown_model")
+
+    def test_memory_guard_explicit_toggle_and_fail_safe(self) -> None:
+        from utils import check_memory_budget, configure_memory_guard
+
+        try:
+            # Explicit boolean toggle OFF bypasses even absurdly large estimates
+            cfg_off = build_experiment_setup(memory_guard_enabled=False, memory_guard_min_free_gb=3.0)
+            self.assertFalse(cfg_off["memory_guard_enabled"])
+            self.assertTrue(check_memory_budget(10 * (1024 ** 4), context="test_disabled"))
+
+            # Explicit boolean toggle ON raises MemoryError so BayesSearchCV/GridSearchCV assigns error_score=-1.0
+            cfg_on = build_experiment_setup(memory_guard_enabled=True, memory_guard_min_free_gb=3.0)
+            self.assertTrue(cfg_on["memory_guard_enabled"])
+            with self.assertRaises(MemoryError):
+                check_memory_budget(10 * (1024 ** 4), context="test_oom_candidate")
+        finally:
+            configure_memory_guard(enabled=True, min_free_gb=3.0)
+
+    def test_lag_reversal_and_bin_snapping_batched_predict_exact_and_cache_teardown(self) -> None:
+        from baseline_utils import _EXTRACTION_CACHE, clear_extraction_cache, configure_extraction_cache
+        from utils import candidate_score, walk_forward_predict
+
+        df, feat_cols = make_synthetic_numerai_panel(n_eras=10, n_tickers=12, n_features=6, seed=7)
+        X = df[["era", "numerai_ticker"] + feat_cols].copy()
+        y = df["target"].copy()
+
+        # Verify LagReversalEstimator batched predict matches exact (X - mu) @ w including NaNs
+        est = LagReversalEstimator(lag=1, top_k=None, center_features=True).fit(X, y)
+        X_val = X.copy()
+        X_val[feat_cols[0]] = X_val[feat_cols[0]].astype(np.float32)
+        X_val.loc[X_val.index[0], feat_cols[0]] = np.nan
+        preds = est.predict(X_val)
+        raw_mat = X_val[list(est.feature_names_in_)].to_numpy(dtype=np.float64)
+        clean_mat = np.where(np.isfinite(raw_mat), raw_mat, est.feature_means_)
+        expected = (clean_mat - est.feature_means_) @ est.weights_
+        np.testing.assert_allclose(preds, expected, atol=1e-6)
+
+        # Verify walk_forward_predict suspends _EXTRACTION_CACHE so it does not pollute cache
+        configure_extraction_cache(enabled=True, max_entries=2)
+        clear_extraction_cache()
+        tr_mask = df["era"] <= 6
+        va_mask = df["era"] > 6
+        wf_est = BinSnappingEstimator(extractor=NumeraiExtractions(top_k=4), top_k=4)
+        _ = walk_forward_predict(
+            wf_est,
+            X.loc[tr_mask], y.loc[tr_mask], df.loc[tr_mask, "era"],
+            X.loc[va_mask], y.loc[va_mask], df.loc[va_mask, "era"],
+            step_eras=2, target_horizon_eras=1, era_stride=1,
+        )
+        self.assertEqual(len(_EXTRACTION_CACHE), 0)
+
+        # Verify candidate_score clears _wf_train_X_ on the scored estimator
+        cv_est = BinSnappingEstimator(top_k=4, walk_forward_step_eras=2, target_horizon_eras=1).fit(X.loc[tr_mask], y.loc[tr_mask])
+        self.assertIsNotNone(cv_est._wf_train_X_)
+        _ = candidate_score(cv_est, X.loc[va_mask], y.loc[va_mask])
+        self.assertIsNone(cv_est._wf_train_X_)
+
 
 if __name__ == "__main__":
     unittest.main()

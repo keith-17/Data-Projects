@@ -23,7 +23,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.linear_model import SGDRegressor
 
 from baseline_utils import BaseNumeraiEstimator
-from utils import NumeraiExtractions, _decode_structured
+from utils import NumeraiExtractions, _decode_structured, check_memory_budget
 
 try:
     from sktime.transformations.panel.rocket import MiniRocket as SktimeMiniRocket
@@ -423,6 +423,10 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         starts = np.flatnonzero(change_mask)
         ends = np.append(starts[1:], n_rows)
 
+        check_memory_budget(
+            n_rows * n_cols * seq_len * 4,
+            context=f"MiniRocketNumeraiEstimator._build_sequence_tensor({n_rows}x{n_cols}x{seq_len})",
+        )
         out_tensor = np.empty((n_rows, n_cols, seq_len), dtype=np.float32)
         tail_buffer: Dict[str, Tuple[np.ndarray, np.ndarray]] = {} if is_fit else getattr(self, "ticker_tail_buffer_", {})
         lag_offsets = (np.arange(seq_len - 1, -1, -1, dtype=np.int64)) * int(train_step)
@@ -892,9 +896,11 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
     def predict(self, X: Any) -> np.ndarray:
         if not hasattr(self, "rocket_") or not hasattr(self, "coef_"):
             raise ValueError("MiniRocketNumeraiEstimator must be fitted before calling predict.")
-        feature_matrix, era_values = self._prepare_predict_matrix(X)
-        tickers = self._extract_tickers(X, len(feature_matrix))
-        sub_matrix = np.asarray(feature_matrix[:, self.channel_indices_], dtype=np.float32)
+        features_df, era_values = self._prepare_predict_df(X)
+        tickers = self._extract_tickers(X, len(features_df))
+        # Slice only the selected MiniRocket channels BEFORE converting to float32 (avoids 11 GB full-matrix copy on feature_set='all')
+        sub_matrix = features_df[list(self.channel_names_)].to_numpy(dtype=np.float32, copy=False)
+        del features_df
         X_tensor = self._build_sequence_tensor(
             sub_matrix,
             era_values,
@@ -903,7 +909,7 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
             is_fit=False,
         )
         raw_pred = self._predict_tensor(X_tensor)
-        del X_tensor, sub_matrix, feature_matrix
+        del X_tensor, sub_matrix
         return self._apply_prediction_transform(raw_pred, era_values)
 
 

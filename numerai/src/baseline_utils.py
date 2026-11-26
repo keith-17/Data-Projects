@@ -25,6 +25,7 @@ from utils import (
     _all_numeric_dtypes,
     _decode_structured,
     _safe_autocorr,
+    check_memory_budget,
     compute_feature_target_correlations,
 )
 
@@ -33,6 +34,14 @@ _EXTRACTION_CACHE_CONFIG: Dict[str, Any] = {
     "enabled": True,
     "max_entries": 4,
 }
+_EXTRACTION_CACHE_SUSPENDED: bool = False
+
+
+def set_extraction_cache_suspended(suspended: bool) -> bool:
+    """Temporarily suspend reading/writing `_EXTRACTION_CACHE` (e.g. inside `walk_forward_predict`)."""
+    global _EXTRACTION_CACHE_SUSPENDED
+    _EXTRACTION_CACHE_SUSPENDED = bool(suspended)
+    return _EXTRACTION_CACHE_SUSPENDED
 
 
 def configure_extraction_cache(enabled: bool = True, max_entries: int = 4) -> Dict[str, Any]:
@@ -262,7 +271,11 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
                 n_samples = len(X_df)
 
         if self.extractor is not None:
-            cache_enabled = bool(_EXTRACTION_CACHE_CONFIG["enabled"]) and int(_EXTRACTION_CACHE_CONFIG["max_entries"]) > 0
+            cache_enabled = (
+                (not _EXTRACTION_CACHE_SUSPENDED)
+                and bool(_EXTRACTION_CACHE_CONFIG["enabled"])
+                and int(_EXTRACTION_CACHE_CONFIG["max_entries"]) > 0
+            )
             if cache_enabled:
                 cache_key = _build_extraction_cache_key(self.extractor, X_df, era_values, target_values)
                 if cache_key in _EXTRACTION_CACHE:
@@ -309,6 +322,11 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
 
         feature_matrix: Optional[np.ndarray] = None
         if return_matrix:
+            item_b = np.dtype(matrix_dtype).itemsize if matrix_dtype is not None else 4
+            check_memory_budget(
+                len(features_df) * len(feature_names) * item_b,
+                context=f"{type(self).__name__}._prepare_fit_inputs",
+            )
             if matrix_dtype is None:
                 feature_matrix = features_df.to_numpy(copy=False)
             else:
@@ -577,14 +595,25 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
     def predict(self, X: Any) -> np.ndarray:
         if not hasattr(self, "bin_table_"):
             raise ValueError("BinSnappingEstimator must be fitted before calling predict.")
-        feature_matrix, era_values = self._prepare_predict_matrix(X)
+        features_df, era_values = self._prepare_predict_df(X)
+        selected_cols = list(self.selected_feature_names_)
+        sub_df = features_df[selected_cols]
+        n_rows = len(sub_df)
         n_bins = self.bin_table_.shape[1]
-        bin_indices = self._snap_features_to_bins(
-            feature_matrix[:, self.selected_indices_],
-            n_bins=n_bins,
-            rescale_from_5=bool(getattr(self, "rescale_from_5_", False)),
-        )
-        raw_pred = self._compute_raw_snapped_pred(bin_indices)
+        rescale = bool(getattr(self, "rescale_from_5_", False))
+        raw_pred = np.empty(n_rows, dtype=np.float64)
+        batch_rows = 32_768
+        for start_r in range(0, n_rows, batch_rows):
+            end_r = min(n_rows, start_r + batch_rows)
+            chunk_vals = sub_df[start_r:end_r].to_numpy(dtype=np.float32, copy=False)
+            bin_indices = self._snap_features_to_bins(
+                chunk_vals,
+                n_bins=n_bins,
+                rescale_from_5=rescale,
+            )
+            raw_pred[start_r:end_r] = self._compute_raw_snapped_pred(bin_indices)
+            del chunk_vals, bin_indices
+        del sub_df, features_df
         return self._apply_prediction_transform(raw_pred, era_values)
 
 
@@ -654,6 +683,10 @@ class LagReversalEstimator(BaseNumeraiEstimator):
             X, y, sample_weight=sample_weight, eras=eras
         )
         n_features = len(feature_names)
+        check_memory_budget(
+            len(raw_features) * n_features * 8,
+            context="LagReversalEstimator.fit",
+        )
         finite_mask = np.isfinite(raw_features)
         if sample_weights is not None:
             row_w = np.where(np.isfinite(sample_weights) & (sample_weights > 0.0), sample_weights, 0.0).astype(np.float64)
@@ -835,10 +868,37 @@ class LagReversalEstimator(BaseNumeraiEstimator):
     def predict(self, X: Any) -> np.ndarray:
         if not hasattr(self, "weights_"):
             raise ValueError("LagReversalEstimator must be fitted before calling predict.")
-        raw_features, era_values = self._prepare_predict_matrix(X)
-        clean_features = np.where(np.isfinite(raw_features), raw_features, self.feature_means_)
-        adjusted_features = (clean_features - self.feature_means_) if self.center_features else clean_features
-        raw_pred = adjusted_features @ self.weights_
+        features_df, era_values = self._prepare_predict_df(X)
+        n_rows = len(features_df)
+        active_idx = np.flatnonzero(np.abs(self.weights_) > 0.0)
+        if len(active_idx) == 0 or n_rows == 0:
+            del features_df
+            return self._apply_prediction_transform(np.zeros(n_rows, dtype=np.float64), era_values)
+
+        active_cols = [str(self.feature_names_in_[i]) for i in active_idx]
+        active_w = self.weights_[active_idx].astype(np.float64, copy=False)
+        active_mu = self.feature_means_[active_idx].astype(np.float64, copy=False)
+        center_offset = float(np.dot(active_mu, active_w)) if self.center_features else 0.0
+        sub_df = features_df[active_cols]
+        is_int_sub = all(
+            isinstance(dt, np.dtype) and np.issubdtype(dt, np.integer)
+            for dt in sub_df.dtypes
+        )
+
+        # Row-batched exact float64 dot product using (X - mu) @ w = X @ w - mu . w (avoids ~55 GB full-matrix copies)
+        raw_pred = np.empty(n_rows, dtype=np.float64)
+        batch_rows = 32_768
+        for start_r in range(0, n_rows, batch_rows):
+            end_r = min(n_rows, start_r + batch_rows)
+            chunk_f64 = sub_df[start_r:end_r].to_numpy(dtype=np.float64, copy=True)
+            if not is_int_sub:
+                bad_mask = ~np.isfinite(chunk_f64)
+                if np.any(bad_mask):
+                    bad_rows, bad_cols = np.nonzero(bad_mask)
+                    chunk_f64[bad_rows, bad_cols] = active_mu[bad_cols]
+            raw_pred[start_r:end_r] = (chunk_f64 @ active_w) - center_offset
+            del chunk_f64
+        del sub_df, features_df
         return self._apply_prediction_transform(raw_pred, era_values)
 
 
@@ -1183,7 +1243,7 @@ def _build_baseline_result_entry(
         "score_version": str(score_version),
         "corr_gap": train_eval["numerai_corr"] - val_eval["numerai_corr"],
         "sanity_status": val_eval["sanity_status"],
-        "validation_preds": val_preds,
+        "validation_preds": np.asarray(val_preds, dtype=np.float32),
         "validation_era_corrs": val_eval["numerai_era_corrs"],
         "params": estimator_params,
     }
@@ -1274,6 +1334,7 @@ def run_baseline(
     era_stride: int = 4,
     error_bin_config: Optional[Dict[str, Any]] = None,
     extraction_cache_config: Optional[Dict[str, Any]] = None,
+    memory_guard_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Dict[str, Any]], pd.DataFrame, Dict[str, Any], Any]:
     """Execute one baseline's default holdout, optional walk-forward holdout, and CV search in a picklable worker.
 
@@ -1285,6 +1346,7 @@ def run_baseline(
         compute_deflated_sharpe_ratio,
         compute_pbo_cscv,
         configure_error_binning,
+        configure_memory_guard,
         evaluate_numerai_predictions,
         make_candidate_scorer,
         prepare_tuned_pipeline,
@@ -1298,6 +1360,8 @@ def run_baseline(
         configure_error_binning(**error_bin_config)
     if extraction_cache_config is not None:
         configure_extraction_cache(**extraction_cache_config)
+    if memory_guard_config is not None:
+        configure_memory_guard(**memory_guard_config)
 
     val_era_dates: Optional[pd.Series] = None
     if isinstance(X_validation, pd.DataFrame) and "date" in X_validation.columns and "era" in X_validation.columns:
@@ -1397,6 +1461,7 @@ def run_baseline(
             estimator_params=default_params,
         )
 
+    clear_extraction_cache()
     cv_scorer = make_candidate_scorer(score_version=score_version)
     search = _build_baseline_cv_search(
         pipeline,
@@ -1432,6 +1497,7 @@ def run_baseline(
         "best_params": best_params,
     }
     del search
+    clear_extraction_cache()
 
     tuned_pipeline = prepare_tuned_pipeline(pipeline, best_params)
     tuned_model = clone(tuned_pipeline).fit(X_train_static, y_train_static)
@@ -1529,9 +1595,29 @@ def run_baseline(
             estimator_params=tuned_params,
         )
 
+    # Strip any retained training buffers from `tuned_model` and clear extraction cache before returning
+    tuned_est = tuned_model.named_steps["estimator"] if hasattr(tuned_model, "named_steps") else tuned_model
+    for _buf_attr in ("_wf_train_X_", "_wf_train_y_", "_wf_train_eras_"):
+        if hasattr(tuned_est, _buf_attr):
+            setattr(tuned_est, _buf_attr, None)
+    tuned_ext = getattr(tuned_est, "extractor_", None)
+    if tuned_ext is not None:
+        for _ext_attr in ("ticker_tail_df_", "era_means_tail_"):
+            if hasattr(tuned_ext, _ext_attr):
+                setattr(tuned_ext, _ext_attr, None)
+
     del X_train_static, y_train_static, train_eras_static, tuned_train_preds
+    clear_extraction_cache()
     gc.collect()
     return baseline_name, results_entries, cv_results_df, search_summary_row, tuned_model
+
+
+def _resolve_baseline_artifact_key(container: Mapping[str, Any], candidates: Tuple[str, ...]) -> Optional[str]:
+    """Return the first matching baseline key present in `container` (supports both new and legacy display names)."""
+    for key in candidates:
+        if key in container:
+            return key
+    return None
 
 
 def extract_baseline_interpretability(
@@ -1543,27 +1629,30 @@ def extract_baseline_interpretability(
     artifacts: Dict[str, Any] = {}
     cap = max(1, int(top_n))
 
-    if "Baseline A (Bin-Snapping)" in fitted_models:
-        est_a = fitted_models["Baseline A (Bin-Snapping)"].named_steps["estimator"]
+    key_bin = _resolve_baseline_artifact_key(fitted_models, ("Bin-Snapping", "Baseline A (Bin-Snapping)"))
+    if key_bin is not None:
+        est_a = fitted_models[key_bin].named_steps["estimator"]
         lookup_df = pd.DataFrame(est_a.lookup_table_).T
         lookup_df.columns = [f"bin_{bin_index}" for bin_index in lookup_df.columns]
         lookup_df["train_corr"] = est_a.selected_corrs_
-        artifacts["Baseline A (Bin-Snapping)"] = {
+        artifacts[key_bin] = {
             "total_features": int(len(lookup_df)),
             "lookup_table_df": lookup_df.head(cap).copy(),
         }
 
-    if "Baseline E (Lag-Reversal)" in fitted_models:
-        est_e = fitted_models["Baseline E (Lag-Reversal)"].named_steps["estimator"]
-        artifacts["Baseline E (Lag-Reversal)"] = {
+    key_lag = _resolve_baseline_artifact_key(fitted_models, ("Lag-Reversal", "Baseline E (Lag-Reversal)"))
+    if key_lag is not None:
+        est_e = fitted_models[key_lag].named_steps["estimator"]
+        artifacts[key_lag] = {
             "n_kept_signals": int((est_e.inversion_signs_ > 0).sum()),
             "n_inverted_signals": int((est_e.inversion_signs_ < 0).sum()),
             "rule_summary_df": est_e.rule_summary_.head(cap).copy(),
         }
 
-    if "Baseline P (Persistence)" in fitted_models:
-        est_p = fitted_models["Baseline P (Persistence)"].named_steps["estimator"]
-        artifacts["Baseline P (Persistence)"] = {
+    key_pers = _resolve_baseline_artifact_key(fitted_models, ("Persistence", "Baseline P (Persistence)"))
+    if key_pers is not None:
+        est_p = fitted_models[key_pers].named_steps["estimator"]
+        artifacts[key_pers] = {
             "persistence_mode": est_p.persistence_mode,
             "persistence_lag": est_p.persistence_lag,
             "global_mean": float(est_p.global_mean_),
@@ -1590,26 +1679,29 @@ def display_baseline_interpretability(
     except ImportError:
         plt = None
 
-    if "Baseline A (Bin-Snapping)" in interpretability:
-        info_a = interpretability["Baseline A (Bin-Snapping)"]
+    key_bin = _resolve_baseline_artifact_key(interpretability, ("Bin-Snapping", "Baseline A (Bin-Snapping)"))
+    if key_bin is not None:
+        info_a = interpretability[key_bin]
         lookup_table_df = info_a["lookup_table_df"]
         display_compact_dataframe(
             lookup_table_df.head(15),
-            title=f"Baseline A Learned Lookup Table (top {info_a['total_features']} features):",
+            title=f"Bin-Snapping Learned Lookup Table (top {info_a['total_features']} features):",
         )
 
-    if "Baseline E (Lag-Reversal)" in interpretability:
-        info_e = interpretability["Baseline E (Lag-Reversal)"]
+    key_lag = _resolve_baseline_artifact_key(interpretability, ("Lag-Reversal", "Baseline E (Lag-Reversal)"))
+    if key_lag is not None:
+        info_e = interpretability[key_lag]
         print(
-            f"Baseline E Signal Rules | kept (+1)={info_e['n_kept_signals']} | "
+            f"Lag-Reversal Signal Rules | kept (+1)={info_e['n_kept_signals']} | "
             f"inverted (-1)={info_e['n_inverted_signals']}"
         )
         display_compact_dataframe(info_e["rule_summary_df"].head(20))
 
-    if "Baseline P (Persistence)" in interpretability:
-        info_p = interpretability["Baseline P (Persistence)"]
+    key_pers = _resolve_baseline_artifact_key(interpretability, ("Persistence", "Baseline P (Persistence)"))
+    if key_pers is not None:
+        info_p = interpretability[key_pers]
         print(
-            f"Baseline P (Persistence) | mode={info_p['persistence_mode']} | "
+            f"Persistence | mode={info_p['persistence_mode']} | "
             f"lag={info_p['persistence_lag']} | global_mean={info_p['global_mean']:.4f} | "
             f"tracked_tickers={info_p['tracked_tickers']}"
         )
@@ -1617,8 +1709,8 @@ def display_baseline_interpretability(
 
     if plt is not None:
         out_dir = Path(results_dir) if results_dir is not None else None
-        if "Baseline E (Lag-Reversal)" in interpretability:
-            top_rule_df = interpretability["Baseline E (Lag-Reversal)"]["rule_summary_df"].head(20).copy()
+        if key_lag is not None:
+            top_rule_df = interpretability[key_lag]["rule_summary_df"].head(20).copy()
             top_rule_df["abs_weight"] = top_rule_df["effective_weight"].abs()
             plot_rule_df = top_rule_df.sort_values("abs_weight", ascending=True)
             fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
@@ -1626,15 +1718,15 @@ def display_baseline_interpretability(
             ax_imp.barh(plot_rule_df["feature"], plot_rule_df["effective_weight"], color=bar_colors, alpha=0.85)
             ax_imp.axvline(0.0, color="#64748b", linewidth=0.9)
             ax_imp.set_xlabel("Effective Signed Weight")
-            ax_imp.set_title("Top 20 Baseline E Features by Effective Weight")
+            ax_imp.set_title("Top 20 Lag-Reversal Features by Effective Weight")
             fig_imp.tight_layout()
             if save_results and out_dir is not None:
                 out_dir.mkdir(parents=True, exist_ok=True)
-                fig_imp.savefig(out_dir / f"{timestamp}_{experiment_name}_baseline_e_weights.png", dpi=140)
+                fig_imp.savefig(out_dir / f"{timestamp}_{experiment_name}_lag_reversal_weights.png", dpi=140)
             plt.show()
             plt.close(fig_imp)
-        elif "Baseline A (Bin-Snapping)" in interpretability:
-            top_bin_df = interpretability["Baseline A (Bin-Snapping)"]["lookup_table_df"].head(20).copy()
+        elif key_bin is not None:
+            top_bin_df = interpretability[key_bin]["lookup_table_df"].head(20).copy()
             top_bin_df["abs_corr"] = top_bin_df["train_corr"].abs()
             plot_bin_df = top_bin_df.sort_values("abs_corr", ascending=True)
             fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
@@ -1642,13 +1734,23 @@ def display_baseline_interpretability(
             ax_imp.barh(plot_bin_df.index, plot_bin_df["train_corr"], color=bar_colors, alpha=0.85)
             ax_imp.axvline(0.0, color="#64748b", linewidth=0.9)
             ax_imp.set_xlabel("Training Target Correlation")
-            ax_imp.set_title("Top 20 Baseline A Features by Training Correlation")
+            ax_imp.set_title("Top 20 Bin-Snapping Features by Training Correlation")
             fig_imp.tight_layout()
             if save_results and out_dir is not None:
                 out_dir.mkdir(parents=True, exist_ok=True)
-                fig_imp.savefig(out_dir / f"{timestamp}_{experiment_name}_baseline_a_corrs.png", dpi=140)
+                fig_imp.savefig(out_dir / f"{timestamp}_{experiment_name}_bin_snapping_corrs.png", dpi=140)
             plt.show()
             plt.close(fig_imp)
+
+
+def _baseline_name_to_slug(baseline_name: Any) -> str:
+    """Map a baseline display name (new or legacy) to a clean filename slug."""
+    low = str(baseline_name).strip().lower()
+    if "bin-snapping" in low or "bin_snapping" in low or "baseline a" in low:
+        return "bin_snapping"
+    if "lag-reversal" in low or "lag_reversal" in low or "baseline e" in low:
+        return "lag_reversal"
+    return "persistence"
 
 
 def extract_cv_analysis_artifacts(
@@ -1685,11 +1787,7 @@ def extract_cv_analysis_artifacts(
         if save_results and out_dir is not None:
             out_dir.mkdir(parents=True, exist_ok=True)
             if include_model_slug:
-                baseline_slug = (
-                    "baseline_a"
-                    if "Baseline A" in str(baseline_name)
-                    else ("baseline_e" if "Baseline E" in str(baseline_name) else "persistence")
-                )
+                baseline_slug = _baseline_name_to_slug(baseline_name)
                 cv_filename = f"{timestamp}_{experiment_name}_{baseline_slug}_{search_mode}_cv.csv"
             else:
                 cv_filename = f"{timestamp}_{experiment_name}_{search_mode}_cv.csv"
