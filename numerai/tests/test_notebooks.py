@@ -201,6 +201,15 @@ class TestNotebookStructureAndStandards(unittest.TestCase):
                 with self.subTest(notebook=nb_name, symbol=sym):
                     self.assertIn(sym, cell1_src)
 
+    def test_minirocket_interpretability_receives_feature_group_mapping(self) -> None:
+        nb = json.loads((NOTEBOOKS_DIR / "minirocket_unity.ipynb").read_text(encoding="utf-8"))
+        notebook_src = "\n".join("".join(cell.get("source", [])) for cell in nb.get("cells", []))
+        self.assertIn(
+            "extract_minirocket_interpretability(fitted_default_models, model_name=model_name, "
+            "feature_groups=unity_feature_groups_dict)",
+            notebook_src,
+        )
+
 
 class TestBaselineNotebookUtils(unittest.TestCase):
     """Unit tests for baseline_unity.ipynb helpers and estimators in src/baseline_utils.py."""
