@@ -779,25 +779,45 @@ class TestPhase1ModelAndNotebookRegressions(unittest.TestCase):
                         continue
                     tree = ast.parse(src, filename=f"{nb_name}:cell_{cell_idx}")
 
-                    # Collect names bound inside this cell (imports, assignments, loop vars, comprehension targets, except names)
-                    cell_bound = set()
-                    for node in ast.walk(tree):
-                        if isinstance(node, (ast.Import, ast.ImportFrom)):
-                            for alias in node.names:
-                                cell_bound.add((alias.asname or alias.name).split(".")[0])
-                        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                            cell_bound.add(node.id)
-                        elif isinstance(node, ast.ExceptHandler) and node.name:
-                            cell_bound.add(node.name)
-                        elif isinstance(node, ast.arg):
-                            cell_bound.add(node.arg)
+                    # Walk top-level statements in order so `del x` removes `x` from `defined`
+                    # and use-after-del NameErrors are caught across and within cells.
+                    for stmt in tree.body:
+                        stmt_bound = set()
+                        for node in ast.walk(stmt):
+                            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                                for alias in node.names:
+                                    stmt_bound.add((alias.asname or alias.name).split(".")[0])
+                            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                                stmt_bound.add(node.id)
+                            elif isinstance(node, ast.ExceptHandler) and node.name:
+                                stmt_bound.add(node.name)
+                            elif isinstance(node, ast.arg):
+                                stmt_bound.add(node.arg)
+                            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                                stmt_bound.add(node.name)
 
-                    scope = defined | cell_bound
-                    for node in ast.walk(tree):
-                        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                            if node.id not in scope:
-                                undefined_refs.append((cell_idx, node.id))
-                    defined |= cell_bound
+                        scope = defined | stmt_bound
+                        for node in ast.walk(stmt):
+                            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                                if node.id not in scope:
+                                    undefined_refs.append((cell_idx, node.id))
+
+                        defined |= stmt_bound
+                        for node in ast.walk(stmt):
+                            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
+                                defined.discard(node.id)
+                            elif (
+                                isinstance(node, ast.Call)
+                                and isinstance(node.func, ast.Attribute)
+                                and node.func.attr == "pop"
+                                and isinstance(node.func.value, ast.Call)
+                                and isinstance(node.func.value.func, ast.Name)
+                                and node.func.value.func.id == "globals"
+                                and node.args
+                                and isinstance(node.args[0], ast.Constant)
+                                and isinstance(node.args[0].value, str)
+                            ):
+                                defined.discard(node.args[0].value)
 
                 self.assertEqual(
                     undefined_refs,
