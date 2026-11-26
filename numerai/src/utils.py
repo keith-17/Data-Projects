@@ -121,7 +121,7 @@ _MEMORY_GUARD_CONFIG: Dict[str, Any] = {
 
 _TIME_GUARD_CONFIG: Dict[str, Any] = {
     "enabled": True,
-    "max_candidate_seconds": 3600.0,
+    "max_candidate_seconds": 1800.0,
 }
 
 _TF_BACKEND_CACHE: Dict[str, Any] = {
@@ -168,7 +168,7 @@ def configure_memory_guard(
 
 def configure_time_guard(
     enabled: bool = True,
-    max_candidate_seconds: float = 3600.0,
+    max_candidate_seconds: float = 1800.0,
 ) -> Dict[str, Any]:
     """Configure the explicit per-candidate wall-clock time fail-safe (`enabled=False` turns it off completely)."""
     _TIME_GUARD_CONFIG["enabled"] = bool(enabled)
@@ -2229,7 +2229,7 @@ def build_experiment_setup(
     kaggle_dataset: str = "svendaj/numerai-data-v6-0-unity",
     cv_strategy: str = "timeseries",
     target_horizon_eras: Optional[int] = None,
-    walk_forward_step_eras: int = 20,
+    walk_forward_step_eras: int = 52,
     walk_forward_window: str = "expanding",
     era_weighting: Optional[str] = None,
     recency_decay: float = 0.005,
@@ -2246,7 +2246,7 @@ def build_experiment_setup(
     memory_guard_enabled: bool = True,
     memory_guard_min_free_gb: float = 3.0,
     time_guard_enabled: bool = True,
-    max_candidate_seconds: float = 3600.0,
+    max_candidate_seconds: float = 1800.0,
     force_reload_data_cache: bool = False,
     use_wandb: bool = False,
     wandb_project: str = "numerai-baselines",

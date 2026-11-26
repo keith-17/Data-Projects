@@ -1133,16 +1133,16 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             utils.check_time_budget(time.perf_counter() - 1.0, context="slow_candidate_test")
 
-        # Restore default 1-hour guard via build_experiment_setup
+        # Restore default 30-minute guard via build_experiment_setup
         cfg = utils.build_experiment_setup(
             target_col="target",
             feature_set="small",
             model_tag="lgbm",
             time_guard_enabled=True,
-            max_candidate_seconds=3600.0,
+            max_candidate_seconds=1800.0,
         )
         self.assertTrue(cfg["time_guard_enabled"])
-        self.assertEqual(cfg["max_candidate_seconds"], 3600.0)
+        self.assertEqual(cfg["max_candidate_seconds"], 1800.0)
 
         timing_df = pd.DataFrame({
             "candidate_id": [0, 1, 2, 3, 4, 5, 6, 7],
@@ -1157,7 +1157,7 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
             tmp_dir = Path(tmp)
             summary_df = utils.plot_candidate_timing_analysis(
                 artifacts,
-                max_candidate_seconds=3600.0,
+                max_candidate_seconds=1800.0,
                 results_dir=tmp_dir,
                 timestamp="20261126",
                 experiment_name="unit",
@@ -1170,7 +1170,7 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
             self.assertAlmostEqual(float(row["median_s"]), 16.5, places=1)
             self.assertGreater(float(row["q75_s"]), float(row["median_s"]))
             self.assertGreaterEqual(int(row["suggested_timeout_s"]), 60)
-            self.assertEqual(int(row["configured_timeout_s"]), 3600)
+            self.assertEqual(int(row["configured_timeout_s"]), 1800)
             out_png = tmp_dir / "20261126_unit_lightgbm_regressor_candidate_timing_analysis.png"
             self.assertTrue(out_png.is_file())
 

@@ -1433,7 +1433,7 @@ def run_baseline(
     verbose: int = 3,
     error_score: Any = -1.0,
     n_jobs: int = 1,
-    walk_forward_step_eras: int = 20,
+    walk_forward_step_eras: int = 52,
     walk_forward_window: str = "expanding",
     target_horizon_eras: int = 4,
     era_stride: int = 4,
@@ -1441,7 +1441,7 @@ def run_baseline(
     extraction_cache_config: Optional[Dict[str, Any]] = None,
     memory_guard_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Dict[str, Any]], pd.DataFrame, Dict[str, Any], Any]:
-    """Execute one baseline's default holdout, optional walk-forward holdout, and CV search in a picklable worker.
+    """Execute one baseline's static default holdout, CV search, and optional tuned walk-forward holdout in a picklable worker.
 
     Configures error binning and resets/collects the process-local `_CV_FOLD_METRIC_LOG` inside the worker so
     parallel execution under `joblib` (`loky`) preserves all extended CV metrics without loss.
@@ -1525,43 +1525,6 @@ def run_baseline(
             val_preds=val_preds,
             val_pnl=val_pnl,
             val_dsr_info=val_dsr_info,
-            score_version=str(score_version),
-            estimator_params=default_params,
-        )
-
-    if eval_mode in ("walk_forward", "both"):
-        wf_preds = walk_forward_predict(
-            pipeline,
-            X_train,
-            y_train,
-            train_eras,
-            X_validation,
-            y_validation,
-            validation_eras,
-            step_eras=walk_forward_step_eras,
-            window_mode=walk_forward_window,
-            target_horizon_eras=target_horizon_eras,
-            era_stride=era_stride,
-        )
-        wf_eval = evaluate_numerai_predictions(
-            y_validation,
-            wf_preds,
-            eras=validation_eras,
-            features_df=X_validation,
-            feature_columns=feature_columns,
-            label=f"{baseline_name} — Walk-Forward Validation Scores",
-            verbose=True,
-        )
-        wf_pnl = simulate_stake_pnl(wf_eval["numerai_era_corrs"], era_dates=val_era_dates)
-        wf_dsr_info = compute_deflated_sharpe_ratio(wf_eval["numerai_era_corrs"], [wf_eval["numerai_sharpe"]])
-        wf_variant_name = f"{baseline_name} [Walk-Forward]"
-        results_entries[wf_variant_name] = _build_baseline_result_entry(
-            variant_name=wf_variant_name,
-            train_eval=train_eval,
-            val_eval=wf_eval,
-            val_preds=wf_preds,
-            val_pnl=wf_pnl,
-            val_dsr_info=wf_dsr_info,
             score_version=str(score_version),
             estimator_params=default_params,
         )
