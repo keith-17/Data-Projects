@@ -137,25 +137,41 @@ _TF_BACKEND_CACHE: Dict[str, Any] = {
 
 
 def get_tf_backend() -> Optional[Any]:
-    """Lazily import TensorFlow once per process for accelerated linear algebra / tensor ops.
+    """Lazily import TensorFlow once per process ONLY when a GPU is available.
 
-    Enables GPU memory growth when GPUs are present so TensorFlow does not pre-allocate all VRAM.
-    Returns `None` cleanly if TensorFlow is not installed.
+    On CPU-only environments, returns `None` immediately without importing TensorFlow (avoiding
+    ~20s import/CUDA init overhead, extra RAM, and slower CPU dispatch vs. NumPy BLAS).
     """
     if _TF_BACKEND_CACHE["checked"]:
         return _TF_BACKEND_CACHE["module"]
     _TF_BACKEND_CACHE["checked"] = True
     try:
+        import shutil
+        import subprocess
+
+        has_nvidia_smi = shutil.which("nvidia-smi") is not None
+        if not has_nvidia_smi:
+            _TF_BACKEND_CACHE["module"] = None
+            return None
+        probe = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=3)
+        if probe.returncode != 0 or "GPU " not in (probe.stdout or ""):
+            _TF_BACKEND_CACHE["module"] = None
+            return None
+
         os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
         import tensorflow as tf_mod
 
-        try:
-            for gpu in tf_mod.config.list_physical_devices("GPU"):
+        gpus = tf_mod.config.list_physical_devices("GPU")
+        if not gpus:
+            _TF_BACKEND_CACHE["module"] = None
+            return None
+        for gpu in gpus:
+            try:
                 tf_mod.config.experimental.set_memory_growth(gpu, True)
-        except Exception:
-            pass
+            except Exception:
+                pass
         _TF_BACKEND_CACHE["module"] = tf_mod
-    except ImportError:
+    except Exception:
         _TF_BACKEND_CACHE["module"] = None
     return _TF_BACKEND_CACHE["module"]
 

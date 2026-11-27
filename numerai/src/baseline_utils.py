@@ -736,12 +736,16 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
             self.global_mean_ = float(np.mean(target_values)) if n_rows > 0 else 0.5
         wy_arr = w_arr * np.asarray(target_values, dtype=np.float64).ravel()
 
-        # Use TensorFlow oneDNN/cuBLAS 5-GEMM when problem size justifies TF dispatch (>=500k elements); else NumPy BLAS 5-GEMM
+        # Use TensorFlow cuBLAS 5-GEMM only when a GPU is available and problem size justifies dispatch; else NumPy BLAS
         tf_mod = None
         if n_rows * n_selected >= 500_000:
             try:
-                import tensorflow as tf_mod  # type: ignore[no-redef]
-            except ImportError:
+                from utils import get_tf_backend
+
+                _cand_tf = get_tf_backend()
+                if _cand_tf is not None and _cand_tf.config.list_physical_devices("GPU"):
+                    tf_mod = _cand_tf
+            except Exception:
                 tf_mod = None
 
         w_sum = np.zeros((n_selected, n_bins), dtype=np.float64)
@@ -774,12 +778,7 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
 
         self.bin_table_ = bin_table
         self.weighted_bin_table_ = self._build_weighted_bin_table()
-        self.lookup_table_: Dict[str, Dict[int, float]] = {
-            self.selected_feature_names_[feature_pos]: {
-                bin_index: float(bin_table[feature_pos, bin_index]) for bin_index in range(n_bins)
-            }
-            for feature_pos in range(n_selected)
-        }
+        self._lookup_table_cache_: Optional[Dict[str, Dict[int, float]]] = None
         if self.bias_correction not in (None, False, "None", "none", ""):
             raw_train_pred = np.empty(n_rows, dtype=np.float64)
             for start_r in range(0, n_rows, batch_rows):
@@ -798,6 +797,24 @@ class BinSnappingEstimator(BaseNumeraiEstimator):
         del w_arr, wy_arr, w_sum, wy_sum, sub_df, features_df
         gc.collect()
         return self
+
+    @property
+    def lookup_table_(self) -> Dict[str, Dict[int, float]]:
+        """Lazily build the per-feature bin lookup dictionary on demand (avoids CV fold dict overhead)."""
+        cached = getattr(self, "_lookup_table_cache_", None)
+        if cached is not None:
+            return cached
+        bin_table = getattr(self, "bin_table_", None)
+        names = getattr(self, "selected_feature_names_", None)
+        if bin_table is None or names is None:
+            raise AttributeError("BinSnappingEstimator must be fitted before accessing lookup_table_.")
+        n_bins = int(bin_table.shape[1])
+        built = {
+            names[feature_pos]: {bin_index: float(bin_table[feature_pos, bin_index]) for bin_index in range(n_bins)}
+            for feature_pos in range(len(names))
+        }
+        self._lookup_table_cache_ = built
+        return built
 
     def predict(self, X: Any) -> np.ndarray:
         aborted = self._aborted_predict(X)
