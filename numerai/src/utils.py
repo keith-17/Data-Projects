@@ -4148,6 +4148,82 @@ def _compute_wallet_ylim(
     return y_lo, y_hi
 
 
+def _shade_financial_quarters(
+    ax: Any,
+    x_vals: Sequence[Any],
+    *,
+    era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
+    era_ids: Optional[Sequence[Any]] = None,
+    shade_color: str = "#e2e8f0",
+    shade_alpha: float = 0.30,
+) -> None:
+    """Add alternating vertical shading for financial quarters when the x-axis spans at least 1 year."""
+    if x_vals is None or len(x_vals) < 2:
+        return
+
+    x_arr = np.asarray(x_vals)
+    is_dt = pd.api.types.is_datetime64_any_dtype(x_arr)
+    if not is_dt and len(x_arr) > 0:
+        first_val = x_arr[0]
+        if isinstance(first_val, (pd.Timestamp, np.datetime64)):
+            is_dt = True
+
+    if is_dt:
+        dt_idx = pd.DatetimeIndex(pd.to_datetime(x_arr, errors="coerce")).dropna()
+        if len(dt_idx) < 2 or (dt_idx.max() - dt_idx.min()).days < 365:
+            return
+        q_starts = pd.date_range(
+            start=dt_idx.min().to_period("Q").start_time,
+            end=dt_idx.max() + pd.offsets.QuarterEnd(1),
+            freq="QS",
+        )
+        min_dt, max_dt = dt_idx.min(), dt_idx.max()
+        for idx in range(len(q_starts) - 1):
+            q_start, q_end = q_starts[idx], q_starts[idx + 1]
+            q_num = q_start.year * 4 + (q_start.quarter - 1)
+            if q_num % 2 == 1:
+                lo, hi = max(q_start, min_dt), min(q_end, max_dt)
+                if hi > lo:
+                    ax.axvspan(lo, hi, color=shade_color, alpha=shade_alpha, zorder=0, lw=0)
+        return
+
+    # Numeric x-axis: map via era_dates if available, otherwise fall back to 13-era (~quarter) blocks.
+    x_num = np.asarray(x_arr, dtype=np.float64)
+    q_ids: Optional[np.ndarray] = None
+    if era_dates is not None:
+        date_map = era_dates.to_dict() if isinstance(era_dates, pd.Series) else dict(era_dates)
+        lookup_keys = era_ids if era_ids is not None else x_vals
+        mapped_dt = pd.DatetimeIndex(
+            [pd.to_datetime(date_map.get(k, pd.NaT), errors="coerce") for k in lookup_keys]
+        )
+        valid_dt = mapped_dt.dropna()
+        if len(valid_dt) >= 2 and (valid_dt.max() - valid_dt.min()).days >= 365:
+            q_ids = np.array(
+                [(ts.year * 4 + (ts.quarter - 1)) if pd.notna(ts) else -1 for ts in mapped_dt],
+                dtype=np.int64,
+            )
+
+    if q_ids is None:
+        if len(x_num) < 52:
+            return
+        q_ids = np.arange(len(x_num), dtype=np.int64) // 13
+
+    step = float(np.median(np.diff(x_num))) if len(x_num) > 1 else 1.0
+    if not np.isfinite(step) or step <= 0:
+        step = 1.0
+    x_min, x_max = float(x_num[0]), float(x_num[-1])
+    run_start = 0
+    for i in range(1, len(q_ids) + 1):
+        if i == len(q_ids) or q_ids[i] != q_ids[run_start]:
+            q_val = int(q_ids[run_start])
+            if q_val >= 0 and q_val % 2 == 1:
+                lo = max(x_min, float(x_num[run_start]) - 0.5 * step)
+                hi = min(x_max, float(x_num[i - 1]) + 0.5 * step)
+                if hi > lo:
+                    ax.axvspan(lo, hi, color=shade_color, alpha=shade_alpha, zorder=0, lw=0)
+            run_start = i
+
+
 def plot_stake_pnl_dashboard(
     per_era_corr: pd.Series,
     *,
@@ -4250,6 +4326,7 @@ def plot_stake_pnl_dashboard(
         ax.set_ylim(bottom=0.7 * start_cap)
     ax.set_xlabel("Time (Validation Era / Week)")
     ax.set_ylabel("Wallet Balance (£)")
+    _shade_financial_quarters(ax, x_vals, era_dates=era_dates)
     ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -4313,6 +4390,82 @@ def plot_stake_pnl_dashboard(
     del fig
     gc.collect()
     return pnl
+
+
+def plot_cumulative_profit_gain(
+    primary_equity: pd.Series,
+    baseline_equity: pd.Series,
+    *,
+    title: str = "Cumulative profit gain: Realistic Live vs. Conservative Floor",
+    ylabel: str = "Cumulative extra profit (£)",
+    xlabel: Optional[str] = None,
+    era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
+    save_path: Optional[Any] = None,
+) -> pd.Series:
+    """Plot cumulative extra £ profit of a primary staking equity curve over a baseline curve with zero-baseline shading."""
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+
+    if not isinstance(primary_equity, pd.Series) or not isinstance(baseline_equity, pd.Series):
+        return pd.Series(dtype=np.float64)
+
+    s_primary = pd.to_numeric(primary_equity, errors="coerce").dropna()
+    s_baseline = pd.to_numeric(baseline_equity, errors="coerce").dropna()
+    gain = (s_primary - s_baseline).dropna()
+    if len(gain) == 0:
+        return pd.Series(dtype=np.float64)
+
+    x_vals = gain.index.to_numpy()
+    y_vals = gain.to_numpy(dtype=np.float64)
+    is_dt = pd.api.types.is_datetime64_any_dtype(x_vals) or isinstance(x_vals[0], (pd.Timestamp, np.datetime64))
+
+    fig, ax = plt.subplots(figsize=(14.5, 4.8), facecolor="white")
+    ax.set_facecolor("white")
+
+    _shade_financial_quarters(ax, x_vals, era_dates=era_dates, era_ids=x_vals if not is_dt else None)
+    ax.axhline(0.0, color="#94a3b8", linewidth=0.9, alpha=0.65, zorder=1)
+    ax.fill_between(x_vals, y_vals, 0.0, color="#1f77b4", alpha=0.25, zorder=2)
+    ax.plot(x_vals, y_vals, color="#1f77b4", linewidth=2.4, zorder=3)
+
+    final_val = float(y_vals[-1])
+    val_label = f"£{final_val:,.0f}" if abs(final_val) >= 100.0 else f"£{final_val:,.2f}"
+    ax.annotate(
+        val_label,
+        xy=(x_vals[-1], final_val),
+        xytext=(-6, -14 if final_val >= 0.0 else 10),
+        textcoords="offset points",
+        ha="right",
+        va="top" if final_val >= 0.0 else "bottom",
+        fontsize=11.0,
+        fontweight="bold",
+        color="#1e293b",
+        zorder=5,
+    )
+
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"£{v:,.0f}"))
+    ax.set_title(title, loc="left", fontsize=13.0, fontweight="bold", pad=10, color="#1e293b")
+    ax.set_ylabel(ylabel, fontsize=11.0, color="#334155")
+    ax.set_xlabel(
+        xlabel or ("Validation Date (Alternating Financial Quarters)" if is_dt else "Validation Era"),
+        fontsize=11.0,
+        color="#334155",
+    )
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#334155")
+    ax.spines["bottom"].set_color("#334155")
+    ax.tick_params(colors="#334155")
+
+    fig.tight_layout()
+    if save_path is not None:
+        out_path = Path(save_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=140)
+    plt.show()
+    plt.close(fig)
+    del fig
+    gc.collect()
+    return gain
 
 
 def plot_stake_pnl_monte_carlo(
@@ -4952,6 +5105,7 @@ def plot_era_error_envelope(
     title: str = "Best Model",
     band_size: float = 0.15,
     is_best: bool = False,
+    era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
     save_path: Optional[Any] = None,
 ) -> pd.DataFrame:
     """Plot the directional error envelope across Numerai eras with max overforecast/underforecast peak callouts."""
@@ -5091,6 +5245,7 @@ def plot_era_error_envelope(
         ax.yaxis.set_major_formatter(FuncFormatter(_format_thousands_count_tick))
     else:
         ax.yaxis.set_major_formatter(FuncFormatter(_format_integer_count_tick))
+    _shade_financial_quarters(ax, era_index, era_dates=era_dates, era_ids=era_index)
     ax.grid(axis="y", color="#DDDDDD", linewidth=0.7)
     ax.set_axisbelow(True)
     ax.tick_params(length=0, labelsize=10)
@@ -6658,11 +6813,83 @@ def _extract_variant_era_corrs(entry: Any) -> pd.Series:
     return pd.Series(raw, dtype=np.float64).dropna().sort_index()
 
 
+def plot_residuals_vs_actual_scatter(
+    y_true: Any,
+    predictions_by_model: Mapping[str, Any],
+    *,
+    max_points: int = 6000,
+    random_state: int = 42,
+    save_path: Optional[Any] = None,
+) -> None:
+    """Plot side-by-side Residuals vs Actual scatter charts with a dashed y=0 reference line."""
+    import matplotlib.pyplot as plt
+
+    if not predictions_by_model:
+        return
+
+    actual = np.asarray(y_true, dtype=np.float64).ravel()
+    finite_actual = np.isfinite(actual)
+    items = list(predictions_by_model.items())
+    n_models = len(items)
+    if n_models == 0:
+        return
+
+    palette = ["#2e8b57", "#e07b00", "#2563eb", "#7c3aed"]
+    rng = np.random.default_rng(int(random_state))
+
+    fig, axes = plt.subplots(
+        1,
+        n_models,
+        figsize=(min(7.0 * n_models, 21.0), 5.0),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+        facecolor="white",
+    )
+    for idx, (ax, (name, entry)) in enumerate(zip(axes.flatten(), items)):
+        ax.set_facecolor("white")
+        pred = _extract_variant_predictions(entry)
+        valid = finite_actual & np.isfinite(pred)
+        a_v = actual[valid]
+        r_v = pred[valid] - a_v
+        if len(a_v) > max_points:
+            sample_idx = rng.choice(len(a_v), size=int(max_points), replace=False)
+            a_v = a_v[sample_idx]
+            r_v = r_v[sample_idx]
+
+        ax.scatter(a_v, r_v, alpha=0.55, s=24, color=palette[idx % len(palette)], edgecolors="none")
+        ax.axhline(0.0, color="black", linestyle="--", linewidth=1.3, zorder=3)
+        ax.set_title(f"{name}: Residuals vs Actual", fontsize=11.0, fontweight="bold")
+        ax.set_xlabel("Actual Target")
+        ax.set_ylabel("Residual: Predicted - Actual")
+        ax.yaxis.grid(True, color="grey", alpha=0.25)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    fig.suptitle(
+        "Residuals vs Actual Target (below 0 = under-predicting)",
+        fontsize=13.0,
+        fontweight="bold",
+        y=0.98,
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    if save_path is not None:
+        out_path = Path(save_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=140)
+    plt.show()
+    plt.close(fig)
+    del fig
+    gc.collect()
+
+
 def plot_cumulative_validation_corr(
     results_by_variant: Mapping[str, Mapping[str, Any]],
     *,
     best_variant_name: Optional[str] = None,
     title: str = "Cumulative Validation CORR Across Variants",
+    era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
     save_path: Optional[Any] = None,
 ) -> pd.DataFrame:
     """Plot Cumulative Validation CORR across all variants with the Train-CV-Locked Winner highlighted."""
@@ -6719,6 +6946,7 @@ def plot_cumulative_validation_corr(
     ax.set_xlabel("Validation Era")
     ax.set_ylabel("Cumulative Numerai CORR")
     ax.set_title(title, fontsize=12.5, fontweight="bold", pad=10)
+    _shade_financial_quarters(ax, x_pos, era_dates=era_dates, era_ids=cum_df.index.to_numpy())
     ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
@@ -6743,6 +6971,7 @@ def plot_rolling_validation_corr(
     window: int = 20,
     comparison_corrs: Optional[Mapping[str, pd.Series]] = None,
     title: str = "Rolling 20-Era Validation CORR",
+    era_dates: Optional[Union[pd.Series, Mapping[Any, Any]]] = None,
     save_path: Optional[Any] = None,
 ) -> pd.Series:
     """Plot a Rolling 20-Era Validation CORR chart with `y=0` reference and positive/negative regime shading."""
@@ -6838,6 +7067,7 @@ def plot_rolling_validation_corr(
     ax.set_xticklabels(era_labels[::tick_step], rotation=40, ha="right", fontsize=8.5)
     ax.set_xlabel("Validation Era")
     ax.set_ylabel(f"Rolling {eff_window}-Era Mean CORR")
+    _shade_financial_quarters(ax, x_pos, era_dates=era_dates, era_ids=rolling_s.index.to_numpy())
     ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
