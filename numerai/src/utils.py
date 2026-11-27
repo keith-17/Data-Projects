@@ -1014,6 +1014,25 @@ def compute_feature_target_correlations(
 
     if method == "pandas_mean":
         if era_series is not None and len(era_series) == len(clean_df):
+            if n_features >= 128 and (os.cpu_count() or 1) > 1:
+                from concurrent.futures import ThreadPoolExecutor
+
+                n_workers = min(4, os.cpu_count() or 1)
+                col_chunks = [feature_cols[i::n_workers] for i in range(n_workers) if feature_cols[i::n_workers]]
+                y_arr_f64 = clean_target.to_numpy(dtype=np.float64)
+                with ThreadPoolExecutor(max_workers=len(col_chunks)) as pool:
+                    chunk_res = list(
+                        pool.map(
+                            lambda cols_sub: pd.Series(
+                                _pandas_mean_corr_vectorized(clean_df[cols_sub], y_arr_f64, era_series),
+                                index=cols_sub,
+                                dtype=np.float64,
+                            ),
+                            col_chunks,
+                        )
+                    )
+                if all(r is not None for r in chunk_res):
+                    return pd.concat(chunk_res).reindex(feature_cols).astype(np.float64)
             vec_corrs = _pandas_mean_corr_vectorized(clean_df, clean_target.to_numpy(dtype=np.float64), era_series)
             if vec_corrs is not None:
                 return pd.Series(vec_corrs, index=feature_cols, dtype=np.float64)
@@ -1023,13 +1042,20 @@ def compute_feature_target_correlations(
     if method == "numerai_mean":
         if era_series is not None and len(era_series) == len(clean_df):
             eras = pd.Series(np.asarray(era_series).ravel(), index=clean_df.index)
-            per_era_num_corrs: List[pd.Series] = []
-            for _, era_features in clean_df.groupby(eras, sort=True):
-                era_target = clean_target.loc[era_features.index]
-                if len(era_features) < 3 or _is_constant_1d(era_target.to_numpy(dtype=np.float64, copy=False)):
-                    continue
-                per_era_num_corrs.append(_safe_numerai_corr_frame(era_features, era_target))
-            if per_era_num_corrs:
+            era_groups = [
+                (era_features, clean_target.loc[era_features.index])
+                for _, era_features in clean_df.groupby(eras, sort=True)
+                if len(era_features) >= 3 and not _is_constant_1d(clean_target.loc[era_features.index].to_numpy(dtype=np.float64, copy=False))
+            ]
+            if era_groups:
+                n_workers = min(4, os.cpu_count() or 1, len(era_groups))
+                if n_workers > 1:
+                    from concurrent.futures import ThreadPoolExecutor
+
+                    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                        per_era_num_corrs = list(pool.map(lambda grp: _safe_numerai_corr_frame(grp[0], grp[1]), era_groups))
+                else:
+                    per_era_num_corrs = [_safe_numerai_corr_frame(ef, et) for ef, et in era_groups]
                 return pd.concat(per_era_num_corrs, axis=1).mean(axis=1).reindex(feature_cols).fillna(0.0)
         return _safe_numerai_corr_frame(clean_df, clean_target).reindex(feature_cols).fillna(0.0)
 
@@ -2222,6 +2248,7 @@ def export_diagnostics_predictions(
 
 
 _CV_FOLD_METRIC_LOG: List[Dict[str, Any]] = []
+_CV_METRIC_LOG_LOCK = threading.Lock()
 
 ERROR_BIN_LABELS: Tuple[str, ...] = (
     "Extreme Underforecast",
@@ -2731,7 +2758,8 @@ def prepare_tuned_pipeline(pipeline: Any, best_params: Mapping[str, Any]) -> Any
 
 def reset_cv_metric_log() -> None:
     """Clear the per-fold CV metric buffer before starting a new `GridSearchCV` / `BayesSearchCV` run."""
-    _CV_FOLD_METRIC_LOG.clear()
+    with _CV_METRIC_LOG_LOCK:
+        _CV_FOLD_METRIC_LOG.clear()
     with _ABORTED_CANDIDATE_LOCK:
         _ABORTED_CANDIDATE_KEYS.clear()
     set_active_fold_start(None)
@@ -2934,7 +2962,7 @@ def candidate_score(
 
     bin_shares = compute_error_bin_shares(targets, preds)
 
-    _CV_FOLD_METRIC_LOG.append({
+    _fold_metric_entry = {
         "score_version": effective_version,
         "requested_score_version": str(score_version or "v0_default").strip().lower(),
         "mmc_missing_fallback": bool(mmc_fallback),
@@ -2952,7 +2980,9 @@ def candidate_score(
         "corr_drawdown": corr_dd,
         "era_corrs": era_corrs,
         **bin_shares,
-    })
+    }
+    with _CV_METRIC_LOG_LOCK:
+        _CV_FOLD_METRIC_LOG.append(_fold_metric_entry)
 
     fold_pnl = (
         simulate_stake_pnl(era_corrs)
