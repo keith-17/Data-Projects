@@ -21,7 +21,14 @@ import pandas as pd
 from lightgbm import LGBMRegressor
 
 from baseline_utils import BaseNumeraiEstimator
-from utils import NumeraiExtractions, _decode_structured, check_memory_budget, check_time_budget
+from utils import (
+    NumeraiExtractions,
+    _decode_structured,
+    check_memory_budget,
+    check_time_budget,
+    get_active_fold_start,
+    is_cv_time_guard_active,
+)
 
 _LGB_DATASET_CACHE: "OrderedDict[str, lgb.Dataset]" = OrderedDict()
 _LGB_DATASET_CACHE_MAX = 2
@@ -98,12 +105,14 @@ class _LightGBMTimeGuardCallback:
     order = 99
     before_iteration = False
 
-    def __init__(self, start_time: float, context: str = "LightGBMNumeraiEstimator.fit", check_every: int = 10):
-        self.start_time = float(start_time)
+    def __init__(self, start_time: Optional[float], context: str = "LightGBMNumeraiEstimator.fit", check_every: int = 10):
+        self.start_time = None if start_time is None else float(start_time)
         self.context = str(context)
         self.check_every = max(1, int(check_every))
 
     def __call__(self, env: Any) -> None:
+        if self.start_time is None:
+            return
         iteration = int(getattr(env, "iteration", 0))
         if (iteration + 1) % self.check_every == 0:
             check_time_budget(self.start_time, context=self.context)
@@ -365,7 +374,7 @@ class LightGBMNumeraiEstimator(BaseNumeraiEstimator):
         sample_weight: Optional[Any] = None,
         eras: Optional[Any] = None,
     ) -> "LightGBMNumeraiEstimator":
-        fit_start_t = time.perf_counter()
+        fit_start_t = (get_active_fold_start() or time.perf_counter()) if is_cv_time_guard_active() else None
         features_df, _, target_values, _, sample_weights, era_values = self._prepare_fit_inputs(
             X, y, sample_weight=sample_weight, eras=eras, return_matrix=False
         )

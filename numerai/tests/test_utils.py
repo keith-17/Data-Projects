@@ -1237,6 +1237,146 @@ class TestSetupErrorBinningAndReporting(unittest.TestCase):
             utils.configure_time_guard(enabled=True, max_candidate_seconds=1800.0)
             utils.configure_memory_guard(enabled=True, min_free_gb=3.0)
 
+    def test_cv_fold_time_budget_aborts_candidate_and_skips_validation(self) -> None:
+        """Fold timeout chucks remaining folds of that candidate, and validation never times out."""
+        import time
+        from sklearn.model_selection import GridSearchCV
+        from sklearn.pipeline import Pipeline
+        from baseline_utils import BaseNumeraiEstimator
+
+        class _SlowCVDummyEstimator(BaseNumeraiEstimator):
+            fit_calls = 0
+
+            def __init__(self, sleep_s: float = 0.0, era_col: str = "era", target_col: str = "target"):
+                super().__init__(era_col=era_col, target_col=target_col)
+                self.sleep_s = float(sleep_s)
+
+            def fit(self, X, y, sample_weight=None, eras=None):
+                return self._fit_with_fail_safe(self._fit_impl, X, y, sample_weight=sample_weight, eras=eras)
+
+            def _fit_impl(self, X, y, sample_weight=None, eras=None):
+                type(self).fit_calls += 1
+                if self.sleep_s > 0.0:
+                    time.sleep(self.sleep_s)
+                    utils.check_time_budget(None, context="_SlowCVDummyEstimator._fit_impl")
+                self.mean_ = float(np.mean(y))
+                return self
+
+            def predict(self, X):
+                aborted = self._aborted_predict(X)
+                if aborted is not None:
+                    return aborted
+                vals = np.linspace(0.4, 0.6, len(X), dtype=np.float64)
+                return vals
+
+        rng = np.random.default_rng(7)
+        eras = np.repeat(np.arange(1, 21, dtype=np.int32), 20)
+        X = pd.DataFrame({
+            "era": eras,
+            "feature_a": rng.normal(size=len(eras)).astype(np.float32),
+            "feature_b": rng.normal(size=len(eras)).astype(np.float32),
+        })
+        y = pd.Series(rng.uniform(0.0, 1.0, size=len(eras)).astype(np.float32), name="target")
+        cv_splits = [
+            (np.arange(0, 120), np.arange(120, 180)),
+            (np.arange(120, 240), np.arange(240, 300)),
+            (np.arange(240, 360), np.arange(360, 400)),
+        ]
+
+        try:
+            # 1) Outside CV (validation), even tiny max_candidate_seconds must NEVER abort fit or walk_forward_predict
+            utils.configure_time_guard(enabled=True, max_candidate_seconds=1e-4)
+            utils._TIME_GUARD_CONFIG["cv_active"] = False
+            val_est = _SlowCVDummyEstimator(sleep_s=0.02)
+            val_est.fit(X.iloc[:200], y.iloc[:200])
+            self.assertIsNone(val_est._aborted_reason_)
+            wf_preds = walk_forward_predict(
+                Pipeline([("estimator", _SlowCVDummyEstimator(sleep_s=0.02))]),
+                X.iloc[:200],
+                y.iloc[:200],
+                pd.Series(eras[:200]),
+                X.iloc[200:],
+                y.iloc[200:],
+                pd.Series(eras[200:]),
+                step_eras=5,
+                target_horizon_eras=1,
+            )
+            self.assertEqual(len(wf_preds), 200)
+
+            # 2) Inside CV: fold 1 times out -> candidate is chucked away (folds 2 & 3 skip _fit_impl)
+            _SlowCVDummyEstimator.fit_calls = 0
+            utils.configure_time_guard(enabled=True, max_candidate_seconds=0.03)
+            pipe = Pipeline([("estimator", _SlowCVDummyEstimator())])
+            search = GridSearchCV(
+                estimator=pipe,
+                param_grid={"estimator__sleep_s": [0.05]},
+                scoring=utils.make_candidate_scorer(score_version="v1_skepta"),
+                cv=cv_splits,
+                refit=False,
+                error_score=-1.0,
+                n_jobs=1,
+            )
+            utils.reset_cv_metric_log()
+            search.fit(X, y)
+            res_df = utils.build_quick_results_df(search)
+            self.assertEqual(_SlowCVDummyEstimator.fit_calls, 1)
+            self.assertAlmostEqual(float(res_df.loc[0, "mean_test_score"]), -1.0)
+            self.assertFalse(utils.is_cv_time_guard_active())
+        finally:
+            utils._TIME_GUARD_CONFIG["cv_active"] = False
+            utils.set_active_fold_start(None)
+            utils.configure_time_guard(enabled=True, max_candidate_seconds=1800.0)
+
+    def test_parallel_walk_forward_and_chunked_val_loader_match_sequential(self) -> None:
+        """Parallel walk_forward_predict(n_jobs=2, val_loader=...) matches sequential n_jobs=1."""
+        from sklearn.pipeline import Pipeline
+        from baseline_utils import LagReversalEstimator
+
+        rng = np.random.default_rng(11)
+        tr_eras = np.repeat(np.arange(1, 11, dtype=np.int32), 15)
+        va_eras = np.repeat(np.arange(12, 24, dtype=np.int32), 15)
+        X_tr = pd.DataFrame({
+            "era": tr_eras,
+            "feature_a": rng.normal(size=len(tr_eras)).astype(np.float32),
+            "feature_b": rng.normal(size=len(tr_eras)).astype(np.float32),
+            "target": rng.uniform(0.0, 1.0, size=len(tr_eras)).astype(np.float32),
+        })
+        X_va = pd.DataFrame({
+            "era": va_eras,
+            "feature_a": rng.normal(size=len(va_eras)).astype(np.float32),
+            "feature_b": rng.normal(size=len(va_eras)).astype(np.float32),
+            "target": rng.uniform(0.0, 1.0, size=len(va_eras)).astype(np.float32),
+        })
+        feat_cols = ["era", "feature_a", "feature_b"]
+        pipe = Pipeline([("estimator", LagReversalEstimator(lag=1, top_k=2))])
+
+        seq_preds = walk_forward_predict(
+            pipe,
+            X_tr[feat_cols],
+            X_tr["target"],
+            pd.Series(tr_eras),
+            X_va[feat_cols],
+            X_va["target"],
+            pd.Series(va_eras),
+            step_eras=4,
+            target_horizon_eras=1,
+            n_jobs=1,
+        )
+        par_chunk_preds = walk_forward_predict(
+            pipe,
+            X_tr[feat_cols],
+            X_tr["target"],
+            pd.Series(tr_eras),
+            None,
+            None,
+            pd.Series(va_eras),
+            step_eras=4,
+            target_horizon_eras=1,
+            n_jobs=2,
+            val_loader=lambda eras_sub: X_va.loc[X_va["era"].isin(eras_sub)].reset_index(drop=True),
+        )
+        self.assertTrue(np.allclose(seq_preds, par_chunk_preds, atol=1e-12))
+
 
 if __name__ == "__main__":
     unittest.main()

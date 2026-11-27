@@ -529,7 +529,9 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         tail_buffer: Dict[str, Tuple[np.ndarray, np.ndarray]] = {} if is_fit else getattr(self, "ticker_tail_buffer_", {})
         lag_offsets = (np.arange(seq_len - 1, -1, -1, dtype=np.int64)) * int(train_step)
 
-        for s, e in zip(starts, ends):
+        for idx, (s, e) in enumerate(zip(starts, ends)):
+            if idx % 500 == 0:
+                check_time_budget(None, context="MiniRocketNumeraiEstimator._build_sequence_tensor")
             t_key = str(sorted_tickers[s])
             grp_eras = sorted_eras[s:e]  # (T,)
             grp_feats = sorted_feats[s:e]  # (T, C)
@@ -681,7 +683,7 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         Xty: Optional[np.ndarray] = None
         n_feat = 0
 
-        batch_t0 = time.perf_counter()
+        batch_t0 = None
         for start in range(0, n_rows, bs):
             check_time_budget(batch_t0, context="MiniRocketNumeraiEstimator._fit_ridge_batched")
             end = min(n_rows, start + bs)
@@ -813,7 +815,7 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         # Pass 1: feature mean/std
         sum_x: Optional[np.ndarray] = None
         sum_x2: Optional[np.ndarray] = None
-        batch_t0 = time.perf_counter()
+        batch_t0 = None
         for start in range(0, n_rows, bs):
             check_time_budget(batch_t0, context="MiniRocketNumeraiEstimator._fit_ridge_batched")
             end = min(n_rows, start + bs)
@@ -853,6 +855,7 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         for _ in range(2):
             perm = rng_sgd.permutation(n_rows)
             for start in range(0, n_rows, bs):
+                check_time_budget(None, context="MiniRocketNumeraiEstimator._fit_batched_sgd[pass2]")
                 batch_idx = perm[start : min(n_rows, start + bs)]
                 Z = self._transform_batch(X_tensor[batch_idx]).astype(np.float64, copy=False)
                 Z_std = (Z - mean_x) / scale_x
@@ -934,6 +937,7 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         rocket, active_backend = self._build_rocket_transformer(n_channels)
         self.active_backend_ = active_backend
 
+        check_time_budget(None, context="MiniRocketNumeraiEstimator.rocket_fit")
         # Fit MiniRocket quantile biases on a deterministic subsample of training sequences
         rng = np.random.default_rng(int(self.random_state))
         fit_n = min(n_rows, max(16, int(self.fit_sample_size)))
@@ -1040,7 +1044,7 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         # Fold standardization into effective weight vector for single BLAS matvec per batch
         eff_coef = self.coef_ / self.feature_scale_
         eff_intercept = self.intercept_ - float(np.dot(self.feature_mean_, eff_coef))
-        batch_t0 = time.perf_counter()
+        batch_t0 = None
         for start in range(0, n_rows, bs):
             check_time_budget(batch_t0, context="MiniRocketNumeraiEstimator._fit_ridge_batched")
             end = min(n_rows, start + bs)

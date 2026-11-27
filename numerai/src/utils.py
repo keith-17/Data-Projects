@@ -9,6 +9,7 @@ import inspect
 import json
 import os
 import sys
+import threading
 import time
 import warnings
 from datetime import datetime
@@ -123,7 +124,11 @@ _MEMORY_GUARD_CONFIG: Dict[str, Any] = {
 _TIME_GUARD_CONFIG: Dict[str, Any] = {
     "enabled": True,
     "max_candidate_seconds": 1800.0,
+    "cv_active": False,
 }
+_TIME_GUARD_TLS = threading.local()
+_ABORTED_CANDIDATE_LOCK = threading.Lock()
+_ABORTED_CANDIDATE_KEYS: set[str] = set()
 
 _TF_BACKEND_CACHE: Dict[str, Any] = {
     "checked": False,
@@ -177,24 +182,75 @@ def configure_time_guard(
     return dict(_TIME_GUARD_CONFIG)
 
 
+def is_cv_time_guard_active() -> bool:
+    """Return True only when time guard is enabled AND a CV search (`BayesSearchCV`/`GridSearchCV`) is active."""
+    return bool(_TIME_GUARD_CONFIG.get("enabled", True)) and bool(_TIME_GUARD_CONFIG.get("cv_active", False))
+
+
+def set_active_fold_start(start_time: Optional[float]) -> None:
+    """Set or clear the current thread's CV fold start timestamp."""
+    _TIME_GUARD_TLS.fold_start_t = None if start_time is None else float(start_time)
+
+
+def get_active_fold_start() -> Optional[float]:
+    """Return the current thread's CV fold start timestamp, or None outside CV folds."""
+    return getattr(_TIME_GUARD_TLS, "fold_start_t", None)
+
+
+def candidate_param_key(estimator: Any) -> str:
+    """Build a deterministic key for a CV candidate's hyperparameters."""
+    try:
+        params = estimator.get_params(deep=True)
+        items = sorted((str(k), repr(v)) for k, v in params.items())
+        return "|".join(f"{k}={v}" for k, v in items)
+    except Exception:
+        return repr(estimator)
+
+
+def mark_candidate_aborted(candidate_key: str) -> None:
+    """Record a candidate parameter signature as aborted so remaining CV folds are skipped immediately."""
+    if not candidate_key:
+        return
+    with _ABORTED_CANDIDATE_LOCK:
+        _ABORTED_CANDIDATE_KEYS.add(candidate_key)
+
+
+def is_candidate_aborted(candidate_key: str) -> bool:
+    """Return True if any earlier fold of this candidate already aborted."""
+    if not candidate_key:
+        return False
+    with _ABORTED_CANDIDATE_LOCK:
+        return candidate_key in _ABORTED_CANDIDATE_KEYS
+
+
 def check_time_budget(
-    start_time: Optional[float],
+    start_time: Optional[float] = None,
     *,
     context: str = "",
     max_seconds: Optional[float] = None,
 ) -> bool:
     """Fail-safe wall-clock check: raises `TimeoutError` if elapsed time exceeds `max_candidate_seconds`.
 
-    When `_TIME_GUARD_CONFIG['enabled']` is `False` (or `start_time` is None / limit <= 0), returns `True`.
-    Inside `BayesSearchCV` / `GridSearchCV` (`error_score=-1.0`), raising `TimeoutError` aborts only the
-    offending slow candidate cleanly instead of stalling the entire hyperparameter search.
+    When `_TIME_GUARD_CONFIG['enabled']` is `False` (or `start_time` is None and no active CV fold
+    start is set, or limit <= 0), returns `True`. When an active CV fold start timestamp is set and
+    `max_seconds` is None, uses the earlier of `start_time` and the fold start so sub-loops cannot
+    reset the fold's wall-clock budget.
     """
-    if not bool(_TIME_GUARD_CONFIG.get("enabled", True)) or start_time is None:
+    if not bool(_TIME_GUARD_CONFIG.get("enabled", True)):
         return True
+    active_fold_start = get_active_fold_start()
+    if start_time is None:
+        if active_fold_start is None:
+            return True
+        effective_start = float(active_fold_start)
+    elif active_fold_start is not None and max_seconds is None:
+        effective_start = min(float(start_time), float(active_fold_start))
+    else:
+        effective_start = float(start_time)
     limit_s = float(_TIME_GUARD_CONFIG["max_candidate_seconds"] if max_seconds is None else max_seconds)
     if limit_s <= 0.0:
         return True
-    elapsed_s = float(time.perf_counter() - float(start_time))
+    elapsed_s = float(time.perf_counter() - effective_start)
     if elapsed_s > limit_s:
         ctx = f"[{context}] " if context else ""
         msg = (
@@ -1305,6 +1361,8 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
                     prefix_groups.setdefault(grp_key, []).append(col)
                 groups_map = {grp: cols for grp, cols in prefix_groups.items() if len(cols) >= 2}
             for grp, grp_cols in groups_map.items():
+                if is_cv_time_guard_active():
+                    check_time_budget(None, context="NumeraiExtractions.transform")
                 sub_mat = base_features[grp_cols]
                 if "mean" in group_stat_tokens:
                     extra_cols[f"feature_{grp}_mean"] = np.clip(np.rint(sub_mat.mean(axis=1)), 0, 4).astype(np.int8)
@@ -1349,6 +1407,8 @@ class NumeraiExtractions(TransformerMixin, BaseEstimator):
         seq_top_n = max(1, int(self.sequence_top_n or 4))
 
         # Causal per-ticker time-series features (`rolling_mean`, `momentum_diff`, `weeks_since_high`, `rolling_rank`, `weeks_since_change`, `expanding_stats`, `raw_lags`)
+        if is_cv_time_guard_active():
+            check_time_budget(None, context="NumeraiExtractions.transform")
         if (
             self.ticker_features not in (None, False, "None", "none", "null", "")
             and era_vals is not None
@@ -1908,8 +1968,8 @@ def walk_forward_predict(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     train_eras: pd.Series,
-    X_validation: pd.DataFrame,
-    y_validation: pd.Series,
+    X_validation: Optional[pd.DataFrame],
+    y_validation: Optional[pd.Series],
     validation_eras: pd.Series,
     *,
     step_eras: int = 20,
@@ -1919,10 +1979,16 @@ def walk_forward_predict(
     settlement_buffer_eras: int = 0,
     balance_era_density: bool = True,
     random_state: int = 42,
+    enforce_time_budget: bool = False,
+    n_jobs: int = 1,
+    val_loader: Optional[Any] = None,
 ) -> np.ndarray:
     """Chronological walk-forward holdout evaluation respecting `target_horizon_eras` settlement lag,
-    optional `settlement_buffer_eras`, era-density equalization, double-stride prevention, and causal
-    feature-only gap context for rolling/sequence predictors."""
+    optional `settlement_buffer_eras`, era-density equalization, double-stride prevention, causal
+    feature-only gap context for rolling/sequence predictors, optional chunked `val_loader`, and
+    parallel step execution via `n_jobs`."""
+    from concurrent.futures import ThreadPoolExecutor
+
     train_era_arr = np.asarray(train_eras, dtype=np.int32).ravel()
     val_era_arr = np.asarray(validation_eras, dtype=np.int32).ravel()
     unique_val_eras = np.array(sorted(np.unique(val_era_arr)), dtype=np.int32)
@@ -1933,8 +1999,8 @@ def walk_forward_predict(
     mode = str(window_mode or "expanding").strip().lower()
     train_era_span = int(np.max(train_era_arr) - np.min(train_era_arr)) if len(train_era_arr) else 52
     rng = np.random.default_rng(int(random_state))
+    rng_lock = threading.Lock()
 
-    # Median rows per era in X_train to detect downsampling imbalance vs 100%-density validation eras
     if len(train_era_arr) > 0:
         _, tr_counts = np.unique(train_era_arr, return_counts=True)
         median_train_era_rows = int(np.median(tr_counts))
@@ -1942,9 +2008,12 @@ def walk_forward_predict(
         median_train_era_rows = 0
 
     y_train_s = pd.Series(np.asarray(y_train, dtype=np.float32).ravel(), index=X_train.index)
-    y_val_s = pd.Series(np.asarray(y_validation, dtype=np.float32).ravel(), index=X_validation.index)
+    y_val_s = (
+        pd.Series(np.asarray(y_validation, dtype=np.float32).ravel(), index=X_validation.index)
+        if (X_validation is not None and y_validation is not None)
+        else None
+    )
 
-    # Suspend per-process extraction/LGB caches during walk-forward steps (each step has a unique cutoff -> 0% cache hit rate)
     import sys
 
     _bu_mod = sys.modules.get("baseline_utils")
@@ -1956,109 +2025,154 @@ def walk_forward_predict(
     if _lgb_mod is not None and hasattr(_lgb_mod, "set_lgb_dataset_cache_suspended"):
         _lgb_mod.set_lgb_dataset_cache_suspended(True)
 
-    wf_preds = np.full(len(X_validation), float(np.mean(y_train_s)) if len(y_train_s) else 0.5, dtype=np.float64)
+    n_val_total = len(X_validation) if X_validation is not None else len(val_era_arr)
+    wf_preds = np.full(n_val_total, float(np.mean(y_train_s)) if len(y_train_s) else 0.5, dtype=np.float64)
     wf_start_t = time.perf_counter()
-    try:
-        for start_idx in range(0, len(unique_val_eras), step):
+    start_indices = list(range(0, len(unique_val_eras), step))
+
+    cpu_cnt = os.cpu_count() or 1
+    req_jobs = cpu_cnt if int(n_jobs) < 0 else max(1, int(n_jobs))
+    base_params = estimator.get_params(deep=True)
+    has_inner_threads = ("estimator__lgbm_n_jobs" in base_params) or ("lgbm_n_jobs" in base_params) or ("estimator__n_jobs" in base_params) or ("n_jobs" in base_params)
+    if req_jobs > 1 and len(start_indices) > 1:
+        eff_wf_jobs = min(2, req_jobs, len(start_indices)) if has_inner_threads else min(req_jobs, len(start_indices))
+    else:
+        eff_wf_jobs = 1
+    inner_threads = max(1, cpu_cnt // eff_wf_jobs) if (has_inner_threads and eff_wf_jobs > 1) else None
+
+    def _run_wf_step(start_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        if enforce_time_budget and is_cv_time_guard_active():
             check_time_budget(wf_start_t, context="walk_forward_predict")
-            chunk_eras = unique_val_eras[start_idx : start_idx + step]
-            forecast_origin_era = int(chunk_eras[0])
-            settled_cutoff_era = forecast_origin_era - horizon - buf
-            min_sliding_era = (settled_cutoff_era - max(1, train_era_span)) if mode == "sliding" else None
+        chunk_eras = unique_val_eras[start_idx : start_idx + step]
+        forecast_origin_era = int(chunk_eras[0])
+        settled_cutoff_era = forecast_origin_era - horizon - buf
+        min_sliding_era = (settled_cutoff_era - max(1, train_era_span)) if mode == "sliding" else None
 
-            train_mask = train_era_arr <= settled_cutoff_era
-            if min_sliding_era is not None:
-                train_mask = train_mask & (train_era_arr >= min_sliding_era)
+        train_mask = train_era_arr <= settled_cutoff_era
+        if min_sliding_era is not None:
+            train_mask = train_mask & (train_era_arr >= min_sliding_era)
 
-            settled_val_eras = unique_val_eras[unique_val_eras <= settled_cutoff_era]
-            if min_sliding_era is not None:
-                settled_val_eras = settled_val_eras[settled_val_eras >= min_sliding_era]
-            if stride > 1 and len(settled_val_eras) > 0:
-                settled_val_eras = settled_val_eras[::stride]
+        settled_val_eras = unique_val_eras[unique_val_eras <= settled_cutoff_era]
+        if min_sliding_era is not None:
+            settled_val_eras = settled_val_eras[settled_val_eras >= min_sliding_era]
+        if stride > 1 and len(settled_val_eras) > 0:
+            settled_val_eras = settled_val_eras[::stride]
 
-            has_train = bool(np.any(train_mask))
-            has_val_settled = len(settled_val_eras) > 0
+        has_train = bool(np.any(train_mask))
+        has_val_settled = len(settled_val_eras) > 0
+        val_chunk_mask = np.isin(val_era_arr, chunk_eras)
 
-            if not has_train and not has_val_settled:
-                # No settled historical eras exist prior to `settled_cutoff_era` — never leak unsettled `X_train`
-                continue
+        if not has_train and not has_val_settled:
+            return val_chunk_mask, np.full(int(np.sum(val_chunk_mask)), float(np.mean(y_train_s)) if len(y_train_s) else 0.5, dtype=np.float64)
 
-            val_fit_mask = np.isin(val_era_arr, settled_val_eras) if has_val_settled else np.zeros(len(val_era_arr), dtype=bool)
-            # Prevent 4x-100x era-density imbalance when X_train was downsampled while X_validation is 100% density
-            if balance_era_density and has_train and has_val_settled and median_train_era_rows > 0:
-                val_fit_indices = np.flatnonzero(val_fit_mask)
-                val_fit_eras_sub = val_era_arr[val_fit_indices]
-                _, vf_counts = np.unique(val_fit_eras_sub, return_counts=True)
-                if len(vf_counts) > 0 and float(np.median(vf_counts)) > 1.5 * float(median_train_era_rows):
-                    balanced_mask = np.zeros(len(val_era_arr), dtype=bool)
-                    for e_id in settled_val_eras:
-                        e_pos = np.flatnonzero(val_era_arr == e_id)
-                        if len(e_pos) > median_train_era_rows:
+        gap_eras = unique_val_eras[(unique_val_eras > settled_cutoff_era) & (unique_val_eras < forecast_origin_era)]
+
+        if val_loader is not None and X_validation is None:
+            needed_eras = sorted({int(e) for e in np.concatenate([settled_val_eras, gap_eras, chunk_eras])})
+            sub_val_df = val_loader(needed_eras)
+            sub_eras = pd.to_numeric(sub_val_df["era"], errors="coerce").to_numpy(dtype=np.int32)
+            target_name = getattr(y_train, "name", None) or "target"
+            sub_y = pd.Series(
+                pd.to_numeric(sub_val_df[target_name], errors="coerce").to_numpy(dtype=np.float32),
+                index=sub_val_df.index,
+            )
+            X_val_src = sub_val_df[[c for c in X_train.columns if c in sub_val_df.columns]]
+            y_val_src = sub_y
+            src_era_arr = sub_eras
+        else:
+            X_val_src = X_validation
+            y_val_src = y_val_s
+            src_era_arr = val_era_arr
+
+        val_fit_mask = np.isin(src_era_arr, settled_val_eras) if has_val_settled else np.zeros(len(src_era_arr), dtype=bool)
+        if balance_era_density and has_train and has_val_settled and median_train_era_rows > 0:
+            val_fit_indices = np.flatnonzero(val_fit_mask)
+            val_fit_eras_sub = src_era_arr[val_fit_indices]
+            _, vf_counts = np.unique(val_fit_eras_sub, return_counts=True)
+            if len(vf_counts) > 0 and float(np.median(vf_counts)) > 1.5 * float(median_train_era_rows):
+                balanced_mask = np.zeros(len(src_era_arr), dtype=bool)
+                for e_id in settled_val_eras:
+                    e_pos = np.flatnonzero(src_era_arr == e_id)
+                    if len(e_pos) > median_train_era_rows:
+                        with rng_lock:
                             pick = rng.choice(e_pos, size=median_train_era_rows, replace=False)
-                            balanced_mask[pick] = True
-                        else:
-                            balanced_mask[e_pos] = True
-                    val_fit_mask = balanced_mask
+                        balanced_mask[pick] = True
+                    else:
+                        balanced_mask[e_pos] = True
+                val_fit_mask = balanced_mask
 
-            if has_train and not has_val_settled:
-                if bool(np.all(train_mask)):
-                    X_fit = X_train
-                    y_fit = y_train_s
-                else:
-                    X_fit = X_train.loc[train_mask]
-                    y_fit = y_train_s.loc[train_mask]
-            elif not has_train and has_val_settled:
-                X_fit = X_validation.loc[val_fit_mask]
-                y_fit = y_val_s.loc[val_fit_mask]
+        if has_train and not has_val_settled:
+            if bool(np.all(train_mask)):
+                X_fit = X_train
+                y_fit = y_train_s
             else:
-                X_tr_part = X_train if bool(np.all(train_mask)) else X_train.loc[train_mask]
-                y_tr_part = y_train_s if bool(np.all(train_mask)) else y_train_s.loc[train_mask]
-                X_fit = pd.concat([X_tr_part, X_validation.loc[val_fit_mask]], axis=0, ignore_index=True)
-                y_fit = pd.concat([y_tr_part.reset_index(drop=True), y_val_s.loc[val_fit_mask].reset_index(drop=True)], axis=0, ignore_index=True)
-                del X_tr_part, y_tr_part
+                X_fit = X_train.loc[train_mask]
+                y_fit = y_train_s.loc[train_mask]
+        elif not has_train and has_val_settled:
+            X_fit = X_val_src.loc[val_fit_mask]
+            y_fit = y_val_src.loc[val_fit_mask]
+        else:
+            X_tr_part = X_train if bool(np.all(train_mask)) else X_train.loc[train_mask]
+            y_tr_part = y_train_s if bool(np.all(train_mask)) else y_train_s.loc[train_mask]
+            X_fit = pd.concat([X_tr_part, X_val_src.loc[val_fit_mask]], axis=0, ignore_index=True)
+            y_fit = pd.concat([y_tr_part.reset_index(drop=True), y_val_src.loc[val_fit_mask].reset_index(drop=True)], axis=0, ignore_index=True)
+            del X_tr_part, y_tr_part
 
-            if isinstance(X_fit, pd.DataFrame) and "era" in X_fit.columns and len(X_fit) > 0:
-                max_fit_era = int(pd.to_numeric(X_fit["era"], errors="coerce").max())
-                if max_fit_era > settled_cutoff_era:
-                    raise ValueError(
-                        f"Walk-forward leakage detected: max fit era ({max_fit_era}) > settled_cutoff_era ({settled_cutoff_era})."
-                    )
+        if isinstance(X_fit, pd.DataFrame) and "era" in X_fit.columns and len(X_fit) > 0:
+            max_fit_era = int(pd.to_numeric(X_fit["era"], errors="coerce").max())
+            if max_fit_era > settled_cutoff_era:
+                raise ValueError(
+                    f"Walk-forward leakage detected: max fit era ({max_fit_era}) > settled_cutoff_era ({settled_cutoff_era})."
+                )
 
-            step_model = clone(estimator)
-            chunk_params = step_model.get_params(deep=True)
-            set_overrides: Dict[str, Any] = {}
-            if "estimator__walk_forward_step_eras" in chunk_params:
-                set_overrides["estimator__walk_forward_step_eras"] = None
-            elif "walk_forward_step_eras" in chunk_params:
-                set_overrides["walk_forward_step_eras"] = None
-            # Prevent double-striding inside step_model when walk_forward_predict already strided settled eras
-            if stride > 1:
-                if "estimator__era_stride" in chunk_params:
-                    set_overrides["estimator__era_stride"] = 1
-                elif "era_stride" in chunk_params:
-                    set_overrides["era_stride"] = 1
-            if set_overrides:
-                step_model.set_params(**set_overrides)
-            step_model.fit(X_fit, y_fit)
+        step_model = clone(estimator)
+        chunk_params = step_model.get_params(deep=True)
+        set_overrides: Dict[str, Any] = {}
+        if "estimator__walk_forward_step_eras" in chunk_params:
+            set_overrides["estimator__walk_forward_step_eras"] = None
+        elif "walk_forward_step_eras" in chunk_params:
+            set_overrides["walk_forward_step_eras"] = None
+        if stride > 1:
+            if "estimator__era_stride" in chunk_params:
+                set_overrides["estimator__era_stride"] = 1
+            elif "era_stride" in chunk_params:
+                set_overrides["era_stride"] = 1
+        if inner_threads is not None:
+            for k in ("estimator__lgbm_n_jobs", "lgbm_n_jobs", "estimator__n_jobs", "n_jobs"):
+                if k in chunk_params:
+                    set_overrides[k] = inner_threads
+        if set_overrides:
+            step_model.set_params(**set_overrides)
+        step_model.fit(X_fit, y_fit)
 
-            val_chunk_mask = np.isin(val_era_arr, chunk_eras)
-            # Provide strictly causal feature-only warm-up context for eras in (settled_cutoff_era, forecast_origin_era)
-            # so rolling / MiniRocket sequence models don't suffer a cold-start across the settlement gap
-            gap_mask = (val_era_arr > settled_cutoff_era) & (val_era_arr < forecast_origin_era)
-            if bool(np.any(gap_mask)) and isinstance(X_validation, pd.DataFrame):
-                # Strip any target column from gap+chunk to guarantee zero target access during predict()
-                non_target_cols = [c for c in X_validation.columns if not str(c).startswith("target")]
-                X_gap = X_validation.loc[gap_mask, non_target_cols]
-                X_chunk = X_validation.loc[val_chunk_mask, non_target_cols]
-                X_pred_in = pd.concat([X_gap, X_chunk], axis=0, ignore_index=True)
-                chunk_preds_full = np.asarray(step_model.predict(X_pred_in), dtype=np.float64).ravel()
-                wf_preds[val_chunk_mask] = chunk_preds_full[len(X_gap) :]
-                del X_gap, X_chunk, X_pred_in, chunk_preds_full
-            else:
-                wf_preds[val_chunk_mask] = step_model.predict(X_validation.loc[val_chunk_mask])
+        src_chunk_mask = np.isin(src_era_arr, chunk_eras)
+        gap_mask = (src_era_arr > settled_cutoff_era) & (src_era_arr < forecast_origin_era)
+        if bool(np.any(gap_mask)) and isinstance(X_val_src, pd.DataFrame):
+            non_target_cols = [c for c in X_val_src.columns if not str(c).startswith("target")]
+            X_gap = X_val_src.loc[gap_mask, non_target_cols]
+            X_chunk = X_val_src.loc[src_chunk_mask, non_target_cols]
+            X_pred_in = pd.concat([X_gap, X_chunk], axis=0, ignore_index=True)
+            chunk_preds_full = np.asarray(step_model.predict(X_pred_in), dtype=np.float64).ravel()
+            out_preds = chunk_preds_full[len(X_gap) :]
+            del X_gap, X_chunk, X_pred_in, chunk_preds_full
+        else:
+            out_preds = np.asarray(step_model.predict(X_val_src.loc[src_chunk_mask]), dtype=np.float64).ravel()
 
-            del X_fit, y_fit, step_model
-            gc.collect()
+        del X_fit, y_fit, step_model
+        if val_loader is not None and X_validation is None:
+            del sub_val_df, sub_y, X_val_src
+        gc.collect()
+        return val_chunk_mask, out_preds
+
+    try:
+        if eff_wf_jobs > 1:
+            with ThreadPoolExecutor(max_workers=eff_wf_jobs) as pool:
+                for val_chunk_mask, out_preds in pool.map(_run_wf_step, start_indices):
+                    wf_preds[val_chunk_mask] = out_preds
+        else:
+            for start_idx in start_indices:
+                val_chunk_mask, out_preds = _run_wf_step(start_idx)
+                wf_preds[val_chunk_mask] = out_preds
     finally:
         if _bu_mod is not None and hasattr(_bu_mod, "set_extraction_cache_suspended"):
             _bu_mod.set_extraction_cache_suspended(_prev_ext_suspended)
@@ -2618,6 +2732,10 @@ def prepare_tuned_pipeline(pipeline: Any, best_params: Mapping[str, Any]) -> Any
 def reset_cv_metric_log() -> None:
     """Clear the per-fold CV metric buffer before starting a new `GridSearchCV` / `BayesSearchCV` run."""
     _CV_FOLD_METRIC_LOG.clear()
+    with _ABORTED_CANDIDATE_LOCK:
+        _ABORTED_CANDIDATE_KEYS.clear()
+    set_active_fold_start(None)
+    _TIME_GUARD_CONFIG["cv_active"] = True
 
 
 def compute_versioned_candidate_score(
@@ -2721,10 +2839,12 @@ def candidate_score(
                     window_mode=str(getattr(inner_est, "walk_forward_window", "expanding") or "expanding"),
                     target_horizon_eras=int(getattr(inner_est, "target_horizon_eras", 4) or 4),
                     era_stride=int(getattr(inner_est, "era_stride", 1) or 1),
+                    enforce_time_budget=True,
                 ),
                 dtype=np.float64,
             ).ravel()
         except (TimeoutError, MemoryError) as exc:
+            mark_candidate_aborted(candidate_param_key(inner_est))
             warnings.warn(
                 f"[FAIL-SAFE ABORT | walk_forward_predict] {exc}",
                 RuntimeWarning,
@@ -2733,7 +2853,18 @@ def candidate_score(
             print(f"  [FAIL-SAFE ABORT | walk_forward_predict] Returning constant fallback so CV assigns -1.0: {exc}")
             preds = np.full(len(targets), 0.5, dtype=np.float64)
     else:
-        preds = np.asarray(estimator.predict(X), dtype=np.float64).ravel()
+        try:
+            preds = np.asarray(estimator.predict(X), dtype=np.float64).ravel()
+        except (TimeoutError, MemoryError) as exc:
+            mark_candidate_aborted(candidate_param_key(inner_est))
+            warnings.warn(
+                f"[FAIL-SAFE ABORT | candidate_score.predict] {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            print(f"  [FAIL-SAFE ABORT | candidate_score.predict] Returning constant fallback so CV assigns -1.0: {exc}")
+            preds = np.full(len(targets), 0.5, dtype=np.float64)
+    set_active_fold_start(None)
     era_corrs = compute_per_era_numerai_corr(targets, preds, eras=eras)
     spearman_era_corrs = compute_per_era_spearman_corr(targets, preds, eras=eras)
 
@@ -4494,6 +4625,10 @@ def _strip_estimator_param_prefix(col_name: Any) -> str:
 
 def build_quick_results_df(search_or_results: Any) -> pd.DataFrame:
     """Build a flat candidate results table with score_version, extended CV metrics, one-wallet OOF staking P&L scalars, and hyperparameters."""
+    _TIME_GUARD_CONFIG["cv_active"] = False
+    set_active_fold_start(None)
+    with _ABORTED_CANDIDATE_LOCK:
+        _ABORTED_CANDIDATE_KEYS.clear()
     cv_res = getattr(search_or_results, "cv_results_", search_or_results)
     if not cv_res:
         _CV_FOLD_METRIC_LOG.clear()

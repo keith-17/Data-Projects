@@ -522,11 +522,31 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
         ``ValueError: All the 1 fits failed`` even when ``error_score=-1.0``. Returning ``self`` in an
         aborted state lets ``predict()`` emit a constant array that ``candidate_score`` penalizes to ``-1.0``.
         """
+        import time
+        from utils import (
+            candidate_param_key,
+            is_candidate_aborted,
+            is_cv_time_guard_active,
+            mark_candidate_aborted,
+            set_active_fold_start,
+        )
+
         self._aborted_reason_ = None
         self._aborted_fallback_value_ = 0.5
+        cv_active = is_cv_time_guard_active()
+        cand_key = candidate_param_key(self) if cv_active else ""
+        if cv_active and is_candidate_aborted(cand_key):
+            return self._mark_aborted_fit(
+                TimeoutError("Candidate already aborted on an earlier CV fold."),
+                y=y,
+                context=context or f"{type(self).__name__}.fit",
+            )
+        set_active_fold_start(time.perf_counter() if cv_active else None)
         try:
             return fit_impl(X, y, sample_weight=sample_weight, eras=eras)
         except (TimeoutError, MemoryError) as exc:
+            if cv_active:
+                mark_candidate_aborted(cand_key)
             return self._mark_aborted_fit(exc, y=y, context=context or f"{type(self).__name__}.fit")
 
 
