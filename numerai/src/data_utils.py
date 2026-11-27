@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import warnings
@@ -1369,7 +1370,10 @@ def _load_and_clean_splits_polars(
     val_downsample_mode: Optional[str] = None,
     val_downsample_frac: Optional[float] = None,
     random_state: int = 42,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    load_train: bool = True,
+    load_validation: bool = True,
+    val_era_sink: Optional[List[int]] = None,
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """Declarative whole-era Polars Parquet reader with native predicate pushdown, zero `_row_idx`, and Int8 casting."""
     _ = random_state  # Retained in signature for call-site compatibility.
     if not two_pass:
@@ -1455,34 +1459,51 @@ def _load_and_clean_splits_polars(
         downsample_mode=resolved_val_mode,
         downsample_frac=resolved_val_frac,
     )
+    if val_era_sink is not None and not va_is_empty:
+        _va_unique_keys = va_key_series.unique().to_list()
+        _va_mapped = sorted(int(key_to_era.get(k, k)) for k in _va_unique_keys) if not era_is_native_int else sorted(int(k) for k in _va_unique_keys)
+        if resolved_val_mode is not None and float(resolved_val_frac) < 1.0:
+            _n_keep = _compute_keep_era_count(len(_va_mapped), float(resolved_val_frac), mode=resolved_val_mode)
+            if resolved_val_mode == "recent":
+                _va_mapped = _va_mapped[-_n_keep:]
+            elif resolved_val_mode == "earliest":
+                _va_mapped = _va_mapped[:_n_keep]
+            elif resolved_val_mode == "uniform":
+                _idx = np.linspace(0, len(_va_mapped) - 1, _n_keep, dtype=int)
+                _va_mapped = [_va_mapped[i] for i in _idx]
+        val_era_sink[:] = _va_mapped
 
     # Step 2: Single declarative parallel='auto' Parquet scan per split with native predicates & zero joins
-    train_df = _load_whole_era_split_polars(
-        train_path,
-        train_cols,
-        feature_columns,
-        target_col,
-        key_col=key_col,
-        key_to_era=key_to_era,
-        era_is_native_int=era_is_native_int,
-        key_predicate=tr_key_pred,
-        val_type_predicate=None,
-        is_empty=tr_is_empty,
-        is_sorted=tr_is_sorted,
-    )
-    val_df = _load_whole_era_split_polars(
-        validation_path,
-        val_cols,
-        feature_columns,
-        target_col,
-        key_col=key_col,
-        key_to_era=key_to_era,
-        era_is_native_int=era_is_native_int,
-        key_predicate=va_key_pred,
-        val_type_predicate=va_type_pred,
-        is_empty=va_is_empty,
-        is_sorted=va_is_sorted,
-    )
+    train_df: Optional[pd.DataFrame] = None
+    if load_train:
+        train_df = _load_whole_era_split_polars(
+            train_path,
+            train_cols,
+            feature_columns,
+            target_col,
+            key_col=key_col,
+            key_to_era=key_to_era,
+            era_is_native_int=era_is_native_int,
+            key_predicate=tr_key_pred,
+            val_type_predicate=None,
+            is_empty=tr_is_empty,
+            is_sorted=tr_is_sorted,
+        )
+    val_df: Optional[pd.DataFrame] = None
+    if load_validation:
+        val_df = _load_whole_era_split_polars(
+            validation_path,
+            val_cols,
+            feature_columns,
+            target_col,
+            key_col=key_col,
+            key_to_era=key_to_era,
+            era_is_native_int=era_is_native_int,
+            key_predicate=va_key_pred,
+            val_type_predicate=va_type_pred,
+            is_empty=va_is_empty,
+            is_sorted=va_is_sorted,
+        )
     return train_df, val_df
 
 
@@ -1645,7 +1666,9 @@ def load_unity_numerai_data(
     workspace_root: Optional[Any] = None,
     auto_download: bool = True,
     use_numerapi_fallback: bool = True,
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], Dict[str, Any]]:
+    load_train: bool = True,
+    load_validation: bool = True,
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], List[str], Dict[str, Any]]:
     """Locate or download Numerai v6.0 Unity data via `kagglehub` / `KaggleApi` / `NumerAPI`.
 
     Preserves `numerai_ticker`, `id`, `date`, and `era` as metadata in `train_df` and `validation_df`
@@ -1675,6 +1698,7 @@ def load_unity_numerai_data(
         val_downsample_frac=val_downsample_frac,
     )
     filtered_early = False
+    _discovered_val_eras: List[int] = []
     if POLARS_AVAILABLE and pl is not None:
         if not want_ticker_ts:
             train_df, validation_df = _load_and_clean_splits_polars(
@@ -1691,6 +1715,9 @@ def load_unity_numerai_data(
                 val_downsample_mode=resolved_val_mode,
                 val_downsample_frac=resolved_val_frac,
                 random_state=random_state,
+                load_train=load_train,
+                load_validation=load_validation,
+                val_era_sink=_discovered_val_eras,
             )
             filtered_early = True
         else:
@@ -1744,6 +1771,10 @@ def load_unity_numerai_data(
         column in FORBIDDEN_FEATURE_COLS or column == target_col or column.startswith("target")
         for column in feature_columns
     )
+    if _discovered_val_eras:
+        feature_metadata = dict(feature_metadata)
+        feature_metadata["val_min_era"] = int(_discovered_val_eras[0])
+        feature_metadata["val_eras"] = [int(e) for e in _discovered_val_eras]
     return train_df, validation_df, feature_columns, feature_metadata
 
 
@@ -1900,8 +1931,8 @@ def _try_load_cached_unity_splits(
 def _write_cached_unity_splits(
     cache_dir: Path,
     key_payload: Dict[str, Any],
-    train_df: pd.DataFrame,
-    validation_df: pd.DataFrame,
+    train_df: Optional[pd.DataFrame],
+    validation_df: Optional[pd.DataFrame],
     feature_columns: List[str],
     feature_metadata: Dict[str, Any],
 ) -> None:
@@ -1909,21 +1940,30 @@ def _write_cached_unity_splits(
     try:
         train_cache, val_cache, meta_cache = _build_processed_cache_paths(cache_dir, key_payload)
         cache_dir.mkdir(parents=True, exist_ok=True)
-        train_df.to_parquet(train_cache, index=False)
-        validation_df.to_parquet(val_cache, index=False)
+        existing_meta: Dict[str, Any] = {}
+        if meta_cache.is_file():
+            try:
+                with meta_cache.open("r", encoding="utf-8") as mf:
+                    cand = json.load(mf)
+                if cand.get("key_payload") == key_payload:
+                    existing_meta = cand
+            except Exception:
+                existing_meta = {}
+        if train_df is not None:
+            train_df.to_parquet(train_cache, index=False)
+        if validation_df is not None:
+            validation_df.to_parquet(val_cache, index=False)
+        meta_out = {
+            "key_payload": key_payload,
+            "feature_columns": feature_columns,
+            "feature_metadata": feature_metadata,
+            "n_train_rows": int(len(train_df)) if train_df is not None else int(existing_meta.get("n_train_rows", 0)),
+            "n_val_rows": int(len(validation_df)) if validation_df is not None else int(existing_meta.get("n_val_rows", 0)),
+            "train_columns": [str(c) for c in train_df.columns] if train_df is not None else list(existing_meta.get("train_columns", [])),
+            "val_columns": [str(c) for c in validation_df.columns] if validation_df is not None else list(existing_meta.get("val_columns", [])),
+        }
         with meta_cache.open("w", encoding="utf-8") as mf:
-            json.dump(
-                {
-                    "key_payload": key_payload,
-                    "feature_columns": feature_columns,
-                    "feature_metadata": feature_metadata,
-                    "n_train_rows": int(len(train_df)),
-                    "n_val_rows": int(len(validation_df)),
-                    "train_columns": [str(c) for c in train_df.columns],
-                    "val_columns": [str(c) for c in validation_df.columns],
-                },
-                mf,
-            )
+            json.dump(meta_out, mf)
     except OSError as cache_err:
         warnings.warn(f"Could not write processed data cache ({cache_err}); continuing without cache.")
 
@@ -2005,6 +2045,9 @@ def load_unity_numerai_data_cached(
     if cached_result is not None:
         return cached_result
 
+    want_ticker_ts = ticker_timeseries_features not in (None, False, "None", "none", "null", "")
+    need_train_on_miss = (clean_split in ("both", "train")) or want_ticker_ts
+    need_val_on_miss = (clean_split in ("both", "validation")) or want_ticker_ts
     train_df, validation_df, feature_columns, feature_metadata = load_unity_numerai_data(
         data_version=data_version,
         data_folder=data_folder,
@@ -2024,8 +2067,10 @@ def load_unity_numerai_data_cached(
         workspace_root=workspace_root,
         auto_download=auto_download,
         use_numerapi_fallback=use_numerapi_fallback,
+        load_train=need_train_on_miss,
+        load_validation=need_val_on_miss,
     )
-    if len(validation_df) > 0 and "era" in validation_df.columns:
+    if validation_df is not None and len(validation_df) > 0 and "era" in validation_df.columns:
         val_eras_sorted = [int(e) for e in sorted(validation_df["era"].unique())]
         feature_metadata = dict(feature_metadata)
         feature_metadata["val_min_era"] = val_eras_sorted[0]
@@ -2033,13 +2078,15 @@ def load_unity_numerai_data_cached(
     key_payload["source_fp"] = _source_files_fingerprint(data_version, data_folder, kaggle_dataset, workspace_dir)
     _write_cached_unity_splits(cache_dir, key_payload, train_df, validation_df, feature_columns, feature_metadata)
     if clean_split == "train":
-        del validation_df
-        gc.collect()
+        if validation_df is not None:
+            del validation_df
+            gc.collect()
         return train_df, None, feature_columns, feature_metadata
     if clean_split == "validation":
-        del train_df
-        gc.collect()
-        if val_era_subset is not None:
+        if train_df is not None:
+            del train_df
+            gc.collect()
+        if validation_df is not None and val_era_subset is not None:
             era_set = {int(e) for e in val_era_subset}
             validation_df = validation_df.loc[validation_df["era"].isin(era_set)].reset_index(drop=True)
         return None, validation_df, feature_columns, feature_metadata

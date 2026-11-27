@@ -890,10 +890,9 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         sample_weight: Optional[Any] = None,
         eras: Optional[Any] = None,
     ) -> "MiniRocketNumeraiEstimator":
-        _, feature_matrix, target_values, _, sample_weights, era_values = self._prepare_fit_inputs(
-            X, y, sample_weight=sample_weight, eras=eras, return_matrix=True, matrix_dtype=np.float32
+        features_df, _, target_values, _, sample_weights, era_values = self._prepare_fit_inputs(
+            X, y, sample_weight=sample_weight, eras=eras, return_matrix=False
         )
-        assert feature_matrix is not None
 
         # Retain top `max_channels` selected features for sequence channels (or all for feature_profile)
         tickers = self._extract_tickers(X, len(target_values))
@@ -922,7 +921,7 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         self.channel_names_ = [str(self.feature_names_in_[i]) for i in sel_idx]
         self.channel_corrs_ = np.asarray(self.feature_corrs_[sel_idx], dtype=np.float64)
 
-        sub_matrix = feature_matrix[:, sel_idx]
+        sub_matrix = features_df[self.channel_names_].to_numpy(dtype=np.float32, copy=False)
         X_tensor = self._build_sequence_tensor(
             sub_matrix,
             era_values,
@@ -1034,7 +1033,7 @@ class MiniRocketNumeraiEstimator(BaseNumeraiEstimator):
         else:
             self.learned_bias_offset_ = 0.0
 
-        del X_tensor, sub_matrix, feature_matrix
+        del X_tensor, sub_matrix, features_df
         return self
 
     def _predict_tensor(self, X_tensor: np.ndarray) -> np.ndarray:

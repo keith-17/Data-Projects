@@ -9,6 +9,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import threading
 import warnings
 from collections import OrderedDict
 from pathlib import Path
@@ -32,6 +33,7 @@ from utils import (
 )
 
 _EXTRACTION_CACHE: "OrderedDict[str, Tuple[NumeraiExtractions, pd.DataFrame]]" = OrderedDict()
+_EXTRACTION_CACHE_LOCK = threading.Lock()
 _EXTRACTION_CACHE_CONFIG: Dict[str, Any] = {
     "enabled": True,
     "max_entries": 4,
@@ -48,20 +50,22 @@ def set_extraction_cache_suspended(suspended: bool) -> bool:
 
 def configure_extraction_cache(enabled: bool = True, max_entries: int = 4) -> Dict[str, Any]:
     """Configure the per-process fold-safe LRU extraction cache used by `BaseNumeraiEstimator`."""
-    _EXTRACTION_CACHE_CONFIG["enabled"] = bool(enabled)
-    _EXTRACTION_CACHE_CONFIG["max_entries"] = max(0, int(max_entries))
-    if not _EXTRACTION_CACHE_CONFIG["enabled"] or _EXTRACTION_CACHE_CONFIG["max_entries"] == 0:
-        _EXTRACTION_CACHE.clear()
-    else:
-        while len(_EXTRACTION_CACHE) > _EXTRACTION_CACHE_CONFIG["max_entries"]:
-            _EXTRACTION_CACHE.popitem(last=False)
-    return dict(_EXTRACTION_CACHE_CONFIG)
+    with _EXTRACTION_CACHE_LOCK:
+        _EXTRACTION_CACHE_CONFIG["enabled"] = bool(enabled)
+        _EXTRACTION_CACHE_CONFIG["max_entries"] = max(0, int(max_entries))
+        if not _EXTRACTION_CACHE_CONFIG["enabled"] or _EXTRACTION_CACHE_CONFIG["max_entries"] == 0:
+            _EXTRACTION_CACHE.clear()
+        else:
+            while len(_EXTRACTION_CACHE) > _EXTRACTION_CACHE_CONFIG["max_entries"]:
+                _EXTRACTION_CACHE.popitem(last=False)
+        return dict(_EXTRACTION_CACHE_CONFIG)
 
 
 def clear_extraction_cache() -> int:
     """Clear all entries from the per-process extraction cache, run GC, and return cleared count."""
-    cleared = len(_EXTRACTION_CACHE)
-    _EXTRACTION_CACHE.clear()
+    with _EXTRACTION_CACHE_LOCK:
+        cleared = len(_EXTRACTION_CACHE)
+        _EXTRACTION_CACHE.clear()
     gc.collect()
     return cleared
 
@@ -280,19 +284,23 @@ class BaseNumeraiEstimator(RegressorMixin, BaseEstimator):
             )
             if cache_enabled:
                 cache_key = _build_extraction_cache_key(self.extractor, X_df, era_values, target_values)
-                if cache_key in _EXTRACTION_CACHE:
-                    _EXTRACTION_CACHE.move_to_end(cache_key)
-                    cached_ext, cached_X_proc = _EXTRACTION_CACHE[cache_key]
+                with _EXTRACTION_CACHE_LOCK:
+                    hit = _EXTRACTION_CACHE.get(cache_key)
+                    if hit is not None:
+                        _EXTRACTION_CACHE.move_to_end(cache_key)
+                if hit is not None:
+                    cached_ext, cached_X_proc = hit
                     self.extractor_ = cached_ext
                     X_proc = cached_X_proc
                 else:
                     fitted_ext = clone(self.extractor)
                     fitted_ext.fit(X_df, target_values)
                     X_proc = fitted_ext.transform(X_df)
-                    _EXTRACTION_CACHE[cache_key] = (fitted_ext, X_proc)
-                    _EXTRACTION_CACHE.move_to_end(cache_key)
-                    while len(_EXTRACTION_CACHE) > int(_EXTRACTION_CACHE_CONFIG["max_entries"]):
-                        _EXTRACTION_CACHE.popitem(last=False)
+                    with _EXTRACTION_CACHE_LOCK:
+                        _EXTRACTION_CACHE[cache_key] = (fitted_ext, X_proc)
+                        _EXTRACTION_CACHE.move_to_end(cache_key)
+                        while len(_EXTRACTION_CACHE) > int(_EXTRACTION_CACHE_CONFIG["max_entries"]):
+                            _EXTRACTION_CACHE.popitem(last=False)
                     self.extractor_ = fitted_ext
             else:
                 self.extractor_ = clone(self.extractor)
@@ -952,7 +960,7 @@ class LagReversalEstimator(BaseNumeraiEstimator):
                 out=np.zeros(n_features, dtype=np.float64),
                 where=observed_counts > 0,
             )
-        clean_features = np.where(finite_mask, raw_features, self.feature_means_)
+        clean_features = np.where(finite_mask, raw_features, self.feature_means_.astype(np.float32, copy=False))
 
         # If era_weighting / sample_weights are supplied, re-estimate feature_corrs_ using weighted per-era correlations
         if row_w is not None and era_values is not None and self.correlation_method not in (None, "none", "None", ""):
